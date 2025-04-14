@@ -614,6 +614,281 @@ def print_fit_results(results_df, model_spec='recent', filter_parameters=None, s
 ######################################################################
 # Fitting and Optimization
 
+def run_fitting(objective, optimization_method='differential_evolution', 
+                opt_workers=8, opt_popsize=20, burn_samples=5, 
+                production_samples=5, prod_steps=1, pool=16,
+                results_log=None, log_mcmc_stats=True,
+                save_dir=None, save_objective=False, save_results=False,
+                results_log_file=None, save_log_in_save_dir=False, 
+                structure=None):
+    """
+    Run fitting procedure on a reflectometry model with optimization and MCMC sampling,
+    and automatically log results.
+    
+    Args:
+        objective: The objective function to fit
+        optimization_method: Optimization method to use ('differential_evolution', 'least_squares', etc.)
+        opt_workers: Number of workers for parallel optimization
+        opt_popsize: Population size for genetic algorithms
+        burn_samples: Number of burn-in samples to discard (in thousands)
+        production_samples: Number of production samples to keep (in thousands)
+        prod_steps: Number of steps between stored samples
+        pool: Number of parallel processes for MCMC sampling
+        results_log: Existing results log DataFrame to append to (None to create new)
+        log_mcmc_stats: Whether to add MCMC statistics to the log
+        save_dir: Directory to save objective and results (None to skip saving)
+        save_objective: Whether to save the objective function
+        save_results: Whether to save the results dictionary
+        results_log_file: Filename to load/save the results log DataFrame (None to skip saving)
+        save_log_in_save_dir: If True and save_dir is specified, save the log file in save_dir 
+                             regardless of results_log_file path
+        structure: The structure object associated with the objective, to be saved along with results
+        
+    Returns:
+        Tuple of (results_dict, updated_results_log, model_name)
+    """
+    import os
+    import pickle
+    import datetime
+    import pandas as pd
+    
+    # Extract model name if available
+    model_name = getattr(objective.model, 'name', 'unnamed_model')
+    print(f"Fitting model: {model_name}")
+    
+    # Generate timestamp for logs and internal tracking (but not filenames)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Determine the actual log file path
+    actual_log_file = results_log_file
+    if save_dir is not None and save_log_in_save_dir:
+        # Create the directory if it doesn't exist
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            print(f"Created directory: {save_dir}")
+        
+        # If results_log_file is specified, use just the filename part in save_dir
+        if results_log_file:
+            log_filename = os.path.basename(results_log_file)
+        else:
+            # Default log filename if not specified
+            log_filename = f"fitting_results_log.csv"
+        
+        actual_log_file = os.path.join(save_dir, log_filename)
+    
+    # Try to load existing results_log if filename is provided
+    if results_log is None and actual_log_file is not None:
+        if os.path.exists(actual_log_file):
+            try:
+                print(f"Loading existing results log from {actual_log_file}")
+                results_log = pd.read_csv(actual_log_file)
+            except Exception as e:
+                print(f"Error loading results log: {str(e)}")
+                print("Initializing new results log")
+                results_log = pd.DataFrame(columns=[
+                    'timestamp', 'model_name', 'goodness_of_fit', 
+                    'parameter', 'value', 'stderr', 'bound_low', 'bound_high', 'vary'
+                ])
+    
+    # Initialize results dictionary
+    results = {
+        'objective': objective,
+        'initial_chi_squared': objective.chisqr(),
+        'optimized_parameters': None,
+        'optimized_chi_squared': None,
+        'mcmc_samples': None,
+        'mcmc_stats': None,
+        'timestamp': timestamp,  # Keep timestamp in results for logs
+        'structure': structure  # Include the structure if provided
+    }
+    
+    # Create fitter
+    print(f"Initializing CurveFitter with {model_name} model")
+    fitter = CurveFitter(objective)
+    
+    # Run optimization
+    print(f"Starting optimization using {optimization_method}...")
+    if optimization_method == 'differential_evolution':
+        fitter.fit(optimization_method, workers=opt_workers, popsize=opt_popsize)
+    else:
+        fitter.fit(optimization_method)
+    
+    # Store optimization results
+    results['optimized_parameters'] = objective.parameters.pvals.copy()
+    results['optimized_chi_squared'] = objective.chisqr()
+    
+    print(f"Optimization complete. Chi-squared improved from {results['initial_chi_squared']:.4f} to {results['optimized_chi_squared']:.4f}")
+    
+    # Run burn-in MCMC samples
+    if burn_samples > 0:
+        print(f"Running {burn_samples}k burn-in MCMC samples...")
+        fitter.sample(burn_samples, pool=pool)
+        print("Burn-in complete. Resetting chain...")
+        fitter.reset()
+    
+    # Run production MCMC samples
+    if production_samples > 0:
+        print(f"Running {production_samples}k production MCMC samples with {prod_steps} steps between stored samples...")
+        results['mcmc_samples'] = fitter.sample(production_samples, prod_steps, pool=pool)
+        
+        # Calculate statistics from MCMC chain
+        try:
+            print("Calculating parameter statistics from MCMC chain...")
+            results['mcmc_stats'] = {}
+            
+            # Process parameter statistics
+            for name, param in objective.parameters.flattened():
+                if param.vary:
+                    param_stats = {
+                        'name': name,
+                        'value': param.value,
+                        'stderr': param.stderr,
+                        'median': None,
+                        'mean': None,
+                        'std': None,
+                        'percentiles': {}
+                    }
+                    
+                    # Extract chain for this parameter
+                    chain_index = fitter.var_pars.index(param)
+                    if chain_index >= 0 and results['mcmc_samples'] is not None:
+                        # Calculate statistics
+                        chain_values = results['mcmc_samples'][:, chain_index]
+                        param_stats['median'] = np.median(chain_values)
+                        param_stats['mean'] = np.mean(chain_values)
+                        param_stats['std'] = np.std(chain_values)
+                        
+                        # Calculate percentiles
+                        for percentile in [2.5, 16, 50, 84, 97.5]:
+                            param_stats['percentiles'][percentile] = np.percentile(chain_values, percentile)
+                    
+                    results['mcmc_stats'][name] = param_stats
+            
+            # Print a summary of key parameters
+            print("\nParameter summary from MCMC:")
+            for name, stats in results['mcmc_stats'].items():
+                if 'median' in stats and stats['median'] is not None:
+                    print(f"  {name}: {stats['median']:.6g} +{stats['percentiles'][84] - stats['median']:.6g} -{stats['median'] - stats['percentiles'][16]:.6g}")
+        
+        except Exception as e:
+            print(f"Error calculating MCMC statistics: {str(e)}")
+    
+    # Initialize results_log if not provided and not loaded from file
+    if results_log is None:
+        print("Initializing new results log")
+        results_log = pd.DataFrame(columns=[
+            'timestamp', 'model_name', 'goodness_of_fit', 
+            'parameter', 'value', 'stderr', 'bound_low', 'bound_high', 'vary'
+        ])
+    
+    # Log the results
+    print(f"Logging results for model {model_name}")
+    
+    # Log the optimized values first
+    results_log, model_name = log_fitting_results(objective, model_name, results_log)
+    
+    # If MCMC was performed and we want to log those stats, create a second entry
+    if log_mcmc_stats and results['mcmc_stats'] is not None:
+        print("Adding MCMC statistics to the log...")
+        
+        # Create a temporary copy of the objective to store MCMC medians
+        import copy
+        mcmc_objective = copy.deepcopy(objective)
+        
+        # Update parameter values to MCMC medians
+        for name, stats in results['mcmc_stats'].items():
+            if 'median' in stats and stats['median'] is not None:
+                # Find the parameter and update its value and error
+                for param in mcmc_objective.parameters.flattened():
+                    if param.name == name:
+                        param.value = stats['median']
+                        # Use percentiles for errors
+                        upper_err = stats['percentiles'][84] - stats['median']
+                        lower_err = stats['median'] - stats['percentiles'][16]
+                        # Use the larger of the two for stderr
+                        param.stderr = max(upper_err, lower_err)
+                        break
+        
+        # Log the MCMC results with a modified name
+        mcmc_model_name = f"{model_name}_MCMC"
+        results_log, _ = log_fitting_results(mcmc_objective, mcmc_model_name, results_log)
+    
+    # Save the objective and/or results if requested
+    if save_dir is not None and (save_objective or save_results):
+        # Create the directory if it doesn't exist
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            print(f"Created directory: {save_dir}")
+        
+        # Save the objective if requested - without timestamp in filename
+        if save_objective:
+            objective_filename = os.path.join(save_dir, f"{model_name}_objective.pkl")
+            try:
+                with open(objective_filename, 'wb') as f:
+                    pickle.dump(objective, f)
+                print(f"Saved objective to {objective_filename}")
+            except Exception as e:
+                print(f"Error saving objective: {str(e)}")
+        
+        # Save the results if requested - without timestamp in filename
+        if save_results:
+            # Create a copy of results without the objective (to avoid duplication if saving both)
+            save_results_copy = results.copy()
+            if 'objective' in save_results_copy and save_objective:
+                save_results_copy['objective'] = None  # Remove the objective to avoid duplication
+            
+            results_filename = os.path.join(save_dir, f"{model_name}_results.pkl")
+            try:
+                with open(results_filename, 'wb') as f:
+                    pickle.dump(save_results_copy, f)
+                print(f"Saved results to {results_filename}")
+            except Exception as e:
+                print(f"Error saving results: {str(e)}")
+            
+            # Save a combined file with results and structure - without timestamp in filename
+            combined_filename = os.path.join(save_dir, f"{model_name}_combined.pkl")
+            try:
+                combined_data = {
+                    'results': save_results_copy,
+                    'structure': structure,
+                    'objective': objective if save_objective else None,
+                    'model_name': model_name,
+                    'timestamp': timestamp  # Keep timestamp in the data
+                }
+                with open(combined_filename, 'wb') as f:
+                    pickle.dump(combined_data, f)
+                print(f"Saved combined results and structure to {combined_filename}")
+            except Exception as e:
+                print(f"Error saving combined data: {str(e)}")
+            
+            # Additionally, save MCMC samples as numpy array if they exist - without timestamp in filename
+            if results['mcmc_samples'] is not None:
+                import numpy as np
+                mcmc_filename = os.path.join(save_dir, f"{model_name}_mcmc_samples.npy")
+                try:
+                    np.save(mcmc_filename, results['mcmc_samples'])
+                    print(f"Saved MCMC samples to {mcmc_filename}")
+                except Exception as e:
+                    print(f"Error saving MCMC samples: {str(e)}")
+    
+    # Save the results log if a filename was provided
+    if actual_log_file is not None:
+        # Create directory for results_log_file if it doesn't exist
+        log_dir = os.path.dirname(actual_log_file)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+            print(f"Created directory for results log: {log_dir}")
+        
+        try:
+            # Save to CSV
+            results_log.to_csv(actual_log_file, index=False)
+            print(f"Saved results log to {actual_log_file}")
+        except Exception as e:
+            print(f"Error saving results log: {str(e)}")
+    
+    return results, results_log, model_name
+
+
 
 
 def load_fitting_file(filename):
@@ -971,3 +1246,94 @@ def get_parameter_summary(combined_data):
     return pd.DataFrame(stats)
 
 
+##########################################
+# Optical Constant Handling
+
+def DeltaBetatoSLD(DeltaBeta):
+    #DeltaBeta needs to be 3 columns Energy,Delta,Beta
+    Wavelength=EnergytoWavelength(DeltaBeta[:,0])
+    SLD=np.zeros([len(DeltaBeta[:,0]),4])
+    SLD[:,0]=DeltaBeta[:,0]
+    SLD[:,3]=Wavelength
+    SLD[:,1]=2*np.pi*DeltaBeta[:,1]/(np.power(Wavelength,2))*1000000
+    SLD[:,2]=2*np.pi*DeltaBeta[:,2]/(np.power(Wavelength,2))*1000000
+    return SLD
+
+def SLDinterp(Energy,SLDarray):
+    Real= np.interp(Energy, SLDarray[:,0],SLDarray[:,1])
+    Imag=np.interp(Energy, SLDarray[:,0],SLDarray[:,2])*1j
+    
+    return(Real,Imag)
+
+
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+
+# Physical constants
+CLASSICAL_ELECTRON_RADIUS = 2.8179403227e-15  # in meters
+AVOGADRO_NUMBER = 6.022140857e23  # mol^-1
+HC_EV_NM = 1239.8  # hc in eV·nm
+
+def energy_to_wavelength(energy_ev):
+    """Convert energy in eV to wavelength in nm"""
+    return HC_EV_NM / energy_ev
+
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+
+def interpolate_sld_from_file(file_path, target_energy):
+    """
+    Interpolate SLD values from a data file at a specified energy.
+    
+    Parameters:
+    -----------
+    file_path : str
+        Path to the data file with columns: [energy(eV), real, imaginary]
+        The real and imaginary values are already energy-corrected SLD components
+    target_energy : float
+        Energy in eV at which to interpolate the SLD
+        
+    Returns:
+    --------
+    tuple
+        (sld_real, sld_imag) in the same units as the input file
+    """
+    # Load the data file
+    try:
+        data = pd.read_csv(file_path, sep='\s+', header=None, 
+                          names=['energy_eV', 'real', 'imag'])
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        # Try alternative format (comma-separated)
+        try:
+            data = pd.read_csv(file_path, header=None, 
+                              names=['energy_eV', 'real', 'imag'])
+        except Exception as e2:
+            print(f"Failed to read file as space or comma separated: {e2}")
+            return None
+    
+    # Ensure data is sorted by energy
+    data = data.sort_values('energy_eV')
+    
+    # Check if target energy is within the data range
+    min_energy = data['energy_eV'].min()
+    max_energy = data['energy_eV'].max()
+    
+    if target_energy < min_energy or target_energy > max_energy:
+        print(f"Warning: Target energy {target_energy} eV is outside the data range [{min_energy}, {max_energy}] eV")
+        print("Extrapolating values, but results may be unreliable.")
+    
+    # Create interpolation functions for real and imaginary components
+    real_interp = interp1d(data['energy_eV'], data['real'], kind='cubic', 
+                          bounds_error=False, fill_value='extrapolate')
+    imag_interp = interp1d(data['energy_eV'], data['imag'], kind='cubic', 
+                          bounds_error=False, fill_value='extrapolate')
+    
+    # Interpolate values at target energy
+    sld_real = real_interp(target_energy)
+    sld_imag = imag_interp(target_energy)
+    
+    return sld_real, sld_imag
