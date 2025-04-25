@@ -374,7 +374,7 @@ def modelcomparisonplot(obj_list, structure_list, shade_start=None,
         ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
         ax_refl.set_ylabel('Reflectivity (a.u)')
         ax_refl.text(0.125, 1, f'RelGF {chi_values[i, 1]}', size=12, 
-                   horizontalalignment='center', verticalalignment='top')
+                   horizontalalignment='center', verticalalignment='bottom')
         
         # Plot SLD profiles
         Real_depth, Real_SLD, Imag_Depth, Imag_SLD = profileflip(structure_list[i])
