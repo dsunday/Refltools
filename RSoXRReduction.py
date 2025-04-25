@@ -1035,7 +1035,7 @@ class RSoXRProcessor:
         
         return results
     
-    def auto_group_scans(self, data_directory=".", position_tolerance=0.1, energy_tolerance=0.5, auto_trim=False, save_table=True, output_dir=None):
+    def auto_group_scans(self, data_directory=".", position_tolerance=0.1, energy_tolerance=0.5, auto_trim=False, save_table=True, output_dir=None, sort_by_energy=True):
         """
         Automatically group scans based on position, energy, and detector type
         
@@ -1053,6 +1053,8 @@ class RSoXRProcessor:
             Whether to save the scan group information to a table file
         output_dir : str, optional
             Directory to save the output table (will be created if it doesn't exist)
+        sort_by_energy : bool
+            Whether to sort the groups by energy
             
         Returns:
         --------
@@ -1228,6 +1230,10 @@ class RSoXRProcessor:
                 'max_angle': overall_max_angle
             })
         
+        # Sort scan groups by energy if requested
+        if sort_by_energy:
+            scan_groups.sort(key=lambda x: x['energy'])
+        
         # Create and display a consolidated table of scan groups
         print(f"\nFound {len(scan_groups)} scan groups:")
         print("=" * 115)
@@ -1298,7 +1304,7 @@ class RSoXRProcessor:
             
         if save_table and scan_groups:
             self.save_scan_groups_to_table(scan_groups, output_dir=output_dir)
-    
+
         return scan_groups
         
     def _determine_trims(self, filenames):
