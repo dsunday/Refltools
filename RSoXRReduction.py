@@ -485,34 +485,28 @@ class RSoXRProcessor:
         
         return x, y, z
     
-    def reduce_data(self, scans, trims, energy, normalize=True, plot=True, convert_to_photons=False, output_dir=None, plot_prefix=None):
+    def reduce_data(self, scans, trims, energy, normalize=True, plot=True, convert_to_photons=False, 
+               output_dir=None, plot_prefix=None, smooth_data=False, savgol_window=None, 
+               savgol_order=2, remove_zeros=True):
         """
         Reduce multiple scans by scaling them to the lowest angle scan
         
         Parameters:
         -----------
-        scans : list of numpy arrays
-            List of data arrays from each scan
-        trims : list of tuples
-            List of (start_idx, end_idx) for each scan
-        energy : float
-            Beam energy in eV
-        normalize : bool
-            Whether to normalize the final reflectivity
-        plot : bool
-            Whether to generate plots during processing
-        convert_to_photons : bool
-            Whether to convert photodiode current to photon flux
-        output_dir : str, optional
-            Directory to save plots if provided
-        plot_prefix : str, optional
-            Prefix for plot filenames
-            
+        [parameters remain the same as before]
+                
         Returns:
         --------
-        ReflQ : numpy array
-            Processed reflectivity data with columns [Q, R, error]
+        If smooth_data is True:
+            (smoothed_refl_q, raw_refl_q) : tuple of numpy arrays
+                Tuple containing the smoothed and raw reflectivity data
+        Else:
+            refl_q : numpy array
+                Processed reflectivity data with columns [Q, R, error]
         """
+        # Import required modules
+        from scipy.signal import savgol_filter
+        
         # Ensure we have trim values for all scans
         if len(trims) < len(scans):
             print(f"Warning: Not enough trim values provided. Adding default trims for {len(scans) - len(trims)} scans.")
@@ -520,6 +514,13 @@ class RSoXRProcessor:
             
         # Process the first scan
         refl = deepcopy(scans[0][trims[0][0]:(len(scans[0][:,0])+trims[0][1]), 0:2])
+        
+        # Remove zeros if requested
+        if remove_zeros:
+            non_zero_mask = refl[:,1] > 0
+            if not all(non_zero_mask):
+                print(f"Removing {len(refl) - np.sum(non_zero_mask)} zero data points from first scan")
+                refl = refl[non_zero_mask]
         
         # Convert to photon flux if requested
         if convert_to_photons and self.calibration_data is not None:
@@ -532,6 +533,13 @@ class RSoXRProcessor:
         # Process additional scans
         for i in range(1, len(scans)):
             scan = scans[i][trims[i][0]:(len(scans[i][:,0])+trims[i][1]), 0:2]
+            
+            # Remove zeros if requested
+            if remove_zeros:
+                non_zero_mask = scan[:,1] > 0
+                if not all(non_zero_mask):
+                    print(f"Removing {len(scan) - np.sum(non_zero_mask)} zero data points from scan {i+1}")
+                    scan = scan[non_zero_mask]
             
             # Convert to photon flux if requested
             if convert_to_photons and self.calibration_data is not None:
@@ -572,24 +580,74 @@ class RSoXRProcessor:
             # Concatenate with existing reflectivity
             refl = np.concatenate((refl, scan))
         
-        # Convert to Q (momentum transfer)
+        # Create a copy of the unsmoothed data
+        raw_refl = deepcopy(refl)
+        
+        # Apply smoothing if requested
+        if smooth_data:
+            # Determine the best window size for Savitzky-Golay filter (must be odd)
+            if savgol_window is None:
+                window_size = max(min(25, len(refl) // 10 * 2 + 1), 5)
+                if window_size % 2 == 0:
+                    window_size += 1
+            else:
+                # Use the user-specified window size
+                window_size = savgol_window
+                # Ensure it's odd and at least 5
+                if window_size % 2 == 0:
+                    window_size += 1
+                window_size = max(window_size, 5)
+            
+            print(f"Applying Savitzky-Golay smoothing with window size: {window_size}, order: {savgol_order}")
+            try:
+                # Apply smoothing while preserving the original angles
+                smoothed_intensities = savgol_filter(refl[:,1], window_size, savgol_order)
+                # Create smoothed data array
+                smoothed_refl = deepcopy(refl)
+                smoothed_refl[:,1] = smoothed_intensities
+            except Exception as e:
+                print(f"Warning: Smoothing failed ({str(e)}), using raw data")
+                smoothed_refl = refl
+        else:
+            smoothed_refl = refl
+        
+        # Convert raw data to Q (momentum transfer)
         wavelength_nm = 1239.9 / energy  # eV to nm
         wavelength_angstrom = wavelength_nm * 10  # nm to Å
-        Q = 4 * np.pi * np.sin(np.radians(refl[:,0])) / wavelength_angstrom  # Q in Å^-1
+        Q_raw = 4 * np.pi * np.sin(np.radians(raw_refl[:,0])) / wavelength_angstrom  # Q in Å^-1
         
-        # Create output array
+        # Convert smoothed data to Q
+        Q = 4 * np.pi * np.sin(np.radians(smoothed_refl[:,0])) / wavelength_angstrom  # Q in Å^-1
+        
+        # Create output array for raw data
+        raw_refl_q = np.zeros([Q_raw.size, 3])
+        raw_refl_q[:,0] = Q_raw
+        
+        # Create output array for smoothed data
         refl_q = np.zeros([Q.size, 3])
         refl_q[:,0] = Q
         
         if normalize:
-            max_intensity = refl[:,1].max()
-            refl_q[:,1] = refl[:,1] / max_intensity
-            refl_q[:,2] = (refl[:,1] / max_intensity) * 0.01  # 1% error
+            # Normalize raw data
+            max_intensity_raw = raw_refl[:,1].max()
+            raw_refl_q[:,1] = raw_refl[:,1] / max_intensity_raw
+            raw_refl_q[:,2] = (raw_refl[:,1] / max_intensity_raw) * 0.01  # 1% error
+            
+            # Normalize smoothed data
+            max_intensity = smoothed_refl[:,1].max()
+            refl_q[:,1] = smoothed_refl[:,1] / max_intensity
+            refl_q[:,2] = (smoothed_refl[:,1] / max_intensity) * 0.01  # 1% error
         else:
-            refl_q[:,1] = refl[:,1]
-            refl_q[:,2] = refl[:,1] * 0.01  # 1% error
+            # Raw data without normalization
+            raw_refl_q[:,1] = raw_refl[:,1]
+            raw_refl_q[:,2] = raw_refl[:,1] * 0.01  # 1% error
+            
+            # Smoothed data without normalization
+            refl_q[:,1] = smoothed_refl[:,1]
+            refl_q[:,2] = smoothed_refl[:,1] * 0.01  # 1% error
         
         # Sort by Q
+        raw_refl_q = raw_refl_q[raw_refl_q[:, 0].argsort()]
         refl_q = refl_q[refl_q[:, 0].argsort()]
         
         # Create a consolidated plot with both raw and reduced data
@@ -616,8 +674,18 @@ class RSoXRProcessor:
             ax1.grid(True, which="both", ls="--", alpha=0.3)
             
             # Plot reduced data (in Q space) in the second subplot
-            ax2.errorbar(refl_q[:,0], refl_q[:,1], yerr=refl_q[:,2], fmt='rx-', 
-                        markersize=4, capsize=3, label='Reduced Data')
+            # Plot raw data points
+            ax2.errorbar(raw_refl_q[:,0], raw_refl_q[:,1], yerr=raw_refl_q[:,2], fmt='rx', 
+                        markersize=4, capsize=3, alpha=0.5, label='Raw Data')
+            
+            # If smoothing was applied, overlay the smoothed data
+            if smooth_data:
+                ax2.errorbar(refl_q[:,0], refl_q[:,1], yerr=refl_q[:,2], fmt='b-', 
+                            linewidth=2, label='Smoothed Data')
+            else:
+                # Connect raw data points with a line if not smoothed
+                ax2.plot(raw_refl_q[:,0], raw_refl_q[:,1], 'b-', linewidth=1, alpha=0.7)
+            
             ax2.set_yscale('log')
             ax2.set_xlabel('Q (Å$^{-1}$)')
             
@@ -644,12 +712,37 @@ class RSoXRProcessor:
                 
             plt.show()
         
-        return refl_q
+            # Save both raw and smoothed data if smoothing was applied
+        if output_dir:
+            if plot_prefix is None:
+                plot_prefix = f"reflectivity_{energy:.1f}eV"
+            
+            # Always save raw data
+            raw_data_filename = f"{plot_prefix}_raw.dat"
+            raw_data_path = os.path.join(output_dir, raw_data_filename)
+            np.savetxt(raw_data_path, raw_refl_q)
+            print(f"Saved raw data to {raw_data_path}")
+            
+            # Save smoothed data if smoothing was applied
+            if smooth_data:
+                smoothed_data_filename = f"{plot_prefix}_smoothed.dat"
+                smoothed_data_path = os.path.join(output_dir, smoothed_data_filename)
+                np.savetxt(smoothed_data_path, refl_q)
+                print(f"Saved smoothed data to {smoothed_data_path}")
+        
+        # Return the processed data (both smoothed and raw if smoothing was applied)
+        if smooth_data:
+            # Return both raw and smoothed data as a tuple
+            return refl_q, raw_refl_q
+        else:
+            return raw_refl_q  # Only raw data if no smoothing
+
     
     def process_scan_set(self, scan_group, output_filename=None, normalize=True, plot=True, 
-                  convert_to_photons=False, output_dir=None, plot_prefix=None, 
-                  save_metadata=True, estimate_thickness=True, min_prominence=0.1,
-                  min_thickness_nm=20, max_thickness_nm=100, smooth_data=True):
+                convert_to_photons=False, output_dir=None, plot_prefix=None, 
+                save_metadata=True, estimate_thickness=False, min_prominence=0.1,
+                min_thickness_nm=20, max_thickness_nm=100, smooth_data=False,
+                savgol_window=None, savgol_order=2, remove_zeros=True):
         """
         Process a scan set and combine them
         
@@ -680,12 +773,22 @@ class RSoXRProcessor:
         max_thickness_nm : float
             Maximum expected film thickness in nm
         smooth_data : bool
-            Whether to apply smoothing to the data before peak detection
+            Whether to apply smoothing to the data 
+        savgol_window : int, optional
+            Window size for Savitzky-Golay filter. Must be odd and >= 5.
+        savgol_order : int
+            Polynomial order for the Savitzky-Golay filter. Default is 2.
+        remove_zeros : bool
+            Whether to remove data points with zero intensity
         
         Returns:
         --------
-        ReflQ : numpy array
-            Processed reflectivity data
+        If smooth_data is True:
+            (smoothed_data, raw_data) : tuple of numpy arrays
+                Tuple containing the smoothed and raw reflectivity data
+        Else:
+            result : numpy array
+                Processed reflectivity data
         """
         # Extract information from the scan group
         file_patterns = scan_group['files']
@@ -726,51 +829,113 @@ class RSoXRProcessor:
             # Default prefix based on energy
             plot_prefix = f"{scan_group['sample_name']}_{energy:.1f}eV"
         
+        # Validate smoothing parameters if smoothing is enabled
+        if smooth_data:
+            # Ensure window size is odd and >= 5
+            if savgol_window is None:
+                # Auto-determine window size
+                window_size = max(min(25, len(scans[0]) // 10 * 2 + 1), 5)
+                if window_size % 2 == 0:
+                    window_size += 1
+            else:
+                window_size = savgol_window
+                if window_size % 2 == 0:
+                    window_size += 1
+                window_size = max(window_size, 5)
+            
+            # Ensure polynomial order is valid
+            polynomial_order = min(savgol_order, window_size - 1)
+            polynomial_order = max(polynomial_order, 1)
+            
+            print(f"Using smoothing with window size={window_size}, polynomial order={polynomial_order}")
+        else:
+            window_size, polynomial_order = None, 2
+        
         # Process the scans
-        refl_q = self.reduce_data(
+        result = self.reduce_data(
             scans, 
             actual_trims, 
             energy, 
             normalize=normalize, 
             plot=plot,
             convert_to_photons=convert_to_photons,
-            output_dir=output_dir,
-            plot_prefix=plot_prefix
+            output_dir=None,  # Initially set to None to control saving ourselves
+            plot_prefix=plot_prefix,
+            smooth_data=smooth_data,
+            savgol_window=window_size,
+            savgol_order=polynomial_order,
+            remove_zeros=remove_zeros
         )
         
         # Save to file if requested
-        if output_filename and refl_q is not None:
+        if output_filename and result is not None:
             # Create output directory if it doesn't exist
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
-                output_path = os.path.join(output_dir, output_filename)
-            else:
-                output_path = output_filename
+            
+            # Handle raw and smoothed data
+            if smooth_data:
+                # Unpack the tuple (smoothed_data, raw_data)
+                smoothed_data, raw_data = result
                 
-            np.savetxt(output_path, refl_q)
-            print(f"Saved processed data to {output_path}")
+                # Generate filenames
+                base_name = os.path.splitext(output_filename)[0]
+                extension = os.path.splitext(output_filename)[1]
+                raw_filename = f"{base_name}_raw{extension}"
+                smoothed_filename = f"{base_name}_smoothed{extension}"
+                
+                # Save raw data
+                if output_dir:
+                    raw_path = os.path.join(output_dir, raw_filename)
+                else:
+                    raw_path = raw_filename
+                    
+                np.savetxt(raw_path, raw_data)
+                print(f"Saved raw data to {raw_path}")
+                
+                # Save smoothed data
+                if output_dir:
+                    smoothed_path = os.path.join(output_dir, smoothed_filename)
+                else:
+                    smoothed_path = smoothed_filename
+                    
+                np.savetxt(smoothed_path, smoothed_data)
+                print(f"Saved smoothed data to {smoothed_path}")
+            else:
+                # Save just the raw data with the requested filename
+                if output_dir:
+                    output_path = os.path.join(output_dir, output_filename)
+                else:
+                    output_path = output_filename
+                    
+                np.savetxt(output_path, result)
+                print(f"Saved processed data to {output_path}")
             
             # Save metadata if requested
             if save_metadata:
+                metadata_data = result[0] if smooth_data else result  # Use smoothed data for metadata if available
                 self.save_reduced_data_metadata(
                     scan_group, 
-                    refl_q, 
+                    metadata_data,
                     output_dir=output_dir
                 )
         
         # Estimate film thickness if requested
         thickness = None
-        if estimate_thickness and refl_q is not None:
+        if estimate_thickness and result is not None:
             print("\nEstimating film thickness from fringe spacing...")
+            # Use smoothed data for thickness estimation if available
+            data_for_thickness = result[0] if smooth_data else result
+            
             thickness, peaks, valleys = self.estimate_film_thickness(
-                refl_q, 
+                data_for_thickness, 
                 min_prominence=min_prominence,
                 min_thickness_nm=min_thickness_nm,
                 max_thickness_nm=max_thickness_nm,
                 plot=plot,
                 output_dir=output_dir,
                 plot_prefix=plot_prefix,
-                smooth_data=smooth_data
+                smooth_data=True  # Always use smoothing for thickness estimation
             )
             
             # Update metadata with thickness if available
@@ -803,8 +968,7 @@ class RSoXRProcessor:
                     except Exception as e:
                         print(f"Warning: Could not update metadata file with thickness: {str(e)}")
         
-        return refl_q
-
+        return result
     
     def batch_process(self, scan_sets, trims_sets, output_template, normalize=True, plot=True, 
                     convert_to_photons=False, output_dir=None):
@@ -1216,7 +1380,9 @@ class RSoXRProcessor:
     def process_auto_groups(self, scan_groups, output_template="{sample_name}_{energy:.1f}eV.dat", 
                       normalize=True, plot=True, convert_to_photons=False, trims=None, 
                       output_dir=None, plot_prefix_template=None, save_metadata=True,
-                      estimate_thickness=True, min_prominence=0.1):
+                      estimate_thickness=True, min_prominence=0.1, 
+                      min_thickness_nm=20, max_thickness_nm=100, smooth_data=False,
+                      savgol_window=None, savgol_order=2, remove_zeros=True):
         """
         Process automatically detected scan groups
         
@@ -1247,6 +1413,18 @@ class RSoXRProcessor:
             Whether to estimate film thickness from fringe spacing
         min_prominence : float
             Minimum prominence for peak/valley detection in thickness estimation
+        min_thickness_nm : float
+            Minimum expected film thickness in nm
+        max_thickness_nm : float
+            Maximum expected film thickness in nm
+        smooth_data : bool
+            Whether to apply smoothing to the data 
+        savgol_window : int, optional
+            Window size for Savitzky-Golay filter. Must be odd and >= 5.
+        savgol_order : int
+            Polynomial order for the Savitzky-Golay filter. Default is 2.
+        remove_zeros : bool
+            Whether to remove data points with zero intensity
             
         Returns:
         --------
@@ -1311,7 +1489,13 @@ class RSoXRProcessor:
                 plot_prefix=plot_prefix,
                 save_metadata=save_metadata,
                 estimate_thickness=estimate_thickness,
-                min_prominence=min_prominence
+                min_prominence=min_prominence,
+                min_thickness_nm=min_thickness_nm,
+                max_thickness_nm=max_thickness_nm,
+                smooth_data=smooth_data,
+                savgol_window=savgol_window,
+                savgol_order=savgol_order,
+                remove_zeros=remove_zeros
             )
             
             results.append(result)
@@ -1425,8 +1609,10 @@ class RSoXRProcessor:
             return csv_path
 
 
-
-    def estimate_film_thickness(self, reflectivity_data, min_prominence=0.1, plot=True, output_dir=None, plot_prefix=None):
+    def estimate_film_thickness(self, reflectivity_data, min_prominence=0.1, min_spacing=0.01, 
+                            max_spacing=0.3, min_thickness_nm=20, max_thickness_nm=100, 
+                            plot=True, output_dir=None, plot_prefix=None, smooth_data=True,
+                            savgol_window=None, savgol_order=2):
         """
         Estimate the film thickness based on the fringe spacing in Q-space
         
@@ -1436,12 +1622,29 @@ class RSoXRProcessor:
             Reduced reflectivity data with columns [Q, R, error]
         min_prominence : float
             Minimum prominence for peak/valley detection
+        min_spacing : float
+            Minimum spacing between adjacent peaks/valleys in Q-space (Å⁻¹)
+            For a 100nm film, fringe spacing is ~0.031 Å⁻¹
+        max_spacing : float
+            Maximum spacing between adjacent peaks/valleys in Q-space (Å⁻¹)
+            For a 20nm film, fringe spacing is ~0.157 Å⁻¹
+        min_thickness_nm : float
+            Minimum expected film thickness in nm
+        max_thickness_nm : float
+            Maximum expected film thickness in nm
         plot : bool
             Whether to generate plots during processing
         output_dir : str, optional
             Directory to save plots if provided
         plot_prefix : str, optional
             Prefix for plot filenames
+        smooth_data : bool
+            Whether to apply smoothing to the data before peak detection
+        savgol_window : int, optional
+            Window size for Savitzky-Golay filter. Must be odd and >= 5.
+            If None, will be automatically determined based on data size.
+        savgol_order : int
+            Polynomial order for the Savitzky-Golay filter. Default is 2.
             
         Returns:
         --------
@@ -1453,41 +1656,132 @@ class RSoXRProcessor:
             Positions of detected valleys in Q-space
         """
         import numpy as np
-        from scipy.signal import find_peaks, peak_prominences
+        from scipy.signal import find_peaks, peak_prominences, savgol_filter
         import matplotlib.pyplot as plt
         import os
+        
+        # Convert thickness range to expected fringe spacing range
+        min_fringe_spacing = 2 * np.pi / (max_thickness_nm * 10)  # max thickness -> min spacing
+        max_fringe_spacing = 2 * np.pi / (min_thickness_nm * 10)  # min thickness -> max spacing
+        
+        print(f"Expected fringe spacing range: {min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹")
+        print(f"Based on thickness range: {min_thickness_nm} - {max_thickness_nm} nm")
+        
+        # Use user-specified spacing if provided
+        if min_spacing > 0:
+            min_fringe_spacing = min_spacing
+        if max_spacing > 0:
+            max_fringe_spacing = max_spacing
         
         # Extract Q and reflectivity
         Q = reflectivity_data[:, 0]
         R = reflectivity_data[:, 1]
         
-        # Take log of reflectivity
-        log_R = np.log10(R)
+        # Sort data by Q values (just to be safe)
+        sort_indices = np.argsort(Q)
+        Q = Q[sort_indices]
+        R = R[sort_indices]
+        
+        # Apply smoothing if requested
+        if smooth_data:
+            # Determine the best window size for Savitzky-Golay filter (must be odd)
+            if savgol_window is None:
+                window_size = max(min(25, len(Q) // 10 * 2 + 1), 5)
+                if window_size % 2 == 0:
+                    window_size += 1
+            else:
+                # Use the user-specified window size
+                window_size = savgol_window
+                # Ensure it's odd and at least 5
+                if window_size % 2 == 0:
+                    window_size += 1
+                window_size = max(window_size, 5)
+                
+            print(f"Using Savitzky-Golay filter with window size: {window_size}, order: {savgol_order}")
+                
+            # Apply Savitzky-Golay filter to reduce noise
+            try:
+                log_R_smooth = savgol_filter(np.log10(R), window_size, savgol_order)
+            except Exception as e:
+                print(f"Warning: Smoothing failed ({str(e)}), using raw data")
+                log_R_smooth = np.log10(R)
+        else:
+            log_R_smooth = np.log10(R)
         
         # Find the valleys (minima) in the reflectivity
         # For valleys, we'll find peaks in the negative of log_R
-        valley_indices, _ = find_peaks(-log_R, prominence=min_prominence)
-        valley_positions = Q[valley_indices]
-        valley_values = log_R[valley_indices]
+        valley_indices, valley_props = find_peaks(-log_R_smooth, 
+                                                prominence=min_prominence,
+                                                distance=int(min_fringe_spacing / (Q[1] - Q[0])))
+        
+        if len(valley_indices) > 0:
+            valley_positions = Q[valley_indices]
+            valley_values = log_R_smooth[valley_indices]
+            valley_prominences = peak_prominences(-log_R_smooth, valley_indices)[0]
+        else:
+            valley_positions = np.array([])
+            valley_values = np.array([])
+            valley_prominences = np.array([])
         
         # Find the peaks (maxima) in the reflectivity
-        peak_indices, _ = find_peaks(log_R, prominence=min_prominence)
-        peak_positions = Q[peak_indices]
-        peak_values = log_R[peak_indices]
+        peak_indices, peak_props = find_peaks(log_R_smooth, 
+                                            prominence=min_prominence,
+                                            distance=int(min_fringe_spacing / (Q[1] - Q[0])))
         
-        # Calculate the average spacing between adjacent minima
+        if len(peak_indices) > 0:
+            peak_positions = Q[peak_indices]
+            peak_values = log_R_smooth[peak_indices]
+            peak_prominences = peak_prominences(log_R_smooth, peak_indices)[0]
+        else:
+            peak_positions = np.array([])
+            peak_values = np.array([])
+            peak_prominences = np.array([])
+        
+        # Filter out peak/valley pairs that are too close or too far apart
+        valid_valley_spacings = []
+        valid_valley_positions = []
+        
         if len(valley_positions) >= 2:
             valley_spacings = np.diff(valley_positions)
-            avg_valley_spacing = np.mean(valley_spacings)
+            
+            # Filter valid spacings
+            valid_indices = np.where((valley_spacings >= min_fringe_spacing) & 
+                                    (valley_spacings <= max_fringe_spacing))[0]
+            
+            # Get valid spacings
+            if len(valid_indices) > 0:
+                for idx in valid_indices:
+                    valid_valley_spacings.append(valley_spacings[idx])
+                    valid_valley_positions.append(valley_positions[idx:idx+2])
+        
+        # Calculate valley-based thickness
+        if valid_valley_spacings:
+            avg_valley_spacing = np.mean(valid_valley_spacings)
             valley_thickness = 2 * np.pi / avg_valley_spacing
         else:
             avg_valley_spacing = None
             valley_thickness = None
         
-        # Calculate the average spacing between adjacent maxima
+        # Similarly for peaks
+        valid_peak_spacings = []
+        valid_peak_positions = []
+        
         if len(peak_positions) >= 2:
             peak_spacings = np.diff(peak_positions)
-            avg_peak_spacing = np.mean(peak_spacings)
+            
+            # Filter valid spacings
+            valid_indices = np.where((peak_spacings >= min_fringe_spacing) & 
+                                (peak_spacings <= max_fringe_spacing))[0]
+            
+            # Get valid spacings
+            if len(valid_indices) > 0:
+                for idx in valid_indices:
+                    valid_peak_spacings.append(peak_spacings[idx])
+                    valid_peak_positions.append(peak_positions[idx:idx+2])
+        
+        # Calculate peak-based thickness
+        if valid_peak_spacings:
+            avg_peak_spacing = np.mean(valid_peak_spacings)
             peak_thickness = 2 * np.pi / avg_peak_spacing
         else:
             avg_peak_spacing = None
@@ -1503,85 +1797,113 @@ class RSoXRProcessor:
         # Calculate final thickness estimate
         if thicknesses:
             thickness = np.mean(thicknesses)
+            thickness_nm = thickness / 10  # Convert Å to nm
         else:
             thickness = None
+            thickness_nm = None
         
         # Print results
         print("\nFilm Thickness Estimation Results:")
         print("-" * 40)
         
         if valley_thickness is not None:
-            print(f"Valley-based estimate: {valley_thickness:.1f} Å")
+            print(f"Valley-based estimate: {valley_thickness:.1f} Å ({valley_thickness/10:.1f} nm)")
             print(f"  Average spacing between valleys: {avg_valley_spacing:.4f} Å⁻¹")
-            print(f"  Number of valleys detected: {len(valley_positions)}")
+            print(f"  Number of valid valley spacings: {len(valid_valley_spacings)}")
         else:
-            print("Not enough valleys detected for thickness estimation")
+            print("No valid valley spacings detected for thickness estimation")
         
         if peak_thickness is not None:
-            print(f"Peak-based estimate: {peak_thickness:.1f} Å")
+            print(f"Peak-based estimate: {peak_thickness:.1f} Å ({peak_thickness/10:.1f} nm)")
             print(f"  Average spacing between peaks: {avg_peak_spacing:.4f} Å⁻¹")
-            print(f"  Number of peaks detected: {len(peak_positions)}")
+            print(f"  Number of valid peak spacings: {len(valid_peak_spacings)}")
         else:
-            print("Not enough peaks detected for thickness estimation")
+            print("No valid peak spacings detected for thickness estimation")
         
         if thickness is not None:
-            print(f"\nFinal thickness estimate: {thickness:.1f} Å")
+            print(f"\nFinal thickness estimate: {thickness:.1f} Å ({thickness_nm:.1f} nm)")
         else:
-            print("\nCould not estimate thickness - insufficient peaks/valleys detected")
-            print("Try adjusting the min_prominence parameter")
+            print("\nCould not estimate thickness - insufficient valid peaks/valleys detected")
+            print(f"Try adjusting the spacing range ({min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹)")
+            print(f"Or min_prominence parameter (currently {min_prominence})")
         
         # Create plot if requested
         if plot and (valley_positions.size > 0 or peak_positions.size > 0):
-            plt.figure(figsize=(10, 6))
+            plt.figure(figsize=(12, 8))
             
             # Plot the reflectivity data
-            plt.plot(Q, log_R, 'b-', label='log(Reflectivity)')
+            plt.plot(Q, log_R_smooth, 'b-', label='log(Reflectivity) [Smoothed]')
+            if smooth_data:
+                plt.plot(Q, np.log10(R), 'b-', alpha=0.3, label='log(Reflectivity) [Raw]')
             
-            # Mark the valleys
-            if valley_positions.size > 0:
-                plt.plot(valley_positions, valley_values, 'rv', markersize=8, label='Valleys')
-                
-                # Annotate the valley spacing
-                for i in range(len(valley_positions)-1):
-                    spacing = valley_positions[i+1] - valley_positions[i]
-                    midpoint = (valley_positions[i] + valley_positions[i+1]) / 2
-                    mid_height = np.interp(midpoint, Q, log_R)
-                    plt.annotate(f"{spacing:.4f}", 
-                               xy=(midpoint, mid_height),
-                               xytext=(0, -20),
-                               textcoords='offset points',
-                               ha='center',
-                               arrowprops=dict(arrowstyle='->'))
+            # Mark all detected valleys
+            if len(valley_positions) > 0:
+                plt.plot(valley_positions, valley_values, 'rv', markersize=8, alpha=0.5, label='All Valleys')
             
-            # Mark the peaks
-            if peak_positions.size > 0:
-                plt.plot(peak_positions, peak_values, 'go', markersize=8, label='Peaks')
+            # Mark all detected peaks
+            if len(peak_positions) > 0:
+                plt.plot(peak_positions, peak_values, 'go', markersize=8, alpha=0.5, label='All Peaks')
+            
+            # Mark valid valley pairs
+            for pos_pair in valid_valley_positions:
+                idx1 = np.where(valley_positions == pos_pair[0])[0][0]
+                idx2 = np.where(valley_positions == pos_pair[1])[0][0]
                 
-                # Annotate the peak spacing
-                for i in range(len(peak_positions)-1):
-                    spacing = peak_positions[i+1] - peak_positions[i]
-                    midpoint = (peak_positions[i] + peak_positions[i+1]) / 2
-                    mid_height = np.interp(midpoint, Q, log_R)
-                    plt.annotate(f"{spacing:.4f}", 
-                               xy=(midpoint, mid_height),
-                               xytext=(0, 20),
-                               textcoords='offset points',
-                               ha='center',
-                               arrowprops=dict(arrowstyle='->'))
+                spacing = pos_pair[1] - pos_pair[0]
+                midpoint = (pos_pair[0] + pos_pair[1]) / 2
+                
+                plt.plot(pos_pair, [valley_values[idx1], valley_values[idx2]], 'r-', linewidth=2)
+                plt.annotate(f"{spacing:.4f}", 
+                        xy=(midpoint, np.interp(midpoint, Q, log_R_smooth)),
+                        xytext=(0, -20),
+                        textcoords='offset points',
+                        ha='center',
+                        color='red',
+                        arrowprops=dict(arrowstyle='->', color='red'))
+            
+            # Mark valid peak pairs
+            for pos_pair in valid_peak_positions:
+                idx1 = np.where(peak_positions == pos_pair[0])[0][0]
+                idx2 = np.where(peak_positions == pos_pair[1])[0][0]
+                
+                spacing = pos_pair[1] - pos_pair[0]
+                midpoint = (pos_pair[0] + pos_pair[1]) / 2
+                
+                plt.plot(pos_pair, [peak_values[idx1], peak_values[idx2]], 'g-', linewidth=2)
+                plt.annotate(f"{spacing:.4f}", 
+                        xy=(midpoint, np.interp(midpoint, Q, log_R_smooth)),
+                        xytext=(0, 20),
+                        textcoords='offset points',
+                        ha='center',
+                        color='green',
+                        arrowprops=dict(arrowstyle='->', color='green'))
             
             # Add thickness annotation
             if thickness is not None:
-                title = f"Film Thickness Estimation: {thickness:.1f} Å"
+                title = f"Film Thickness Estimation: {thickness:.1f} Å ({thickness_nm:.1f} nm)"
                 if valley_thickness is not None and peak_thickness is not None:
-                    title += f" (P: {peak_thickness:.1f} Å, V: {valley_thickness:.1f} Å)"
+                    title += f"\nPeak-based: {peak_thickness:.1f} Å, Valley-based: {valley_thickness:.1f} Å"
             else:
-                title = "Film Thickness Estimation: Insufficient Data"
+                title = "Film Thickness Estimation: Insufficient Valid Data"
                 
             plt.title(title)
             plt.xlabel('Q (Å⁻¹)')
             plt.ylabel('log(Reflectivity)')
             plt.legend()
             plt.grid(True, linestyle='--', alpha=0.7)
+            
+            # Add a text box with parameter settings
+            textbox_props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+            info_text = (
+                f"Parameters:\n"
+                f"Min prominence: {min_prominence}\n"
+                f"Q spacing range: {min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹\n"
+                f"Expected thickness: {min_thickness_nm} - {max_thickness_nm} nm\n"
+                f"Savgol window: {window_size if smooth_data else 'N/A'}"
+            )
+            plt.text(0.02, 0.02, info_text, transform=plt.gca().transAxes, 
+                    fontsize=9, verticalalignment='bottom', horizontalalignment='left',
+                    bbox=textbox_props)
             
             # Save plot if output directory is specified
             if output_dir:
@@ -1598,6 +1920,7 @@ class RSoXRProcessor:
         
         # Return the results
         return thickness, peak_positions, valley_positions
+    
 
     def save_reduced_data_metadata(self, scan_group, reduced_data, output_dir=None, output_format='csv'):
         """
