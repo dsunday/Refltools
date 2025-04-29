@@ -1384,11 +1384,12 @@ class RSoXRProcessor:
         return trims
     
     def process_auto_groups(self, scan_groups, output_template="{sample_name}_{energy:.1f}eV.dat", 
-                  normalize=True, plot=True, convert_to_photons=False, trims=None, 
-                  output_dir=None, plot_prefix_template=None, save_metadata=True,
-                  estimate_thickness=True, min_prominence=0.1, 
-                  min_thickness_nm=20, max_thickness_nm=100, smooth_data=False,
-                  savgol_window=None, savgol_order=2, remove_zeros=True):
+                      normalize=True, plot=True, convert_to_photons=False, trims=None, 
+                      output_dir=None, plot_prefix_template=None, save_metadata=True,
+                      estimate_thickness=True, min_prominence=0.1, 
+                      min_thickness_nm=20, max_thickness_nm=100, smooth_data=False,
+                      savgol_window=None, savgol_order=2, remove_zeros=True,
+                      hybrid_trim_first=None):
         """
         Process automatically detected scan groups
         
@@ -1431,149 +1432,100 @@ class RSoXRProcessor:
             Polynomial order for the Savitzky-Golay filter. Default is 2.
         remove_zeros : bool
             Whether to remove data points with zero intensity
+        hybrid_trim_first : int or None
+            If not None, manually set the start trim value for the first file in each group
+            while auto-determining trims for remaining files. This value will be used as the
+            first trim's start value.
             
         Returns:
         --------
-        results : dict
-            Dictionary containing processed reflectivity data for successful groups
-            and error information for failed groups
+        results : list
+            List of processed reflectivity data
         """
-        results = {'successful': {}, 'failed': {}}
+        results = []
         
         # Create output directory if specified
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
             print(f"Output will be saved to directory: {output_dir}")
         
-        # Create a log file for errors if output_dir is specified
-        error_log_path = None
-        if output_dir:
-            error_log_path = os.path.join(output_dir, "processing_errors.log")
-            with open(error_log_path, 'w') as f:
-                f.write("RSoXR Processing Errors\n")
-                f.write("=" * 80 + "\n\n")
-        
         for i, group in enumerate(scan_groups):
-            try:
-                print(f"\nProcessing group {i+1}/{len(scan_groups)}: {group['sample_name']} at {group['energy']:.1f} eV")
-                
-                # Generate output filename from template
-                output_filename = output_template.format(
+            print(f"\nProcessing group {i+1}/{len(scan_groups)}: {group['sample_name']} at {group['energy']:.1f} eV")
+            
+            # Generate output filename from template
+            output_filename = output_template.format(
+                sample_name=group['sample_name'],
+                energy=group['energy'],
+                index=i+1
+            )
+            
+            # Generate plot prefix if template provided
+            if plot_prefix_template:
+                plot_prefix = plot_prefix_template.format(
                     sample_name=group['sample_name'],
                     energy=group['energy'],
                     index=i+1
                 )
-                
-                # Generate plot prefix if template provided
-                if plot_prefix_template:
-                    plot_prefix = plot_prefix_template.format(
-                        sample_name=group['sample_name'],
-                        energy=group['energy'],
-                        index=i+1
-                    )
-                else:
-                    # Default to using output filename without extension
-                    plot_prefix = os.path.splitext(output_filename)[0]
-                
-                # Determine which trims to use
-                group_trims = group['trims']  # Default to using group's trims
-                
-                if trims is not None:
-                    if isinstance(trims, dict) and i in trims:
-                        # Use the trim values for this group index
-                        group_trims = trims[i]
-                        print(f"  Using custom trims for group {i+1}")
-                    elif isinstance(trims, list) and i < len(trims):
-                        # Use the trim values at this index
-                        group_trims = trims[i]
-                        print(f"  Using custom trims for group {i+1}")
-                    else:
-                        print(f"  No custom trims specified for group {i+1}, using defaults")
-                
-                # Create a copy of the group with updated trims
-                current_group = group.copy()
-                current_group['trims'] = group_trims
-                
-                # Process this scan set
-                result = self.process_scan_set(
-                    scan_group=current_group, 
-                    output_filename=output_filename,
-                    normalize=normalize,
-                    plot=plot,
-                    convert_to_photons=convert_to_photons,
-                    output_dir=output_dir,
-                    plot_prefix=plot_prefix,
-                    save_metadata=save_metadata,
-                    estimate_thickness=estimate_thickness,
-                    min_prominence=min_prominence,
-                    min_thickness_nm=min_thickness_nm,
-                    max_thickness_nm=max_thickness_nm,
-                    smooth_data=smooth_data,
-                    savgol_window=savgol_window,
-                    savgol_order=savgol_order,
-                    remove_zeros=remove_zeros
-                )
-                
-                # Store successful result
-                results['successful'][i] = {
-                    'sample_name': group['sample_name'],
-                    'energy': group['energy'],
-                    'result': result
-                }
-                
-            except Exception as e:
-                import traceback
-                error_traceback = traceback.format_exc()
-                
-                error_message = f"Error processing group {i+1} ({group['sample_name']} at {group['energy']:.1f} eV): {str(e)}"
-                print(f"\n{'!'*100}\n{error_message}")
-                print(f"This group will be flagged for manual inspection.")
-                print(f"{'!'*100}\n")
-                
-                # Store error information
-                results['failed'][i] = {
-                    'sample_name': group['sample_name'],
-                    'energy': group['energy'],
-                    'error': str(e),
-                    'traceback': error_traceback
-                }
-                
-                # Log detailed error information to file if output_dir is specified
-                if error_log_path:
-                    with open(error_log_path, 'a') as f:
-                        f.write(f"Group {i+1}: {group['sample_name']} at {group['energy']:.1f} eV\n")
-                        f.write(f"Error: {str(e)}\n")
-                        f.write(f"Files: {', '.join([os.path.basename(f) for f in group['files']])}\n")
-                        f.write(f"Traceback:\n{error_traceback}\n")
-                        f.write("-" * 80 + "\n\n")
-        
-        # Summarize results
-        print("\n" + "="*50)
-        print(f"Processing Summary: {len(results['successful'])} successful, {len(results['failed'])} failed")
-        
-        if results['failed']:
-            print("\nGroups that need manual inspection:")
-            for idx, failure in results['failed'].items():
-                print(f"  - Group {idx+1}: {failure['sample_name']} at {failure['energy']:.1f} eV")
-                print(f"    Error: {failure['error']}")
+            else:
+                # Default to using output filename without extension
+                plot_prefix = os.path.splitext(output_filename)[0]
             
-            # Create a separate file with information for manual processing
-            if output_dir:
-                manual_file_path = os.path.join(output_dir, "manual_processing_needed.txt")
-                with open(manual_file_path, 'w') as f:
-                    f.write("Groups that need manual inspection:\n")
-                    f.write("=" * 80 + "\n\n")
-                    for idx, failure in results['failed'].items():
-                        group = scan_groups[idx]
-                        f.write(f"Group {idx+1}: {failure['sample_name']} at {failure['energy']:.1f} eV\n")
-                        f.write(f"Error: {failure['error']}\n")
-                        f.write(f"Files:\n")
-                        for file_path in group['files']:
-                            f.write(f"  - {file_path}\n")
-                        f.write("\n")
-                print(f"\nDetailed information saved to {manual_file_path}")
-        
+            # Determine which trims to use
+            group_trims = group['trims']  # Default to using group's trims
+            
+            if trims is not None:
+                if isinstance(trims, dict) and i in trims:
+                    # Use the trim values for this group index
+                    group_trims = trims[i]
+                    print(f"  Using custom trims for group {i+1}")
+                elif isinstance(trims, list) and i < len(trims):
+                    # Use the trim values at this index
+                    group_trims = trims[i]
+                    print(f"  Using custom trims for group {i+1}")
+                else:
+                    print(f"  No custom trims specified for group {i+1}, using defaults")
+            
+            # Apply hybrid trim if specified - autodetect all trims except the first file's start trim
+            if hybrid_trim_first is not None:
+                if len(group_trims) > 0:
+                    # Auto-determine trims for all files
+                    auto_trims = self._determine_trims(group['files'])
+                    
+                    # But replace just the first file's start value with the manual one
+                    auto_trims[0] = (hybrid_trim_first, auto_trims[0][1])
+                    
+                    # Update group_trims with the hybrid approach
+                    group_trims = auto_trims
+                    print(f"  Using hybrid trimming: manual start trim ({hybrid_trim_first}) for first file, auto-detected trims for others")
+            
+            # Create a copy of the group with updated trims
+            current_group = group.copy()
+            current_group['trims'] = group_trims
+            
+            # Process this scan set
+            result = self.process_scan_set(
+                scan_group=current_group, 
+                output_filename=output_filename,
+                normalize=normalize,
+                plot=plot,
+                convert_to_photons=convert_to_photons,
+                output_dir=output_dir,
+                plot_prefix=plot_prefix,
+                save_metadata=save_metadata,
+                estimate_thickness=estimate_thickness,
+                min_prominence=min_prominence,
+                min_thickness_nm=min_thickness_nm,
+                max_thickness_nm=max_thickness_nm,
+                smooth_data=smooth_data,
+                savgol_window=savgol_window,
+                savgol_order=savgol_order,
+                remove_zeros=remove_zeros
+            )
+            
+            results.append(result)
+            
         return results
+
 
     def save_scan_groups_to_table(self, scan_groups, output_format='csv', output_dir=None):
         """
