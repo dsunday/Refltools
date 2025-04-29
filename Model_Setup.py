@@ -1337,3 +1337,282 @@ def interpolate_sld_from_file(file_path, target_energy):
     sld_imag = imag_interp(target_energy)
     
     return sld_real, sld_imag
+
+
+
+
+
+
+
+
+####Parameter Bound update Functions######
+
+
+
+def update_parameter_bounds(objective, parameter_name, new_bounds, verbose=True):
+    """
+    Update the bounds of a specific parameter in a refnx objective.
+    
+    Args:
+        objective: The refnx objective function to update
+        parameter_name (str): Name of the parameter to update
+        new_bounds (tuple): New bounds as (lower, upper)
+        verbose (bool): Whether to print information about the update
+        
+    Returns:
+        bool: True if parameter was found and updated, False otherwise
+    """
+    # Check inputs
+    if not hasattr(objective, 'parameters'):
+        if verbose:
+            print("Error: Objective does not have a parameters attribute")
+        return False
+    
+    if not isinstance(new_bounds, tuple) or len(new_bounds) != 2:
+        if verbose:
+            print("Error: new_bounds must be a tuple of (lower, upper)")
+        return False
+    
+    lower_bound, upper_bound = new_bounds
+    
+    if lower_bound >= upper_bound:
+        if verbose:
+            print("Error: Lower bound must be less than upper bound")
+        return False
+    
+    # Find the parameter by name
+    found = False
+    for param in objective.parameters.flattened():
+        if param.name == parameter_name:
+            # Store old bounds for reporting
+            old_bounds = None
+            try:
+                bounds = getattr(param, 'bounds', None)
+                if bounds is not None:
+                    # Extract bound values
+                    if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                        old_bounds = (bounds.lb, bounds.ub)
+                    elif isinstance(bounds, tuple) and len(bounds) == 2:
+                        old_bounds = bounds
+            except Exception as e:
+                if verbose:
+                    print(f"Warning: Could not get current bounds for {parameter_name}: {str(e)}")
+            
+            # Set the new bounds
+            try:
+                param.bounds = new_bounds
+                found = True
+                
+                if verbose:
+                    if old_bounds:
+                        print(f"Updated bounds for {parameter_name}: {old_bounds} -> {new_bounds}")
+                    else:
+                        print(f"Set bounds for {parameter_name} to {new_bounds}")
+            except Exception as e:
+                if verbose:
+                    print(f"Error updating bounds for {parameter_name}: {str(e)}")
+                return False
+            
+            break
+    
+    if not found and verbose:
+        print(f"Parameter '{parameter_name}' not found in the objective")
+    
+    return found
+
+
+def update_multiple_parameter_bounds(objective, parameters_dict, verbose=True):
+    """
+    Update bounds for multiple parameters in a refnx objective.
+    
+    Args:
+        objective: The refnx objective function to update
+        parameters_dict (dict): Dictionary mapping parameter names to new bounds tuples
+        verbose (bool): Whether to print information about the updates
+        
+    Returns:
+        dict: Dictionary of results for each parameter (True if updated, False if not)
+    """
+    results = {}
+    
+    for param_name, new_bounds in parameters_dict.items():
+        results[param_name] = update_parameter_bounds(
+            objective, param_name, new_bounds, verbose=verbose
+        )
+    
+    if verbose:
+        num_updated = sum(1 for success in results.values() if success)
+        print(f"Updated {num_updated} of {len(parameters_dict)} parameters")
+    
+    return results
+
+
+def expand_sld_parameter_bounds(objective, parameter_names=None, expansion_factor=1.5, min_bound=None, 
+                               filter_pattern='sld', verbose=True):
+    """
+    Expand bounds for SLD parameters in a refnx objective.
+    
+    Args:
+        objective: The refnx objective function to update
+        parameter_names (list, optional): List of specific parameter names to update.
+                                       If None, update all parameters matching filter_pattern.
+        expansion_factor (float): Factor to expand bounds by (around the current value or midpoint)
+        min_bound (float, optional): Minimum value for lower bounds (useful for imaginary SLDs)
+        filter_pattern (str): Pattern to match parameter names if parameter_names is None
+        verbose (bool): Whether to print information about the updates
+        
+    Returns:
+        dict: Dictionary of results for each parameter (True if updated, False if not)
+    """
+    import re
+    
+    # Check if we need to find parameters by pattern
+    if parameter_names is None:
+        parameter_names = []
+        for param in objective.parameters.flattened():
+            if re.search(filter_pattern, param.name, re.IGNORECASE):
+                parameter_names.append(param.name)
+    
+    if verbose:
+        print(f"Found {len(parameter_names)} parameters to update")
+    
+    # Collect bounds to update
+    bounds_to_update = {}
+    
+    for param_name in parameter_names:
+        # Find the parameter
+        param = None
+        for p in objective.parameters.flattened():
+            if p.name == param_name:
+                param = p
+                break
+        
+        if param is None:
+            if verbose:
+                print(f"Parameter '{param_name}' not found")
+            continue
+        
+        # Get current bounds
+        current_bounds = None
+        try:
+            bounds = getattr(param, 'bounds', None)
+            if bounds is not None:
+                # Extract bound values
+                if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                    current_bounds = (bounds.lb, bounds.ub)
+                elif isinstance(bounds, tuple) and len(bounds) == 2:
+                    current_bounds = bounds
+        except Exception as e:
+            if verbose:
+                print(f"Warning: Could not get current bounds for {param_name}: {str(e)}")
+            continue
+        
+        if current_bounds is None:
+            if verbose:
+                print(f"Parameter '{param_name}' has no bounds to expand")
+            continue
+        
+        # Calculate new bounds
+        current_value = param.value
+        low, high = current_bounds
+        
+        # Calculate midpoint (either current value or middle of bounds)
+        if low <= current_value <= high:
+            midpoint = current_value
+        else:
+            midpoint = (low + high) / 2
+        
+        # Calculate expanded range
+        current_range = high - low
+        expanded_range = current_range * expansion_factor
+        
+        # Calculate new bounds centered on midpoint
+        new_low = midpoint - expanded_range / 2
+        new_high = midpoint + expanded_range / 2
+        
+        # Enforce minimum bound if specified
+        if min_bound is not None and 'isld' in param_name.lower():
+            new_low = max(new_low, min_bound)
+        
+        bounds_to_update[param_name] = (new_low, new_high)
+    
+    # Update all bounds
+    return update_multiple_parameter_bounds(objective, bounds_to_update, verbose=verbose)
+
+
+def get_parameter_info(objective, parameter_pattern=None):
+    """
+    Get information about parameters in a refnx objective.
+    
+    Args:
+        objective: The refnx objective function to query
+        parameter_pattern (str, optional): Pattern to filter parameter names
+        
+    Returns:
+        pandas.DataFrame: DataFrame containing parameter information
+    """
+    import pandas as pd
+    import re
+    
+    # Initialize lists to store parameter information
+    param_info = []
+    
+    # Iterate through all parameters
+    for param in objective.parameters.flattened():
+        # Skip if pattern doesn't match
+        if parameter_pattern and not re.search(parameter_pattern, param.name, re.IGNORECASE):
+            continue
+        
+        # Get basic parameter info
+        info = {
+            'name': param.name,
+            'value': param.value,
+            'stderr': getattr(param, 'stderr', None),
+            'vary': getattr(param, 'vary', None),
+            'bound_low': None,
+            'bound_high': None,
+            'near_bounds': False
+        }
+        
+        # Get bounds if available
+        try:
+            bounds = getattr(param, 'bounds', None)
+            if bounds is not None:
+                # Extract bound values
+                if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                    info['bound_low'] = bounds.lb
+                    info['bound_high'] = bounds.ub
+                elif isinstance(bounds, tuple) and len(bounds) == 2:
+                    info['bound_low'], info['bound_high'] = bounds
+        except Exception:
+            pass
+        
+        # Check if parameter is near bounds
+        if info['bound_low'] is not None and info['bound_high'] is not None:
+            bound_range = info['bound_high'] - info['bound_low']
+            threshold = 0.02 * bound_range  # 2% threshold
+            
+            if bound_range > 0:
+                near_low = abs(info['value'] - info['bound_low']) < threshold
+                near_high = abs(info['bound_high'] - info['value']) < threshold
+                info['near_bounds'] = near_low or near_high
+        
+        param_info.append(info)
+    
+    # Create DataFrame
+    if param_info:
+        df = pd.DataFrame(param_info)
+        
+        # Add bound percentage column
+        df['bound_pct'] = None
+        mask = (df['bound_high'].notnull() & df['bound_low'].notnull() & 
+               (df['bound_high'] > df['bound_low']))
+        
+        df.loc[mask, 'bound_pct'] = ((df.loc[mask, 'value'] - df.loc[mask, 'bound_low']) / 
+                                    (df.loc[mask, 'bound_high'] - df.loc[mask, 'bound_low']) * 100)
+        
+        return df
+    else:
+        return pd.DataFrame(columns=['name', 'value', 'stderr', 'vary', 
+                                   'bound_low', 'bound_high', 'near_bounds', 'bound_pct'])
+
