@@ -223,7 +223,10 @@ def generate_layer_params_with_flexible_bounds(energy_materials, base_layer_para
             # Get the SLD values for this material at this energy
             material_sld = material_sld_map[material_name]
             real_sld = material_sld["real"]
-            imag_sld = material_sld["imag"]
+            
+            # For the imaginary part, we need the magnitude of the complex number
+            imag_sld_complex = material_sld["imag"]
+            imag_sld = abs(imag_sld_complex)  # Get magnitude for bounds
             
             # Check if explicit SLD bounds are provided in base_layer_params
             has_explicit_real_bounds = "sld_real_bounds" in params
