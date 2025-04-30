@@ -6,6 +6,7 @@ import re
 import numpy as np
 from refnx.dataset import ReflectDataset
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 from Model_Setup import create_reflectometry_model, create_model_and_objective, SLDinterp, run_fitting, print_fit_results, log_fitting_results
 from Plotting_Refl import modelcomparisonplot, profileflip
@@ -3311,3 +3312,665 @@ def interactive_parameter_explorer(objectives_dict, structures_dict, energy_list
     ])
     
     return main_widget
+
+
+# First, install the ipympl package if you haven't already
+# Uncomment and run this cell if needed
+# !pip install ipympl
+
+# Set the matplotlib backend - CRITICAL FOR VS CODE INTERACTIVITY
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.gridspec import GridSpec
+import matplotlib.cm as cm
+
+def create_vscode_sld_explorer(objectives_dict, structures_dict, energy_list=None, 
+                             material_name="PS", parameter_type='sld', 
+                             figsize=(12, 10), min_bound=None):
+    """
+    Create an interactive plot for VS Code where clicking on a point in the SLD vs energy plot
+    shows the corresponding reflectivity curve.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to include. If None, uses all available energies.
+        material_name (str): Name of the material to analyze
+        parameter_type (str): Type of parameter to plot ('sld' or 'isld')
+        figsize (tuple): Figure size as (width, height)
+        min_bound (float, optional): Minimum y-axis value for SLD plot
+        
+    Returns:
+        matplotlib.figure.Figure: Interactive figure
+    """
+    # Determine the available energies
+    if energy_list is None:
+        available_energies = sorted(list(set(objectives_dict.keys()) & set(structures_dict.keys())))
+    else:
+        # Filter by available data
+        available_energies = []
+        for energy in energy_list:
+            if energy in objectives_dict and energy in structures_dict:
+                available_energies.append(energy)
+    
+    if not available_energies:
+        print("No valid energies found.")
+        return None
+    
+    # Extract SLD values and parameter info for each energy
+    param_data = []
+    param_string = f"{material_name} - {parameter_type}"
+    
+    for energy in available_energies:
+        # Get objective for this energy
+        objective = objectives_dict[energy]
+        
+        # Find the specified parameter
+        found = False
+        for param in objective.parameters.flattened():
+            if param.name == param_string:
+                value = param.value
+                stderr = getattr(param, 'stderr', None)
+                bound_low = None
+                bound_high = None
+                
+                try:
+                    bounds = getattr(param, 'bounds', None)
+                    if bounds is not None:
+                        # Extract bound values
+                        if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                            bound_low = bounds.lb
+                            bound_high = bounds.ub
+                        elif isinstance(bounds, tuple) and len(bounds) == 2:
+                            bound_low, bound_high = bounds
+                except:
+                    pass
+                
+                param_data.append({
+                    'energy': energy,
+                    'value': value,
+                    'stderr': stderr if stderr is not None else 0,
+                    'bound_low': bound_low,
+                    'bound_high': bound_high,
+                    'chi_squared': objective.chisqr()
+                })
+                found = True
+                break
+        
+        if not found:
+            print(f"Parameter {param_string} not found for energy {energy}")
+    
+    if not param_data:
+        print(f"No data found for parameter {param_string}")
+        return None
+    
+    # Convert to DataFrame for easier handling
+    df = pd.DataFrame(param_data)
+    df = df.sort_values('energy')
+    
+    # Create figure with custom layout
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(3, 3, figure=fig, height_ratios=[1, 1, 2])
+    
+    # SLD vs Energy plot (top left)
+    ax_sld = fig.add_subplot(gs[0, :2])
+    # Reflectivity plot (bottom)
+    ax_refl = fig.add_subplot(gs[2, :])
+    # SLD profile plot (top right)
+    ax_profile = fig.add_subplot(gs[0:2, 2])
+    # Chi-squared plot (middle left)
+    ax_chi = fig.add_subplot(gs[1, :2])
+    
+    # Create a colormap based on chi-squared values
+    if len(df) > 1:
+        norm = plt.Normalize(df['chi_squared'].min(), df['chi_squared'].max())
+    else:
+        norm = plt.Normalize(0, 1)
+    
+    # Color points by chi-squared
+    sld_points = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        point = ax_sld.scatter(
+            row['energy'], 
+            row['value'],
+            s=64,  # Larger size for better clickability
+            c=[cm.viridis(norm(row['chi_squared']))],
+            picker=5  # Enable picking with a 5 pixel tolerance
+        )
+        sld_points.append(point)
+    
+    # Add error bars separately (without picker to avoid confusion)
+    ax_sld.errorbar(
+        df['energy'], 
+        df['value'],
+        yerr=df['stderr'],
+        fmt='none',  # No markers
+        ecolor='gray',
+        alpha=0.5
+    )
+    
+    # Set up the colorbar for chi-squared
+    sm = plt.cm.ScalarMappable(cmap=cm.viridis, norm=norm)
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax_sld, label='Chi-squared')
+    
+    # Add bounds as a shaded region
+    has_bounds = df['bound_low'].notna().any() and df['bound_high'].notna().any()
+    if has_bounds:
+        # Get min and max energies
+        min_energy = df['energy'].min()
+        max_energy = df['energy'].max()
+        
+        # Create arrays for bounds
+        x_bounds = np.linspace(min_energy, max_energy, 100)
+        y_low = np.interp(x_bounds, df['energy'][df['bound_low'].notna()], 
+                         df['bound_low'][df['bound_low'].notna()])
+        y_high = np.interp(x_bounds, df['energy'][df['bound_high'].notna()], 
+                          df['bound_high'][df['bound_high'].notna()])
+        
+        # Plot bounds
+        ax_sld.fill_between(x_bounds, y_low, y_high, alpha=0.2, color='gray')
+    
+    # Set labels and title for SLD plot
+    y_label = 'Real SLD (10⁻⁶ Å⁻²)' if parameter_type == 'sld' else 'Imaginary SLD (10⁻⁶ Å⁻²)'
+    ax_sld.set_xlabel('Energy (eV)')
+    ax_sld.set_ylabel(y_label)
+    ax_sld.set_title(f'{y_label} vs Energy for {material_name}')
+    ax_sld.grid(True, alpha=0.3)
+    
+    # Set minimum y value if specified
+    if min_bound is not None:
+        ylim = ax_sld.get_ylim()
+        ax_sld.set_ylim(min_bound, ylim[1])
+    
+    # Plot chi-squared vs energy
+    chi_points = ax_chi.scatter(
+        df['energy'], 
+        df['chi_squared'], 
+        c='red', 
+        s=64,
+        picker=5
+    )
+    ax_chi.plot(df['energy'], df['chi_squared'], 'r-', alpha=0.5)
+    ax_chi.set_xlabel('Energy (eV)')
+    ax_chi.set_ylabel('Chi-squared')
+    ax_chi.set_title('Goodness of Fit vs Energy')
+    ax_chi.grid(True, alpha=0.3)
+    
+    # Use log scale for chi-squared if values vary by more than a factor of 10
+    if df['chi_squared'].max() / df['chi_squared'].min() > 10:
+        ax_chi.set_yscale('log')
+    
+    # Text annotations for info display
+    energy_text = fig.text(0.02, 0.02, "", fontsize=10, transform=fig.transFigure)
+    value_text = fig.text(0.3, 0.02, "", fontsize=10, transform=fig.transFigure)
+    gof_text = fig.text(0.6, 0.02, "", fontsize=10, transform=fig.transFigure)
+    
+    # Create a vertical line to show the current energy on the SLD plot
+    energy_line = ax_sld.axvline(x=df['energy'].iloc[0], color='red', linestyle='--', alpha=0.7)
+    
+    # Create a vertical line for the chi-squared plot
+    chi_line = ax_chi.axvline(x=df['energy'].iloc[0], color='red', linestyle='--', alpha=0.7)
+    
+    # Create highlight point to mark the selected energy in SLD plot
+    highlight_point = ax_sld.plot(df['energy'].iloc[0], df['value'].iloc[0], 'o', 
+                                 color='red', markersize=12, alpha=0.7)[0]
+    
+    # Function to update the plots when a point is clicked
+    def update_plots(energy):
+        # Find the index for this energy
+        idx = df[df['energy'] == energy].index
+        if len(idx) == 0:
+            return
+        idx = idx[0]
+        
+        # Get the value and chi-squared for this energy
+        value = df.loc[idx, 'value']
+        chi_squared = df.loc[idx, 'chi_squared']
+        
+        # Update vertical lines
+        energy_line.set_xdata([energy, energy])
+        chi_line.set_xdata([energy, energy])
+        
+        # Update highlight point
+        highlight_point.set_data([energy], [value])
+        
+        # Get the objective and structure for this energy
+        obj = objectives_dict[energy]
+        structure = structures_dict[energy]
+        
+        # Update reflectivity plot
+        ax_refl.clear()
+        data = obj.data
+        ax_refl.plot(data.data[0], data.data[1], 'o', label='Data', markersize=3)
+        ax_refl.plot(data.data[0], obj.model(data.data[0]), '-', label='Simulation')
+        ax_refl.set_yscale('log')
+        ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
+        ax_refl.set_ylabel('Reflectivity (a.u)')
+        ax_refl.set_title(f'Reflectivity - {energy} eV (χ²: {chi_squared:.4f})')
+        ax_refl.grid(True, alpha=0.3)
+        ax_refl.legend(loc='best')
+        
+        # Update SLD profile plot
+        ax_profile.clear()
+        
+        # Get SLD profiles
+        from Plotting_Refl import profileflip
+        Real_depth, Real_SLD, Imag_Depth, Imag_SLD = profileflip(structure, depth_shift=0)
+        
+        # Apply profile shift
+        profile_shift = -20
+        Real_depth = Real_depth + profile_shift
+        Imag_Depth = Imag_Depth + profile_shift
+        
+        # Plot SLD profiles
+        ax_profile.plot(Real_depth, Real_SLD, 'b-', label='Real SLD')
+        ax_profile.plot(Imag_Depth, Imag_SLD, 'b--', label='Imag SLD')
+        ax_profile.set_xlabel(r'Distance from Si ($\AA$)')
+        ax_profile.set_ylabel(r'SLD $(10^{-6})$ $\AA^{-2}$')
+        ax_profile.set_title(f'SLD Profile - {energy} eV')
+        ax_profile.grid(True, alpha=0.3)
+        ax_profile.legend(loc='best')
+        
+        # Update text annotations
+        energy_text.set_text(f"Energy: {energy} eV")
+        value_text.set_text(f"{parameter_type.upper()}: {value:.6g}")
+        gof_text.set_text(f"χ²: {chi_squared:.4g}")
+        
+        # Force the figure to update
+        fig.canvas.draw_idle()
+    
+    # Connect the pick event
+    def on_pick(event):
+        # Check if we have a valid pick event with data points
+        if hasattr(event, 'ind') and len(event.ind) > 0:
+            # Get the artist that was picked
+            artist = event.artist
+            
+            # Determine which energy was clicked
+            ind = event.ind[0]  # Use the first point if multiple were picked
+            
+            # Extract the energy value depending on which plot was clicked
+            if artist in sld_points or artist == chi_points:
+                # Get x data from the artist
+                xdata = artist.get_offsets()[:, 0]
+                # Get the energy at the picked index
+                energy = xdata[ind]
+                # Update the plots
+                update_plots(energy)
+    
+    # Connect the pick event to the figure
+    fig.canvas.mpl_connect('pick_event', on_pick)
+    
+    # Initial update with the first energy
+    update_plots(df['energy'].iloc[0])
+    
+    plt.tight_layout(rect=[0, 0.05, 1, 1])  # Adjust layout to make room for text
+    
+    print("The plot is now interactive. Click on any point to update the reflectivity and SLD profile.")
+    print("If clicking doesn't work, make sure you have installed ipympl and used %matplotlib widget.")
+    
+    return fig
+
+# Example usage:
+# fig = create_vscode_sld_explorer(objectives_dict, structures_dict, material_name="PS", parameter_type='sld')
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.gridspec import GridSpec
+import matplotlib.cm as cm
+
+def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_list=None, 
+                                    material_name="PS", figsize=(14, 12)):
+    """
+    Create an interactive plot for VS Code where clicking on a parameter's energy trend
+    shows the corresponding reflectivity curve and SLD profile.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to include. If None, uses all available energies.
+        material_name (str): Name of the material to analyze
+        figsize (tuple): Figure size as (width, height)
+        
+    Returns:
+        matplotlib.figure.Figure: Interactive figure
+    """
+    # Determine the available energies
+    if energy_list is None:
+        available_energies = sorted(list(set(objectives_dict.keys()) & set(structures_dict.keys())))
+    else:
+        # Filter by available data
+        available_energies = []
+        for energy in energy_list:
+            if energy in objectives_dict and energy in structures_dict:
+                available_energies.append(energy)
+    
+    if not available_energies:
+        print("No valid energies found.")
+        return None
+    
+    # Extract parameter values and info for each energy
+    param_strings = [
+        f"{material_name} - sld",
+        f"{material_name} - isld",
+        f"{material_name} - thick",
+        f"{material_name} - rough"
+    ]
+    
+    # Initialize data structure
+    param_data = {param: [] for param in param_strings}
+    chi_squared_data = []
+    
+    for energy in available_energies:
+        # Get objective for this energy
+        objective = objectives_dict[energy]
+        chi_squared = objective.chisqr()
+        chi_squared_data.append({'energy': energy, 'chi_squared': chi_squared})
+        
+        # Find parameter values
+        for param_string in param_strings:
+            found = False
+            for param in objective.parameters.flattened():
+                if param.name == param_string:
+                    value = param.value
+                    stderr = getattr(param, 'stderr', None)
+                    bound_low = None
+                    bound_high = None
+                    
+                    try:
+                        bounds = getattr(param, 'bounds', None)
+                        if bounds is not None:
+                            # Extract bound values
+                            if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                                bound_low = bounds.lb
+                                bound_high = bounds.ub
+                            elif isinstance(bounds, tuple) and len(bounds) == 2:
+                                bound_low, bound_high = bounds
+                    except:
+                        pass
+                    
+                    param_data[param_string].append({
+                        'energy': energy,
+                        'value': value,
+                        'stderr': stderr if stderr is not None else 0,
+                        'bound_low': bound_low,
+                        'bound_high': bound_high,
+                        'chi_squared': chi_squared
+                    })
+                    found = False # Stop looking after finding the first match
+                    break
+            
+            if not found:
+                print(f"Parameter {param_string} not found for one or more energies")
+    
+    # Convert to DataFrames
+    param_dfs = {}
+    for param_string, data in param_data.items():
+        if data:
+            df = pd.DataFrame(data)
+            param_dfs[param_string] = df.sort_values('energy')
+    
+    chi_squared_df = pd.DataFrame(chi_squared_data).sort_values('energy')
+    
+    # Create figure with custom layout
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(4, 3, figure=fig, height_ratios=[1, 1, 1, 1.5])
+    
+    # Create axis for each parameter (4 rows)
+    ax_sld = fig.add_subplot(gs[0, :2])
+    ax_isld = fig.add_subplot(gs[1, :2])
+    ax_thick = fig.add_subplot(gs[2, :2])
+    ax_chi = fig.add_subplot(gs[3, :2])
+    
+    # Create axis for reflectivity and SLD profile (right column)
+    ax_refl = fig.add_subplot(gs[2:4, 2])
+    ax_profile = fig.add_subplot(gs[0:2, 2])
+    
+    # Dictionary to store scatter plots for interaction
+    scatter_plots = {}
+    
+    # Plot parameters vs Energy with error bars
+    if f"{material_name} - sld" in param_dfs:
+        df = param_dfs[f"{material_name} - sld"]
+        scatter_plots['sld'] = ax_sld.scatter(
+            df['energy'], df['value'], 
+            s=64, color='blue', picker=5,
+            label=f"{material_name} - sld"
+        )
+        # Add error bars separately
+        ax_sld.errorbar(
+            df['energy'], df['value'], 
+            yerr=df['stderr'], 
+            fmt='none', ecolor='gray', alpha=0.5
+        )
+        ax_sld.set_ylabel('Real SLD\n(10⁻⁶ Å⁻²)')
+        ax_sld.set_title(f'Real SLD vs Energy for {material_name}')
+        ax_sld.grid(True, alpha=0.3)
+    
+    if f"{material_name} - isld" in param_dfs:
+        df = param_dfs[f"{material_name} - isld"]
+        scatter_plots['isld'] = ax_isld.scatter(
+            df['energy'], df['value'], 
+            s=64, color='orange', picker=5,
+            label=f"{material_name} - isld"
+        )
+        # Add error bars separately
+        ax_isld.errorbar(
+            df['energy'], df['value'], 
+            yerr=df['stderr'], 
+            fmt='none', ecolor='gray', alpha=0.5
+        )
+        ax_isld.set_ylabel('Imag SLD\n(10⁻⁶ Å⁻²)')
+        ax_isld.set_title(f'Imaginary SLD vs Energy for {material_name}')
+        ax_isld.grid(True, alpha=0.3)
+    
+    if f"{material_name} - thick" in param_dfs:
+        df = param_dfs[f"{material_name} - thick"]
+        scatter_plots['thick'] = ax_thick.scatter(
+            df['energy'], df['value'], 
+            s=64, color='green', picker=5,
+            label=f"{material_name} - thick"
+        )
+        # Add error bars separately
+        ax_thick.errorbar(
+            df['energy'], df['value'], 
+            yerr=df['stderr'], 
+            fmt='none', ecolor='gray', alpha=0.5
+        )
+        ax_thick.set_ylabel('Thickness (Å)')
+        ax_thick.set_title(f'Thickness vs Energy for {material_name}')
+        ax_thick.grid(True, alpha=0.3)
+    
+    # Plot chi-squared vs energy
+    scatter_plots['chi'] = ax_chi.scatter(
+        chi_squared_df['energy'], chi_squared_df['chi_squared'], 
+        s=64, color='red', picker=5
+    )
+    ax_chi.plot(chi_squared_df['energy'], chi_squared_df['chi_squared'], 'r-', alpha=0.5)
+    ax_chi.set_xlabel('Energy (eV)')
+    ax_chi.set_ylabel('Chi-squared')
+    ax_chi.set_title('Goodness of Fit vs Energy')
+    ax_chi.grid(True, alpha=0.3)
+    
+    # Use log scale for chi-squared if values vary by more than a factor of 10
+    if chi_squared_df['chi_squared'].max() / chi_squared_df['chi_squared'].min() > 10:
+        ax_chi.set_yscale('log')
+    
+    # Text annotations for info display
+    energy_text = fig.text(0.02, 0.02, "", fontsize=10, transform=fig.transFigure)
+    sld_text = fig.text(0.25, 0.02, "", fontsize=10, transform=fig.transFigure)
+    isld_text = fig.text(0.45, 0.02, "", fontsize=10, transform=fig.transFigure)
+    thick_text = fig.text(0.65, 0.02, "", fontsize=10, transform=fig.transFigure)
+    gof_text = fig.text(0.85, 0.02, "", fontsize=10, transform=fig.transFigure)
+    
+    # Create vertical lines for each plot
+    energy_lines = {}
+    if f"{material_name} - sld" in param_dfs:
+        energy_lines['sld'] = ax_sld.axvline(
+            x=available_energies[0], color='red', linestyle='--', alpha=0.7
+        )
+    if f"{material_name} - isld" in param_dfs:
+        energy_lines['isld'] = ax_isld.axvline(
+            x=available_energies[0], color='red', linestyle='--', alpha=0.7
+        )
+    if f"{material_name} - thick" in param_dfs:
+        energy_lines['thick'] = ax_thick.axvline(
+            x=available_energies[0], color='red', linestyle='--', alpha=0.7
+        )
+    energy_lines['chi'] = ax_chi.axvline(
+        x=available_energies[0], color='red', linestyle='--', alpha=0.7
+    )
+    
+    # Create highlight points for each parameter
+    highlight_points = {}
+    if f"{material_name} - sld" in param_dfs:
+        df = param_dfs[f"{material_name} - sld"]
+        if not df.empty:
+            highlight_points['sld'] = ax_sld.plot(
+                df['energy'].iloc[0], df['value'].iloc[0], 
+                'o', color='red', markersize=12, alpha=0.7
+            )[0]
+    
+    if f"{material_name} - isld" in param_dfs:
+        df = param_dfs[f"{material_name} - isld"]
+        if not df.empty:
+            highlight_points['isld'] = ax_isld.plot(
+                df['energy'].iloc[0], df['value'].iloc[0], 
+                'o', color='red', markersize=12, alpha=0.7
+            )[0]
+    
+    if f"{material_name} - thick" in param_dfs:
+        df = param_dfs[f"{material_name} - thick"]
+        if not df.empty:
+            highlight_points['thick'] = ax_thick.plot(
+                df['energy'].iloc[0], df['value'].iloc[0], 
+                'o', color='red', markersize=12, alpha=0.7
+            )[0]
+    
+    # Function to update the plots when a point is clicked
+    def update_plots(energy):
+        # Update vertical lines
+        for line in energy_lines.values():
+            line.set_xdata([energy, energy])
+        
+        # Get the objective and structure for this energy
+        obj = objectives_dict[energy]
+        structure = structures_dict[energy]
+        
+        # Find values for this energy
+        sld_value = None
+        isld_value = None
+        thick_value = None
+        rough_value = None
+        
+        if f"{material_name} - sld" in param_dfs:
+            df = param_dfs[f"{material_name} - sld"]
+            row = df[df['energy'] == energy]
+            if not row.empty:
+                sld_value = row['value'].iloc[0]
+                if 'sld' in highlight_points:
+                    highlight_points['sld'].set_data([energy], [sld_value])
+        
+        if f"{material_name} - isld" in param_dfs:
+            df = param_dfs[f"{material_name} - isld"]
+            row = df[df['energy'] == energy]
+            if not row.empty:
+                isld_value = row['value'].iloc[0]
+                if 'isld' in highlight_points:
+                    highlight_points['isld'].set_data([energy], [isld_value])
+        
+        if f"{material_name} - thick" in param_dfs:
+            df = param_dfs[f"{material_name} - thick"]
+            row = df[df['energy'] == energy]
+            if not row.empty:
+                thick_value = row['value'].iloc[0]
+                if 'thick' in highlight_points:
+                    highlight_points['thick'].set_data([energy], [thick_value])
+        
+        if f"{material_name} - rough" in param_dfs:
+            df = param_dfs[f"{material_name} - rough"]
+            row = df[df['energy'] == energy]
+            if not row.empty:
+                rough_value = row['value'].iloc[0]
+        
+        chi_row = chi_squared_df[chi_squared_df['energy'] == energy]
+        chi_squared = chi_row['chi_squared'].iloc[0] if not chi_row.empty else None
+        
+        # Update reflectivity plot
+        ax_refl.clear()
+        data = obj.data
+        ax_refl.plot(data.data[0], data.data[1], 'o', label='Data', markersize=3)
+        ax_refl.plot(data.data[0], obj.model(data.data[0]), '-', label='Simulation')
+        ax_refl.set_yscale('log')
+        ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
+        ax_refl.set_ylabel('Reflectivity (a.u)')
+        ax_refl.set_title(f'Reflectivity - {energy} eV (χ²: {chi_squared:.4f})')
+        ax_refl.grid(True, alpha=0.3)
+        ax_refl.legend(loc='best')
+        
+        # Update SLD profile plot
+        ax_profile.clear()
+        
+        # Get SLD profiles
+        from Plotting_Refl import profileflip
+        Real_depth, Real_SLD, Imag_Depth, Imag_SLD = profileflip(structure, depth_shift=0)
+        
+        # Apply profile shift
+        profile_shift = -20
+        Real_depth = Real_depth + profile_shift
+        Imag_Depth = Imag_Depth + profile_shift
+        
+        # Plot SLD profiles
+        ax_profile.plot(Real_depth, Real_SLD, 'b-', label='Real SLD')
+        ax_profile.plot(Imag_Depth, Imag_SLD, 'b--', label='Imag SLD')
+        ax_profile.set_xlabel(r'Distance from Si ($\AA$)')
+        ax_profile.set_ylabel(r'SLD $(10^{-6})$ $\AA^{-2}$')
+        ax_profile.set_title(f'SLD Profile - {energy} eV')
+        ax_profile.grid(True, alpha=0.3)
+        ax_profile.legend(loc='best')
+        
+        # Update text annotations
+        energy_text.set_text(f"Energy: {energy} eV")
+        sld_text.set_text(f"SLD: {sld_value:.4g}" if sld_value is not None else "")
+        isld_text.set_text(f"iSLD: {isld_value:.4g}" if isld_value is not None else "")
+        thick_text.set_text(f"Thick: {thick_value:.1f} Å" if thick_value is not None else "")
+        gof_text.set_text(f"χ²: {chi_squared:.4g}" if chi_squared is not None else "")
+        
+        # Force the figure to update
+        fig.canvas.draw_idle()
+    
+    # Add click event handler
+    def on_pick(event):
+        # Check if we have a valid pick event with data points
+        if hasattr(event, 'ind') and len(event.ind) > 0:
+            # Get the artist that was picked
+            artist = event.artist
+            
+            # Determine which energy was clicked
+            ind = event.ind[0]  # Use the first point if multiple were picked
+            
+            # Extract the energy value from the offsets
+            xdata = artist.get_offsets()[:, 0]
+            energy = xdata[ind]
+            
+            # Update the plots
+            update_plots(energy)
+    
+    # Connect the pick event to the figure
+    fig.canvas.mpl_connect('pick_event', on_pick)
+    
+    # Initial update with the first energy
+    update_plots(available_energies[0])
+    
+    plt.tight_layout(rect=[0, 0.05, 1, 1])  # Adjust layout to make room for text
+    
+    print("The plot is now interactive. Click on any point to update the reflectivity and SLD profile.")
+    print("If clicking doesn't work, make sure you've restarted the kernel after installing ipympl.")
+    
+    return fig
