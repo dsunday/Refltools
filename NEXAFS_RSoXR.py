@@ -1378,7 +1378,7 @@ def plot_energy_dependent_parameters(results_df, energy_list, material_name,
             # Plot bounds as vertical error bars if available
             if data['bound_low'] is not None and data['bound_high'] is not None:
                 # Plot vertical range with slightly wider horizontal lines
-                bound_width = 0.03 * (max(energy_list) - min(energy_list))  # 3% of x-axis range
+                bound_width = 0.003 * (max(energy_list) - min(energy_list))  # 0.3% of x-axis range
                 
                 # Draw bounds as vertical line
                 ax.plot([data['energy'], data['energy']], 
@@ -1402,7 +1402,7 @@ def plot_energy_dependent_parameters(results_df, energy_list, material_name,
                 fmt='o', 
                 color=color, 
                 markersize=8, 
-                capsize=5
+                capsize=1
             )
         
         # Set labels and title
@@ -1570,7 +1570,7 @@ def compare_sld_with_nexafs(results_df, energy_list, material_name,
                 # Plot bounds as vertical error bars if available
                 if data['bound_low'] is not None and data['bound_high'] is not None:
                     # Plot vertical range with slightly wider horizontal lines
-                    bound_width = 0.03 * (max(energy_list) - min(energy_list))  # 3% of x-axis range
+                    bound_width = 0.003 * (max(energy_list) - min(energy_list))  # 0.3% of x-axis range
                     
                     # Draw bounds as vertical line
                     ax.plot([data['energy'], data['energy']], 
@@ -2510,3 +2510,801 @@ def plot_iteration_analysis(analysis, figsize=(14, 14), save_path=None):
     
     return fig, axes
 
+
+
+
+# Visualization Widgets
+
+def create_interactive_model_visualizer(objectives_dict, structures_dict, energy_list=None, 
+                                 shade_start=None, profile_shift=-20, xlim=None, 
+                                 fig_size_w=14, colors=None):
+    """
+    Create an interactive widget to visualize reflectometry models for specific energies.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to include. If None, uses all available energies.
+        shade_start (float, optional): Starting position for layer shading
+        profile_shift (float): Shift applied to depth profiles
+        xlim (list, optional): Custom x-axis limits for SLD plots as [min, max]
+        fig_size_w (float): Width of the figure
+        colors (list, optional): List of colors for layer shading
+        
+    Returns:
+        ipywidgets.VBox: Interactive widget for model visualization
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    import ipywidgets as widgets
+    from IPython.display import display, clear_output
+    
+    # Determine the available energies
+    if energy_list is None:
+        available_energies = sorted(list(set(objectives_dict.keys()) & set(structures_dict.keys())))
+    else:
+        # Filter by available data
+        available_energies = []
+        for energy in energy_list:
+            if energy in objectives_dict and energy in structures_dict:
+                available_energies.append(energy)
+    
+    if not available_energies:
+        return widgets.HTML("<b>No valid energies to visualize.</b>")
+    
+    # Create widgets
+    energy_dropdown = widgets.Dropdown(
+        options=[(f"{energy} eV", energy) for energy in available_energies],
+        description='Energy:',
+        style={'description_width': 'initial'}
+    )
+    
+    # Add button to navigate through energies
+    prev_button = widgets.Button(description='Previous')
+    next_button = widgets.Button(description='Next')
+    
+    # Chi-squared label
+    chi_label = widgets.Label(value="Chi-squared: N/A")
+    
+    # Create the output widget for the plots
+    output = widgets.Output()
+    
+    # Create the subplot function
+    def create_plots(energy):
+        # Get the objective and structure for this energy
+        obj = objectives_dict[energy]
+        structure = structures_dict[energy]
+        
+        # Calculate chi-squared
+        try:
+            chi_squared = obj.chisqr()
+            chi_label.value = f"Chi-squared: {chi_squared:.4f}"
+        except:
+            chi_label.value = "Chi-squared: N/A"
+        
+        # Create figure with custom layout
+        fig = plt.figure(figsize=(fig_size_w, 8))
+        gs = GridSpec(2, 1, height_ratios=[1, 1], figure=fig)
+        
+        # Create axes
+        ax_refl = fig.add_subplot(gs[0])
+        ax_sld = fig.add_subplot(gs[1])
+        
+        # Extract data from objective
+        data = obj.data
+        
+        # Plot reflectivity data
+        ax_refl.plot(data.data[0], data.data[1], label='Data')
+        ax_refl.set_yscale('log')
+        ax_refl.plot(data.data[0], obj.model(data.data[0]), label='Simulation')
+        ax_refl.legend(loc='upper right')
+        ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
+        ax_refl.set_ylabel('Reflectivity (a.u)')
+        ax_refl.set_title(f'Reflectivity - {energy} eV (χ²: {chi_squared:.4f})')
+        
+        # Plot SLD profiles
+        from Plotting_Refl import profileflip
+        Real_depth, Real_SLD, Imag_Depth, Imag_SLD = profileflip(structure, depth_shift=0)
+        
+        # Apply manual shift
+        Real_depth = Real_depth + profile_shift
+        Imag_Depth = Imag_Depth + profile_shift
+        
+        # Set initial plot
+        ax_sld.plot(Real_depth, Real_SLD, color='blue', label='Real SLD', zorder=2)
+        ax_sld.plot(Imag_Depth, Imag_SLD, linestyle='dashed', color='blue', label='Im SLD', zorder=2)
+        
+        # Set custom xlim if provided
+        if xlim is not None:
+            ax_sld.set_xlim(xlim)
+        
+        # Shade layers
+        slabs = structure.slabs()
+        num_layers = len(slabs)
+        
+        # Auto-calculate shade_start if not provided
+        if shade_start is None:
+            current_shade_start = 0
+        else:
+            current_shade_start = shade_start
+        
+        # Set default colors if not provided
+        if colors is None:
+            colors = ['silver', 'grey', 'blue', 'violet', 'orange', 'purple', 'red', 'green', 'yellow']
+        
+        # Calculate layer positions
+        thicknesses = [current_shade_start]
+        
+        # Extract parameter values
+        pvals = obj.parameters.pvals
+        
+        # Extract thicknesses from slabs or parameter values
+        for j in range(1, num_layers):
+            thickness_index = (num_layers - j - 1) * 5 + 9  # Based on your pattern
+            
+            if thickness_index < len(pvals):
+                thicknesses.append(thicknesses[-1] + pvals[thickness_index])
+            else:
+                # Fallback to using slab thickness
+                thicknesses.append(thicknesses[-1] + slabs[j]['thickness'])
+        
+        # Add silver shading between 0 and the first layer
+        if len(thicknesses) > 0:
+            ax_sld.axvspan(0, thicknesses[0], color='silver', alpha=0.3, zorder=0)
+        
+        # Shade each layer
+        for j in range(len(thicknesses) - 1):
+            color_index = min(j, len(colors) - 1)
+            ax_sld.axvspan(thicknesses[j], thicknesses[j + 1], 
+                          color=colors[color_index], alpha=0.2, zorder=1)
+        
+        # Add legend and axis labels
+        ax_sld.legend(loc='upper right')
+        ax_sld.set_xlabel(r'Distance from Si ($\AA$)')
+        ax_sld.set_ylabel(r'SLD $(10^{-6})$ $\AA^{-2}$')
+        ax_sld.set_title(f'SLD Profile - {energy} eV')
+        
+        plt.tight_layout()
+        return fig
+    
+    # Update function for the widget
+    def update_plot(change=None):
+        with output:
+            clear_output(wait=True)
+            energy = energy_dropdown.value
+            fig = create_plots(energy)
+            plt.show()
+    
+    # Define button click handlers
+    def on_prev_button_clicked(b):
+        current_index = available_energies.index(energy_dropdown.value)
+        if current_index > 0:
+            energy_dropdown.value = available_energies[current_index - 1]
+    
+    def on_next_button_clicked(b):
+        current_index = available_energies.index(energy_dropdown.value)
+        if current_index < len(available_energies) - 1:
+            energy_dropdown.value = available_energies[current_index + 1]
+    
+    # Connect handlers
+    energy_dropdown.observe(update_plot, names='value')
+    prev_button.on_click(on_prev_button_clicked)
+    next_button.on_click(on_next_button_clicked)
+    
+    # Create button row
+    button_row = widgets.HBox([prev_button, next_button, chi_label])
+    
+    # Create widget layout
+    widget = widgets.VBox([energy_dropdown, button_row, output])
+    
+    # Initialize the plot
+    update_plot()
+    
+    return widget
+
+
+def create_multi_energy_comparison(objectives_dict, structures_dict, energy_list=None, 
+                                  shade_start=None, profile_shift=-20, xlim=None, 
+                                  fig_size_w=16, colors=None, max_energies=4):
+    """
+    Create an interactive widget to compare multiple energy models side by side.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to include. If None, uses all available energies.
+        shade_start (float, optional): Starting position for layer shading
+        profile_shift (float): Shift applied to depth profiles
+        xlim (list, optional): Custom x-axis limits for SLD plots as [min, max]
+        fig_size_w (float): Width of the figure
+        colors (list, optional): List of colors for layer shading
+        max_energies (int): Maximum number of energies to display at once
+        
+    Returns:
+        ipywidgets.VBox: Interactive widget for model comparison
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import ipywidgets as widgets
+    from IPython.display import display, clear_output
+    
+    # Determine the available energies
+    if energy_list is None:
+        available_energies = sorted(list(set(objectives_dict.keys()) & set(structures_dict.keys())))
+    else:
+        # Filter by available data
+        available_energies = []
+        for energy in energy_list:
+            if energy in objectives_dict and energy in structures_dict:
+                available_energies.append(energy)
+    
+    if not available_energies:
+        return widgets.HTML("<b>No valid energies to visualize.</b>")
+    
+    # Create widgets
+    energy_select = widgets.SelectMultiple(
+        options=[(f"{energy} eV", energy) for energy in available_energies],
+        description='Energies:',
+        rows=min(10, len(available_energies)),
+        style={'description_width': 'initial'}
+    )
+    
+    # Add a button to update the plot
+    update_button = widgets.Button(description='Update Plot')
+    
+    # Add info label
+    info_label = widgets.Label(value=f"Select up to {max_energies} energies to compare")
+    
+    # Create the output widget for the plots
+    output = widgets.Output()
+    
+    # Create the subplot function
+    def create_comparison_plots(selected_energies):
+        # Limit the number of energies
+        if len(selected_energies) > max_energies:
+            selected_energies = selected_energies[:max_energies]
+            info_label.value = f"Showing {max_energies} of {len(selected_energies)} selected energies"
+        else:
+            info_label.value = f"Comparing {len(selected_energies)} energies"
+        
+        n_energies = len(selected_energies)
+        
+        # Prepare lists for the modelcomparisonplot function
+        obj_list = [objectives_dict[energy] for energy in selected_energies]
+        structure_list = [structures_dict[energy] for energy in selected_energies]
+        
+        # Prepare shade_start
+        if shade_start is None:
+            shade_start_list = [0] * n_energies
+        elif isinstance(shade_start, (int, float)):
+            shade_start_list = [shade_start] * n_energies
+        else:
+            shade_start_list = shade_start
+        
+        # Call your modelcomparisonplot function
+        from Plotting_Refl import modelcomparisonplot
+        fig, axes = modelcomparisonplot(
+            obj_list=obj_list, 
+            structure_list=structure_list,
+            shade_start=shade_start_list,
+            profile_shift=profile_shift,
+            xlim=xlim,
+            fig_size_w=fig_size_w,
+            colors=colors
+        )
+        
+        # Add energy labels to each plot
+        if n_energies == 1:
+            # Single plot case
+            axes[0].set_title(f"Reflectivity - {selected_energies[0]} eV")
+            axes[1].set_title(f"SLD Profile - {selected_energies[0]} eV")
+        else:
+            # Multiple plots case
+            for i, energy in enumerate(selected_energies):
+                chi_squared = obj_list[i].chisqr()
+                axes[0, i].set_title(f"Reflectivity - {energy} eV (χ²: {chi_squared:.4f})")
+                axes[1, i].set_title(f"SLD Profile - {energy} eV")
+        
+        plt.tight_layout()
+        return fig
+    
+    # Update function for the widget
+    def update_plot(b):
+        with output:
+            clear_output(wait=True)
+            selected_energies = list(energy_select.value)
+            
+            if not selected_energies:
+                print("Please select at least one energy to visualize.")
+                return
+            
+            fig = create_comparison_plots(selected_energies)
+            plt.show()
+    
+    # Connect handler
+    update_button.on_click(update_plot)
+    
+    # Create widget layout
+    controls = widgets.VBox([energy_select, update_button, info_label])
+    widget = widgets.HBox([controls, output])
+    
+    return widget
+
+
+def analyze_model_parameters_by_energy(objectives_dict, energy_list=None, parameter_patterns=None):
+    """
+    Analyze how parameters change across different energies.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        energy_list (list, optional): List of energies to include. If None, uses all available energies.
+        parameter_patterns (list, optional): List of parameter name patterns to include.
+                                         If None, includes all parameters.
+        
+    Returns:
+        pandas.DataFrame: DataFrame containing parameter values by energy
+    """
+    import pandas as pd
+    import re
+    import numpy as np
+    
+    # Determine the available energies
+    if energy_list is None:
+        energy_list = sorted(objectives_dict.keys())
+    else:
+        # Filter to valid energies
+        energy_list = [e for e in energy_list if e in objectives_dict]
+    
+    if not energy_list:
+        print("No valid energies to analyze.")
+        return pd.DataFrame()
+    
+    # Collect parameter values across energies
+    param_values = {}
+    
+    for energy in energy_list:
+        objective = objectives_dict[energy]
+        
+        for param in objective.parameters.flattened():
+            # Skip if parameter doesn't match patterns
+            if parameter_patterns:
+                if not any(re.search(pattern, param.name, re.IGNORECASE) for pattern in parameter_patterns):
+                    continue
+            
+            # Initialize parameter entry if not already present
+            if param.name not in param_values:
+                param_values[param.name] = {
+                    'values': {},
+                    'bounds': {},
+                    'stderr': {},
+                    'vary': {}
+                }
+            
+            # Store parameter value for this energy
+            param_values[param.name]['values'][energy] = param.value
+            
+            # Store error if available
+            stderr = getattr(param, 'stderr', None)
+            param_values[param.name]['stderr'][energy] = stderr
+            
+            # Store vary flag
+            vary = getattr(param, 'vary', None)
+            param_values[param.name]['vary'][energy] = vary
+            
+            # Store bounds if available
+            bounds = None
+            try:
+                bounds_obj = getattr(param, 'bounds', None)
+                if bounds_obj is not None:
+                    if hasattr(bounds_obj, 'lb') and hasattr(bounds_obj, 'ub'):
+                        bounds = (bounds_obj.lb, bounds_obj.ub)
+                    elif isinstance(bounds_obj, tuple) and len(bounds_obj) == 2:
+                        bounds = bounds_obj
+            except:
+                pass
+            
+            param_values[param.name]['bounds'][energy] = bounds
+    
+    # Create DataFrame
+    rows = []
+    
+    for param_name, param_data in param_values.items():
+        row = {'parameter': param_name}
+        
+        # Add values by energy
+        for energy in energy_list:
+            if energy in param_data['values']:
+                row[f"{energy}"] = param_data['values'][energy]
+                row[f"{energy}_stderr"] = param_data['stderr'].get(energy)
+                
+                # Calculate percentage of bound range
+                bounds = param_data['bounds'].get(energy)
+                if bounds and bounds[0] is not None and bounds[1] is not None:
+                    lower, upper = bounds
+                    value = param_data['values'][energy]
+                    bound_range = upper - lower
+                    
+                    if bound_range > 0:
+                        percentage = (value - lower) / bound_range * 100
+                        row[f"{energy}_bound_pct"] = percentage
+        
+        rows.append(row)
+    
+    # Create DataFrame and sort by parameter name
+    df = pd.DataFrame(rows)
+    
+    if not df.empty:
+        df = df.sort_values('parameter')
+    
+    return df
+
+
+def plot_parameter_energy_trends(param_df, parameter_names=None, figsize=(12, 8)):
+    """
+    Plot trends in parameter values across energies.
+    
+    Args:
+        param_df (DataFrame): DataFrame from analyze_model_parameters_by_energy
+        parameter_names (list, optional): List of parameter names to plot.
+                                      If None, include all parameters.
+        figsize (tuple): Figure size as (width, height)
+        
+    Returns:
+        matplotlib.figure.Figure: Figure object
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import re
+    
+    # Check if DataFrame is valid
+    if param_df.empty:
+        print("Empty DataFrame provided. Nothing to plot.")
+        return None
+    
+    # Extract energy columns (those that don't have '_stderr' or '_bound_pct' suffix)
+    energy_cols = [col for col in param_df.columns 
+                  if col != 'parameter' and '_stderr' not in col and '_bound_pct' not in col]
+    
+    # Convert energy columns to numeric values
+    energies = sorted([float(col) for col in energy_cols])
+    
+    # Filter parameters if needed
+    if parameter_names:
+        df = param_df[param_df['parameter'].isin(parameter_names)].copy()
+    else:
+        df = param_df.copy()
+    
+    if df.empty:
+        print("No parameters match the specified names.")
+        return None
+    
+    # Group parameters by type
+    param_groups = {}
+    
+    for param in df['parameter']:
+        # Try to categorize parameters
+        if 'sld' in param.lower() and 'isld' not in param.lower():
+            group = 'Real SLD'
+        elif 'isld' in param.lower():
+            group = 'Imaginary SLD'
+        elif 'thick' in param.lower():
+            group = 'Thickness'
+        elif 'rough' in param.lower():
+            group = 'Roughness'
+        else:
+            group = 'Other'
+        
+        if group not in param_groups:
+            param_groups[group] = []
+        param_groups[group].append(param)
+    
+    # Determine number of subplots
+    n_groups = len(param_groups)
+    
+    # Create figure and axes
+    fig, axes = plt.subplots(n_groups, 1, figsize=figsize, sharex=True)
+    
+    # Use a single subplot if there's only one group
+    if n_groups == 1:
+        axes = [axes]
+    
+    # Plot each parameter group
+    for i, (group, params) in enumerate(param_groups.items()):
+        ax = axes[i]
+        
+        for param in params:
+            # Extract values for this parameter
+            values = []
+            errors = []
+            
+            for energy in energies:
+                if f"{energy}" in df.columns and param in df['parameter'].values:
+                    param_row = df[df['parameter'] == param]
+                    value = param_row[f"{energy}"].values[0]
+                    error = param_row[f"{energy}_stderr"].values[0] if f"{energy}_stderr" in param_row else None
+                    
+                    values.append(value)
+                    errors.append(error)
+            
+            # Plot values with error bars if available
+            if None not in values:
+                if all(err is not None for err in errors):
+                    ax.errorbar(energies, values, yerr=errors, marker='o', label=param)
+                else:
+                    ax.plot(energies, values, marker='o', label=param)
+        
+        # Set labels and title
+        ax.set_ylabel(group)
+        ax.set_title(f"{group} Parameters vs Energy")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best')
+    
+    # Set x-axis label on the bottom subplot
+    axes[-1].set_xlabel("Energy (eV)")
+    
+    plt.tight_layout()
+    return fig
+
+
+def interactive_parameter_explorer(objectives_dict, structures_dict, energy_list=None):
+    """
+    Create an interactive widget to explore parameter values and model visualizations.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to include. If None, uses all available energies.
+        
+    Returns:
+        ipywidgets.VBox: Interactive widget for parameter exploration
+    """
+    import ipywidgets as widgets
+    from IPython.display import display, clear_output
+    import pandas as pd
+    
+    # Determine the available energies
+    if energy_list is None:
+        available_energies = sorted(list(set(objectives_dict.keys()) & set(structures_dict.keys())))
+    else:
+        # Filter by available data
+        available_energies = []
+        for energy in energy_list:
+            if energy in objectives_dict and energy in structures_dict:
+                available_energies.append(energy)
+    
+    if not available_energies:
+        return widgets.HTML("<b>No valid energies to explore.</b>")
+    
+    # Analyze parameters across energies
+    param_df = analyze_model_parameters_by_energy(objectives_dict, available_energies)
+    
+    # Get unique parameter names
+    if param_df.empty:
+        return widgets.HTML("<b>No parameters found to analyze.</b>")
+    
+    param_names = param_df['parameter'].unique().tolist()
+    
+    # Group parameters by type for the dropdown
+    param_groups = {
+        'SLD Parameters': [p for p in param_names if 'sld' in p.lower()],
+        'Thickness Parameters': [p for p in param_names if 'thick' in p.lower()],
+        'Roughness Parameters': [p for p in param_names if 'rough' in p.lower()],
+        'Other Parameters': [p for p in param_names if not any(x in p.lower() for x in ['sld', 'thick', 'rough'])]
+    }
+    
+    # Create a flattened list of options with group headers
+    dropdown_options = []
+    
+    for group, params in param_groups.items():
+        if params:
+            dropdown_options.append((group, None))  # Add group header
+            dropdown_options.extend([(f"  {p}", p) for p in sorted(params)])  # Add indented parameters
+    
+    # Create widgets
+    param_dropdown = widgets.Dropdown(
+        options=dropdown_options,
+        description='Parameter:',
+        style={'description_width': 'initial'}
+    )
+    
+    energy_select = widgets.SelectMultiple(
+        options=[(f"{energy} eV", energy) for energy in available_energies],
+        description='Energies:',
+        rows=min(6, len(available_energies)),
+        style={'description_width': 'initial'}
+    )
+    
+    # Tabs for different views
+    tab_output = widgets.Output()
+    param_output = widgets.Output()
+    model_output = widgets.Output()
+    trend_output = widgets.Output()
+    
+    tabs = widgets.Tab(children=[tab_output, param_output, model_output, trend_output])
+    tabs.set_title(0, 'Parameter Table')
+    tabs.set_title(1, 'Parameter Details')
+    tabs.set_title(2, 'Model Visualization')
+    tabs.set_title(3, 'Parameter Trends')
+    
+    # Update buttons
+    table_button = widgets.Button(description='Update Table')
+    detail_button = widgets.Button(description='Show Parameter')
+    model_button = widgets.Button(description='Show Models')
+    trend_button = widgets.Button(description='Show Trends')
+    
+    # Filter widgets for table
+    filter_text = widgets.Text(
+        value='',
+        placeholder='Filter parameters...',
+        description='Filter:',
+        style={'description_width': 'initial'}
+    )
+    
+    # Update functions
+    def update_table(b):
+        with tab_output:
+            clear_output(wait=True)
+            # Get selected energies
+            selected_energies = list(energy_select.value)
+            if not selected_energies:
+                selected_energies = available_energies[:5]  # Default to first 5
+            
+            # Filter parameters
+            filter_val = filter_text.value.strip().lower()
+            if filter_val:
+                filtered_df = param_df[param_df['parameter'].str.lower().str.contains(filter_val)]
+            else:
+                filtered_df = param_df
+            
+            # Select columns
+            display_cols = ['parameter']
+            for energy in selected_energies:
+                if f"{energy}" in filtered_df.columns:
+                    display_cols.extend([f"{energy}", f"{energy}_stderr"])
+            
+            # Display table
+            if filtered_df.empty:
+                print("No parameters match the filter criteria.")
+            else:
+                display(filtered_df[display_cols])
+    
+    def show_parameter_details(b):
+        with param_output:
+            clear_output(wait=True)
+            # Get selected parameter
+            param_name = param_dropdown.value
+            
+            if param_name is None:
+                print("Please select a parameter to view.")
+                return
+            
+            # Get parameter data
+            param_row = param_df[param_df['parameter'] == param_name]
+            
+            if param_row.empty:
+                print(f"Parameter '{param_name}' not found in the data.")
+                return
+            
+            # Create a table of values by energy
+            data = []
+            
+            for energy in available_energies:
+                if f"{energy}" in param_row.columns:
+                    value = param_row[f"{energy}"].values[0]
+                    stderr = param_row[f"{energy}_stderr"].values[0] if f"{energy}_stderr" in param_row else None
+                    bound_pct = param_row[f"{energy}_bound_pct"].values[0] if f"{energy}_bound_pct" in param_row else None
+                    
+                    data.append({
+                        'Energy': energy,
+                        'Value': value,
+                        'Std Error': stderr,
+                        'Bound %': bound_pct
+                    })
+            
+            detail_df = pd.DataFrame(data)
+            display(detail_df)
+    
+    def show_models(b):
+        with model_output:
+            clear_output(wait=True)
+            # Get selected energies
+            selected_energies = list(energy_select.value)
+            
+            if not selected_energies:
+                print("Please select at least one energy to visualize.")
+                return
+            
+            if len(selected_energies) > 4:
+                print("Warning: Showing only the first 4 selected energies.")
+                selected_energies = selected_energies[:4]
+            
+            # Prepare lists for the modelcomparisonplot function
+            obj_list = [objectives_dict[energy] for energy in selected_energies]
+            structure_list = [structures_dict[energy] for energy in selected_energies]
+            
+            # Get the modelcomparisonplot function
+            from Plotting_Refl import modelcomparisonplot
+            
+            # Create the plots
+            fig, axes = modelcomparisonplot(
+                obj_list=obj_list, 
+                structure_list=structure_list,
+                shade_start=[0] * len(selected_energies),
+                profile_shift=-20,
+                xlim=None,
+                fig_size_w=14,
+                colors=None
+            )
+            
+            # Add energy labels to each plot
+            if len(selected_energies) == 1:
+                # Single plot case
+                axes[0].set_title(f"Reflectivity - {selected_energies[0]} eV")
+                axes[1].set_title(f"SLD Profile - {selected_energies[0]} eV")
+            else:
+                # Multiple plots case
+                for i, energy in enumerate(selected_energies):
+                    chi_squared = obj_list[i].chisqr()
+                    axes[0, i].set_title(f"Reflectivity - {energy} eV (χ²: {chi_squared:.4f})")
+                    axes[1, i].set_title(f"SLD Profile - {energy} eV")
+            
+            plt.tight_layout()
+            plt.show()
+    
+    def show_parameter_trends(b):
+        with trend_output:
+            clear_output(wait=True)
+            # Get selected parameter
+            param_name = param_dropdown.value
+            
+            if param_name is None:
+                print("Please select a parameter to view trends.")
+                return
+            
+            # Create trend plot
+            fig = plot_parameter_energy_trends(param_df, parameter_names=[param_name], figsize=(10, 6))
+            
+            if fig:
+                plt.show()
+    
+    # Connect handlers
+    table_button.on_click(update_table)
+    detail_button.on_click(show_parameter_details)
+    model_button.on_click(show_models)
+    trend_button.on_click(show_parameter_trends)
+    
+    # Create button rows
+    table_controls = widgets.HBox([filter_text, table_button])
+    detail_controls = widgets.HBox([param_dropdown, detail_button])
+    model_controls = widgets.HBox([widgets.Label("Use energy selection above"), model_button])
+    trend_controls = widgets.HBox([widgets.Label("Use parameter selection above"), trend_button])
+    
+    # Create layout for controls
+    controls = widgets.VBox([
+        widgets.HTML("<b>Select Energies:</b>"),
+        energy_select,
+        widgets.HTML("<hr style='margin:10px 0'>"),
+        widgets.HTML("<b>Table Controls:</b>"),
+        table_controls,
+        widgets.HTML("<hr style='margin:10px 0'>"),
+        widgets.HTML("<b>Parameter Controls:</b>"),
+        detail_controls,
+        widgets.HTML("<hr style='margin:10px 0'>"),
+        widgets.HTML("<b>Model Visualization:</b>"),
+        model_controls,
+        widgets.HTML("<hr style='margin:10px 0'>"),
+        widgets.HTML("<b>Trend Visualization:</b>"),
+        trend_controls
+    ])
+    
+    # Initialize with the table view
+    update_table(None)
+    
+    # Create the main widget
+    main_widget = widgets.VBox([
+        widgets.HTML("<h3>Interactive Parameter Explorer</h3>"),
+        widgets.HBox([controls, tabs])
+    ])
+    
+    return main_widget
