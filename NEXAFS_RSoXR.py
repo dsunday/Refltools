@@ -3626,7 +3626,8 @@ from matplotlib.gridspec import GridSpec
 import matplotlib.cm as cm
 
 def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_list=None, 
-                                    material_name="PS", figsize=(14, 12)):
+                                    material_name="PS", figsize=(14, 12), xlim=None, 
+                                    bound_threshold=0.02):
     """
     Create an interactive plot for VS Code where clicking on a parameter's energy trend
     shows the corresponding reflectivity curve and SLD profile.
@@ -3637,6 +3638,8 @@ def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_li
         energy_list (list, optional): List of energies to include. If None, uses all available energies.
         material_name (str): Name of the material to analyze
         figsize (tuple): Figure size as (width, height)
+        xlim (tuple, optional): Custom x-axis limits for energy plots as (min, max)
+        bound_threshold (float): Threshold for highlighting values near bounds (as fraction of bound range)
         
     Returns:
         matplotlib.figure.Figure: Interactive figure
@@ -3695,19 +3698,28 @@ def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_li
                     except:
                         pass
                     
+                    # Calculate if the value is near bounds
+                    near_bound = False
+                    if bound_low is not None and bound_high is not None:
+                        bound_range = bound_high - bound_low
+                        threshold = bound_threshold * bound_range
+                        near_bound = (abs(value - bound_low) < threshold or 
+                                     abs(bound_high - value) < threshold)
+                    
                     param_data[param_string].append({
                         'energy': energy,
                         'value': value,
                         'stderr': stderr if stderr is not None else 0,
                         'bound_low': bound_low,
                         'bound_high': bound_high,
+                        'near_bound': near_bound,
                         'chi_squared': chi_squared
                     })
-                    found = False # Stop looking after finding the first match
+                    found = True
                     break
             
             if not found:
-                print(f"Parameter {param_string} not found for one or more energies")
+                print(f"Parameter {param_string} not found for energy {energy}")
     
     # Convert to DataFrames
     param_dfs = {}
@@ -3720,72 +3732,139 @@ def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_li
     
     # Create figure with custom layout
     fig = plt.figure(figsize=figsize)
-    gs = GridSpec(4, 3, figure=fig, height_ratios=[1, 1, 1, 1.5])
+    gs = GridSpec(5, 3, figure=fig, height_ratios=[1, 1, 1, 1, 1.5])
     
-    # Create axis for each parameter (4 rows)
+    # Create axis for each parameter (5 rows, including roughness)
     ax_sld = fig.add_subplot(gs[0, :2])
     ax_isld = fig.add_subplot(gs[1, :2])
     ax_thick = fig.add_subplot(gs[2, :2])
-    ax_chi = fig.add_subplot(gs[3, :2])
+    ax_rough = fig.add_subplot(gs[3, :2])
+    ax_chi = fig.add_subplot(gs[4, :2])
     
     # Create axis for reflectivity and SLD profile (right column)
-    ax_refl = fig.add_subplot(gs[2:4, 2])
-    ax_profile = fig.add_subplot(gs[0:2, 2])
+    ax_refl = fig.add_subplot(gs[3:5, 2])
+    ax_profile = fig.add_subplot(gs[0:3, 2])
     
     # Dictionary to store scatter plots for interaction
     scatter_plots = {}
     
-    # Plot parameters vs Energy with error bars
-    if f"{material_name} - sld" in param_dfs:
-        df = param_dfs[f"{material_name} - sld"]
-        scatter_plots['sld'] = ax_sld.scatter(
-            df['energy'], df['value'], 
-            s=64, color='blue', picker=5,
-            label=f"{material_name} - sld"
-        )
-        # Add error bars separately
-        ax_sld.errorbar(
-            df['energy'], df['value'], 
-            yerr=df['stderr'], 
-            fmt='none', ecolor='gray', alpha=0.5
-        )
-        ax_sld.set_ylabel('Real SLD\n(10⁻⁶ Å⁻²)')
-        ax_sld.set_title(f'Real SLD vs Energy for {material_name}')
-        ax_sld.grid(True, alpha=0.3)
+    # Parameter type to color mapping
+    param_colors = {
+        'sld': 'blue',
+        'isld': 'orange',
+        'thick': 'green',
+        'rough': 'purple',
+        'chi': 'red'
+    }
     
-    if f"{material_name} - isld" in param_dfs:
-        df = param_dfs[f"{material_name} - isld"]
-        scatter_plots['isld'] = ax_isld.scatter(
-            df['energy'], df['value'], 
-            s=64, color='orange', picker=5,
-            label=f"{material_name} - isld"
-        )
-        # Add error bars separately
-        ax_isld.errorbar(
+    # Function to plot parameter with bounds, errors, and near-bound highlighting
+    def plot_parameter(ax, param_string, param_type):
+        if param_string not in param_dfs:
+            return None, None
+        
+        df = param_dfs[param_string]
+        
+        # Create masked arrays for normal and near-bound points
+        mask_normal = ~df['near_bound']
+        mask_near_bound = df['near_bound']
+        
+        # Plot normal points
+        if any(mask_normal):
+            normal_scatter = ax.scatter(
+                df.loc[mask_normal, 'energy'], 
+                df.loc[mask_normal, 'value'], 
+                s=64, color=param_colors[param_type], picker=5,
+                label=f"{param_string} (normal)"
+            )
+        else:
+            normal_scatter = None
+            
+        # Plot near-bound points
+        if any(mask_near_bound):
+            near_bound_scatter = ax.scatter(
+                df.loc[mask_near_bound, 'energy'], 
+                df.loc[mask_near_bound, 'value'], 
+                s=64, color='red', picker=5,
+                label=f"{param_string} (near bound)"
+            )
+        else:
+            near_bound_scatter = None
+        
+        # Add bounds as shaded region
+        has_bounds = df['bound_low'].notna().any() and df['bound_high'].notna().any()
+        if has_bounds:
+            # Create arrays for bounds (use only rows with valid bounds)
+            valid_bounds = df['bound_low'].notna() & df['bound_high'].notna()
+            if any(valid_bounds):
+                bound_df = df[valid_bounds].sort_values('energy')
+                
+                # Get energies and bounds
+                energies = bound_df['energy']
+                lower_bounds = bound_df['bound_low']
+                upper_bounds = bound_df['bound_high']
+                
+                # Plot bounds as shaded region
+                ax.fill_between(
+                    energies, lower_bounds, upper_bounds, 
+                    color=param_colors[param_type], alpha=0.1
+                )
+                
+                # Add thin lines for the bounds
+                ax.plot(
+                    energies, lower_bounds, '--', 
+                    color=param_colors[param_type], alpha=0.5, linewidth=1
+                )
+                ax.plot(
+                    energies, upper_bounds, '--', 
+                    color=param_colors[param_type], alpha=0.5, linewidth=1
+                )
+        
+        # Add error bars
+        ax.errorbar(
             df['energy'], df['value'], 
             yerr=df['stderr'], 
             fmt='none', ecolor='gray', alpha=0.5
         )
-        ax_isld.set_ylabel('Imag SLD\n(10⁻⁶ Å⁻²)')
-        ax_isld.set_title(f'Imaginary SLD vs Energy for {material_name}')
-        ax_isld.grid(True, alpha=0.3)
+        
+        # Connect points with a line
+        ax.plot(
+            df['energy'], df['value'], '-', 
+            color=param_colors[param_type], alpha=0.5
+        )
+        
+        # Return combined scatter plot for picker functionality
+        if normal_scatter is not None and near_bound_scatter is not None:
+            # Both types of points exist
+            return (normal_scatter, near_bound_scatter)
+        elif normal_scatter is not None:
+            return normal_scatter, None
+        elif near_bound_scatter is not None:
+            return near_bound_scatter, None
+        else:
+            return None, None
     
-    if f"{material_name} - thick" in param_dfs:
-        df = param_dfs[f"{material_name} - thick"]
-        scatter_plots['thick'] = ax_thick.scatter(
-            df['energy'], df['value'], 
-            s=64, color='green', picker=5,
-            label=f"{material_name} - thick"
-        )
-        # Add error bars separately
-        ax_thick.errorbar(
-            df['energy'], df['value'], 
-            yerr=df['stderr'], 
-            fmt='none', ecolor='gray', alpha=0.5
-        )
-        ax_thick.set_ylabel('Thickness (Å)')
-        ax_thick.set_title(f'Thickness vs Energy for {material_name}')
-        ax_thick.grid(True, alpha=0.3)
+    # Plot each parameter
+    scatter_plots['sld'], near_bound_sld = plot_parameter(ax_sld, f"{material_name} - sld", 'sld')
+    scatter_plots['isld'], near_bound_isld = plot_parameter(ax_isld, f"{material_name} - isld", 'isld')
+    scatter_plots['thick'], near_bound_thick = plot_parameter(ax_thick, f"{material_name} - thick", 'thick')
+    scatter_plots['rough'], near_bound_rough = plot_parameter(ax_rough, f"{material_name} - rough", 'rough')
+    
+    # Set labels and titles
+    ax_sld.set_ylabel('Real SLD\n(10⁻⁶ Å⁻²)')
+    ax_sld.set_title(f'Real SLD vs Energy for {material_name}')
+    ax_sld.grid(True, alpha=0.3)
+    
+    ax_isld.set_ylabel('Imag SLD\n(10⁻⁶ Å⁻²)')
+    ax_isld.set_title(f'Imaginary SLD vs Energy for {material_name}')
+    ax_isld.grid(True, alpha=0.3)
+    
+    ax_thick.set_ylabel('Thickness (Å)')
+    ax_thick.set_title(f'Thickness vs Energy for {material_name}')
+    ax_thick.grid(True, alpha=0.3)
+    
+    ax_rough.set_ylabel('Roughness (Å)')
+    ax_rough.set_title(f'Roughness vs Energy for {material_name}')
+    ax_rough.grid(True, alpha=0.3)
     
     # Plot chi-squared vs energy
     scatter_plots['chi'] = ax_chi.scatter(
@@ -3804,10 +3883,16 @@ def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_li
     
     # Text annotations for info display
     energy_text = fig.text(0.02, 0.02, "", fontsize=10, transform=fig.transFigure)
-    sld_text = fig.text(0.25, 0.02, "", fontsize=10, transform=fig.transFigure)
-    isld_text = fig.text(0.45, 0.02, "", fontsize=10, transform=fig.transFigure)
-    thick_text = fig.text(0.65, 0.02, "", fontsize=10, transform=fig.transFigure)
-    gof_text = fig.text(0.85, 0.02, "", fontsize=10, transform=fig.transFigure)
+    sld_text = fig.text(0.20, 0.02, "", fontsize=10, transform=fig.transFigure)
+    isld_text = fig.text(0.36, 0.02, "", fontsize=10, transform=fig.transFigure)
+    thick_text = fig.text(0.52, 0.02, "", fontsize=10, transform=fig.transFigure)
+    rough_text = fig.text(0.68, 0.02, "", fontsize=10, transform=fig.transFigure)
+    gof_text = fig.text(0.84, 0.02, "", fontsize=10, transform=fig.transFigure)
+    
+    # Apply custom xlim if provided
+    if xlim is not None:
+        for ax in [ax_sld, ax_isld, ax_thick, ax_rough, ax_chi]:
+            ax.set_xlim(xlim)
     
     # Create vertical lines for each plot
     energy_lines = {}
@@ -3823,35 +3908,29 @@ def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_li
         energy_lines['thick'] = ax_thick.axvline(
             x=available_energies[0], color='red', linestyle='--', alpha=0.7
         )
+    if f"{material_name} - rough" in param_dfs:
+        energy_lines['rough'] = ax_rough.axvline(
+            x=available_energies[0], color='red', linestyle='--', alpha=0.7
+        )
     energy_lines['chi'] = ax_chi.axvline(
         x=available_energies[0], color='red', linestyle='--', alpha=0.7
     )
     
     # Create highlight points for each parameter
     highlight_points = {}
-    if f"{material_name} - sld" in param_dfs:
-        df = param_dfs[f"{material_name} - sld"]
-        if not df.empty:
-            highlight_points['sld'] = ax_sld.plot(
-                df['energy'].iloc[0], df['value'].iloc[0], 
-                'o', color='red', markersize=12, alpha=0.7
-            )[0]
-    
-    if f"{material_name} - isld" in param_dfs:
-        df = param_dfs[f"{material_name} - isld"]
-        if not df.empty:
-            highlight_points['isld'] = ax_isld.plot(
-                df['energy'].iloc[0], df['value'].iloc[0], 
-                'o', color='red', markersize=12, alpha=0.7
-            )[0]
-    
-    if f"{material_name} - thick" in param_dfs:
-        df = param_dfs[f"{material_name} - thick"]
-        if not df.empty:
-            highlight_points['thick'] = ax_thick.plot(
-                df['energy'].iloc[0], df['value'].iloc[0], 
-                'o', color='red', markersize=12, alpha=0.7
-            )[0]
+    for param_type, param_string in zip(
+        ['sld', 'isld', 'thick', 'rough'], 
+        [f"{material_name} - sld", f"{material_name} - isld", 
+         f"{material_name} - thick", f"{material_name} - rough"]
+    ):
+        if param_string in param_dfs:
+            df = param_dfs[param_string]
+            if not df.empty:
+                ax = locals()[f"ax_{param_type}"]  # Get the right axis
+                highlight_points[param_type] = ax.plot(
+                    df['energy'].iloc[0], df['value'].iloc[0], 
+                    'o', color='red', markersize=12, alpha=0.7
+                )[0]
     
     # Function to update the plots when a point is clicked
     def update_plots(energy):
@@ -3869,36 +3948,36 @@ def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_li
         thick_value = None
         rough_value = None
         
-        if f"{material_name} - sld" in param_dfs:
-            df = param_dfs[f"{material_name} - sld"]
-            row = df[df['energy'] == energy]
-            if not row.empty:
-                sld_value = row['value'].iloc[0]
-                if 'sld' in highlight_points:
-                    highlight_points['sld'].set_data([energy], [sld_value])
+        # Flags for near bounds
+        sld_near_bound = False
+        isld_near_bound = False
+        thick_near_bound = False
+        rough_near_bound = False
         
-        if f"{material_name} - isld" in param_dfs:
-            df = param_dfs[f"{material_name} - isld"]
-            row = df[df['energy'] == energy]
-            if not row.empty:
-                isld_value = row['value'].iloc[0]
-                if 'isld' in highlight_points:
-                    highlight_points['isld'].set_data([energy], [isld_value])
+        # Helper function to get parameter value
+        def get_param_value(param_string):
+            if param_string in param_dfs:
+                df = param_dfs[param_string]
+                row = df[df['energy'] == energy]
+                if not row.empty:
+                    return row['value'].iloc[0], row['near_bound'].iloc[0]
+            return None, False
         
-        if f"{material_name} - thick" in param_dfs:
-            df = param_dfs[f"{material_name} - thick"]
-            row = df[df['energy'] == energy]
-            if not row.empty:
-                thick_value = row['value'].iloc[0]
-                if 'thick' in highlight_points:
-                    highlight_points['thick'].set_data([energy], [thick_value])
+        # Get values
+        sld_value, sld_near_bound = get_param_value(f"{material_name} - sld")
+        isld_value, isld_near_bound = get_param_value(f"{material_name} - isld")
+        thick_value, thick_near_bound = get_param_value(f"{material_name} - thick")
+        rough_value, rough_near_bound = get_param_value(f"{material_name} - rough")
         
-        if f"{material_name} - rough" in param_dfs:
-            df = param_dfs[f"{material_name} - rough"]
-            row = df[df['energy'] == energy]
-            if not row.empty:
-                rough_value = row['value'].iloc[0]
-        
+        # Update highlight points
+        for param_type, value in zip(
+            ['sld', 'isld', 'thick', 'rough'],
+            [sld_value, isld_value, thick_value, rough_value]
+        ):
+            if param_type in highlight_points and value is not None:
+                highlight_points[param_type].set_data([energy], [value])
+                
+        # Get chi-squared
         chi_row = chi_squared_df[chi_squared_df['energy'] == energy]
         chi_squared = chi_row['chi_squared'].iloc[0] if not chi_row.empty else None
         
@@ -3910,7 +3989,8 @@ def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_li
         ax_refl.set_yscale('log')
         ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
         ax_refl.set_ylabel('Reflectivity (a.u)')
-        ax_refl.set_title(f'Reflectivity - {energy} eV (χ²: {chi_squared:.4f})')
+        ax_refl.set_title(f'Reflectivity - {energy} eV' + 
+                         (f' (χ²: {chi_squared:.4f})' if chi_squared is not None else ''))
         ax_refl.grid(True, alpha=0.3)
         ax_refl.legend(loc='best')
         
@@ -3935,11 +4015,22 @@ def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_li
         ax_profile.grid(True, alpha=0.3)
         ax_profile.legend(loc='best')
         
+        # Function to format parameter text
+        def format_param_text(label, value, near_bound):
+            if value is None:
+                return ""
+            
+            color = "red" if near_bound else "black"
+            return f"<span style='color:{color}'>{label}: {value:.4g}</span>"
+        
         # Update text annotations
         energy_text.set_text(f"Energy: {energy} eV")
-        sld_text.set_text(f"SLD: {sld_value:.4g}" if sld_value is not None else "")
-        isld_text.set_text(f"iSLD: {isld_value:.4g}" if isld_value is not None else "")
-        thick_text.set_text(f"Thick: {thick_value:.1f} Å" if thick_value is not None else "")
+        
+        # Use HTML formatting to show near-bound parameters in red
+        sld_text.set_text(format_param_text("SLD", sld_value, sld_near_bound))
+        isld_text.set_text(format_param_text("iSLD", isld_value, isld_near_bound))
+        thick_text.set_text(format_param_text("Thick", thick_value, thick_near_bound) + " Å" if thick_value is not None else "")
+        rough_text.set_text(format_param_text("Rough", rough_value, rough_near_bound) + " Å" if rough_value is not None else "")
         gof_text.set_text(f"χ²: {chi_squared:.4g}" if chi_squared is not None else "")
         
         # Force the figure to update
@@ -3968,9 +4059,1096 @@ def create_vscode_parameter_explorer(objectives_dict, structures_dict, energy_li
     # Initial update with the first energy
     update_plots(available_energies[0])
     
-    plt.tight_layout(rect=[0, 0.05, 1, 1])  # Adjust layout to make room for text
+    # Add legend to explain coloring
+    legend_text = (
+        f"Red points are within {bound_threshold*100:.0f}% of parameter bounds. "
+        "Shaded regions show parameter bounds."
+    )
+    fig.text(0.5, 0.01, legend_text, ha='center', fontsize=10)
+    
+    plt.tight_layout(rect=[0, 0.05, 1, 0.98])  # Adjust layout to make room for text
     
     print("The plot is now interactive. Click on any point to update the reflectivity and SLD profile.")
-    print("If clicking doesn't work, make sure you've restarted the kernel after installing ipympl.")
     
     return fig
+
+
+
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import copy
+import pickle
+
+def batch_fit_selected_models_enhanced(objectives_dict, structures_dict, energy_list=None, 
+                                     optimization_method='differential_evolution', 
+                                     opt_workers=8, opt_popsize=20, burn_samples=5, 
+                                     production_samples=5, prod_steps=1, pool=16,
+                                     results_log=None, log_mcmc_stats=True,
+                                     save_dir=None, save_objective=False, save_results=False,
+                                     results_log_file=None, save_log_in_save_dir=False,
+                                     save_originals=True, verbose=True):
+    """
+    Run fitting procedure on selected reflectometry models with option to save original objectives.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to fit. If None, fit all available models.
+        optimization_method (str): Optimization method to use
+        opt_workers (int): Number of workers for parallel optimization
+        opt_popsize (int): Population size for genetic algorithms
+        burn_samples (int): Number of burn-in samples to discard (in thousands)
+        production_samples (int): Number of production samples to keep (in thousands)
+        prod_steps (int): Number of steps between stored samples
+        pool (int): Number of parallel processes for MCMC sampling
+        results_log (DataFrame, optional): Existing results log DataFrame to append to
+        log_mcmc_stats (bool): Whether to add MCMC statistics to the log
+        save_dir (str, optional): Directory to save objective and results
+        save_objective (bool): Whether to save the objective function
+        save_results (bool): Whether to save the results dictionary
+        results_log_file (str, optional): Filename to load/save the results log DataFrame
+        save_log_in_save_dir (bool): If True, save the log file in save_dir
+        save_originals (bool): Whether to save original objectives for comparison
+        verbose (bool): Whether to print detailed progress information
+        
+    Returns:
+        tuple: (results_dict, updated_results_df, original_objectives_dict)
+            - results_dict: Dictionary mapping energy values to fitting results
+            - updated_results_df: Combined DataFrame of all fitting results
+            - original_objectives_dict: Dictionary of original (pre-fitting) objectives
+    """
+    # Dictionary to store fitting results
+    results_dict = {}
+    
+    # Save original objectives if requested
+    original_objectives_dict = {}
+    if save_originals:
+        if verbose:
+            print("Making deep copies of original objectives for comparison...")
+        for energy, obj in objectives_dict.items():
+            original_objectives_dict[energy] = copy.deepcopy(obj)
+    
+    # If no energy list is provided, use all available energies
+    if energy_list is None:
+        energy_list = sorted(list(objectives_dict.keys()))
+    
+    # Filter to ensure we only process energies that have both objectives and structures
+    valid_energies = []
+    for energy in energy_list:
+        if energy in objectives_dict and energy in structures_dict:
+            valid_energies.append(energy)
+        else:
+            if verbose:
+                print(f"Warning: Missing objective or structure for energy {energy} eV. Skipping.")
+    
+    if not valid_energies:
+        if verbose:
+            print("No valid energies to fit.")
+        return {}, results_log, original_objectives_dict
+    
+    if verbose:
+        print(f"Fitting {len(valid_energies)} models: {valid_energies}")
+    
+    # Determine the actual log file path
+    actual_log_file = results_log_file
+    if save_dir is not None and save_log_in_save_dir:
+        # Create the directory if it doesn't exist
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            if verbose:
+                print(f"Created directory: {save_dir}")
+        
+        # If results_log_file is specified, use just the filename part in save_dir
+        if results_log_file:
+            log_filename = os.path.basename(results_log_file)
+        else:
+            # Default log filename if not specified
+            log_filename = f"fitting_results_log.csv"
+        
+        actual_log_file = os.path.join(save_dir, log_filename)
+    
+    # Try to load existing results_log if filename is provided
+    if results_log is None and actual_log_file is not None:
+        if os.path.exists(actual_log_file):
+            try:
+                if verbose:
+                    print(f"Loading existing results log from {actual_log_file}")
+                results_log = pd.read_csv(actual_log_file)
+            except Exception as e:
+                if verbose:
+                    print(f"Error loading results log: {str(e)}")
+                    print("Initializing new results log")
+                results_log = pd.DataFrame(columns=[
+                    'timestamp', 'model_name', 'goodness_of_fit', 
+                    'parameter', 'value', 'stderr', 'bound_low', 'bound_high', 'vary'
+                ])
+    
+    # Initialize results_log if not provided and not loaded from file
+    if results_log is None:
+        if verbose:
+            print("Initializing new results log")
+        results_log = pd.DataFrame(columns=[
+            'timestamp', 'model_name', 'goodness_of_fit', 
+            'parameter', 'value', 'stderr', 'bound_low', 'bound_high', 'vary'
+        ])
+    
+    # Process each energy
+    for energy in valid_energies:
+        objective = objectives_dict[energy]
+        structure = structures_dict[energy]
+        
+        # Extract model name if available
+        model_name = getattr(objective.model, 'name', f"Model_{energy}eV")
+        if verbose:
+            print(f"Fitting model: {model_name}")
+        
+        # Generate timestamp for logs and internal tracking (but not filenames)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Initialize results dictionary
+        results = {
+            'objective': objective,
+            'initial_chi_squared': objective.chisqr(),
+            'optimized_parameters': None,
+            'optimized_chi_squared': None,
+            'mcmc_samples': None,
+            'mcmc_stats': None,
+            'timestamp': timestamp,
+            'structure': structure
+        }
+        
+        try:
+            # Create fitter
+            from refnx.analysis import CurveFitter
+            fitter = CurveFitter(objective)
+            
+            # Run optimization
+            if verbose:
+                print(f"Starting optimization using {optimization_method}...")
+            if optimization_method == 'differential_evolution':
+                fitter.fit(optimization_method, workers=opt_workers, popsize=opt_popsize)
+            else:
+                fitter.fit(optimization_method)
+            
+            # Store optimization results
+            results['optimized_parameters'] = objective.parameters.pvals.copy()
+            results['optimized_chi_squared'] = objective.chisqr()
+            
+            if verbose:
+                print(f"Optimization complete. Chi-squared improved from {results['initial_chi_squared']:.4f} to {results['optimized_chi_squared']:.4f}")
+            
+            # Run burn-in MCMC samples
+            if burn_samples > 0:
+                if verbose:
+                    print(f"Running {burn_samples}k burn-in MCMC samples...")
+                fitter.sample(burn_samples, pool=pool)
+                if verbose:
+                    print("Burn-in complete. Resetting chain...")
+                fitter.reset()
+            
+            # Run production MCMC samples
+            if production_samples > 0:
+                if verbose:
+                    print(f"Running {production_samples}k production MCMC samples with {prod_steps} steps between stored samples...")
+                results['mcmc_samples'] = fitter.sample(production_samples, prod_steps, pool=pool)
+                
+                # Calculate statistics from MCMC chain
+                try:
+                    if verbose:
+                        print("Calculating parameter statistics from MCMC chain...")
+                    results['mcmc_stats'] = {}
+                    
+                    # Process parameter statistics
+                    for param in objective.parameters.flattened():
+                        if param.vary:
+                            param_stats = {
+                                'name': param.name,
+                                'value': param.value,
+                                'stderr': param.stderr,
+                                'median': None,
+                                'mean': None,
+                                'std': None,
+                                'percentiles': {}
+                            }
+                            
+                            # Extract chain for this parameter
+                            chain_index = fitter.var_pars.index(param)
+                            if chain_index >= 0 and results['mcmc_samples'] is not None:
+                                # Calculate statistics
+                                chain_values = results['mcmc_samples'][:, chain_index]
+                                param_stats['median'] = np.median(chain_values)
+                                param_stats['mean'] = np.mean(chain_values)
+                                param_stats['std'] = np.std(chain_values)
+                                
+                                # Calculate percentiles
+                                for percentile in [2.5, 16, 50, 84, 97.5]:
+                                    param_stats['percentiles'][percentile] = np.percentile(chain_values, percentile)
+                            
+                            results['mcmc_stats'][param.name] = param_stats
+                    
+                    # Print a summary of key parameters
+                    if verbose:
+                        print("\nParameter summary from MCMC:")
+                        for name, stats in results['mcmc_stats'].items():
+                            if 'median' in stats and stats['median'] is not None:
+                                print(f"  {name}: {stats['median']:.6g} +{stats['percentiles'][84] - stats['median']:.6g} -{stats['median'] - stats['percentiles'][16]:.6g}")
+                
+                except Exception as e:
+                    if verbose:
+                        print(f"Error calculating MCMC statistics: {str(e)}")
+            
+            # Log the results
+            if verbose:
+                print(f"Logging results for model {model_name}")
+            
+            # Import log_fitting_results if not already available in the namespace
+            try:
+                from Model_Setup import log_fitting_results
+            except ImportError:
+                # Define a simplified version if not available
+                def log_fitting_results(objective, model_name, results_df=None):
+                    """Simplified function to log fitting results"""
+                    # Initialize a new DataFrame if none is provided
+                    if results_df is None:
+                        results_df = pd.DataFrame(columns=[
+                            'timestamp', 'model_name', 'goodness_of_fit', 
+                            'parameter', 'value', 'stderr', 'bound_low', 'bound_high', 'vary'
+                        ])
+                    
+                    # Get the current timestamp
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Extract the goodness of fit
+                    try:
+                        gof = objective.chisqr()
+                    except Exception as e:
+                        print(f"Error getting chisqr: {str(e)}")
+                        gof = None
+                    
+                    # Extract all parameters from the model
+                    model = objective.model
+                    rows = []
+                    
+                    # Process each parameter
+                    for param in model.parameters.flattened():
+                        try:
+                            # Get parameter name and value
+                            param_name = param.name
+                            value = param.value
+                            stderr = getattr(param, 'stderr', None)
+                            vary = getattr(param, 'vary', False)
+                            
+                            # Handle bounds
+                            bound_low = None
+                            bound_high = None
+                            
+                            try:
+                                bounds = getattr(param, 'bounds', None)
+                                if bounds is not None:
+                                    # Try to access as Interval object with lb and ub attributes
+                                    if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                                        bound_low = bounds.lb
+                                        bound_high = bounds.ub
+                                    # Fallback to tuple unpacking
+                                    elif isinstance(bounds, tuple) and len(bounds) == 2:
+                                        bound_low, bound_high = bounds
+                            except Exception as e:
+                                print(f"Error extracting bounds for {param_name}: {str(e)}")
+                            
+                            # Create a row for this parameter
+                            row = {
+                                'timestamp': timestamp,
+                                'model_name': model_name,
+                                'goodness_of_fit': gof,
+                                'parameter': param_name,
+                                'value': value,
+                                'stderr': stderr,
+                                'bound_low': bound_low,
+                                'bound_high': bound_high,
+                                'vary': vary
+                            }
+                            rows.append(row)
+                        except Exception as e:
+                            print(f"Error processing parameter: {str(e)}")
+                            continue
+                    
+                    # Add new rows to the DataFrame
+                    results_df = pd.concat([results_df, pd.DataFrame(rows)], ignore_index=True)
+                    
+                    return results_df, model_name
+            
+            # Log the optimized values first
+            results_log, updated_model_name = log_fitting_results(objective, model_name, results_log)
+            
+            # If MCMC was performed and we want to log those stats, create a second entry
+            if log_mcmc_stats and results['mcmc_stats'] is not None:
+                if verbose:
+                    print("Adding MCMC statistics to the log...")
+                
+                # Create a temporary copy of the objective to store MCMC medians
+                mcmc_objective = copy.deepcopy(objective)
+                
+                # Update parameter values to MCMC medians
+                for name, stats in results['mcmc_stats'].items():
+                    if 'median' in stats and stats['median'] is not None:
+                        # Find the parameter and update its value and error
+                        for param in mcmc_objective.parameters.flattened():
+                            if param.name == name:
+                                param.value = stats['median']
+                                # Use percentiles for errors
+                                upper_err = stats['percentiles'][84] - stats['median']
+                                lower_err = stats['median'] - stats['percentiles'][16]
+                                # Use the larger of the two for stderr
+                                param.stderr = max(upper_err, lower_err)
+                                break
+                
+                # Log the MCMC results with a modified name
+                mcmc_model_name = f"{updated_model_name}_MCMC"
+                results_log, _ = log_fitting_results(mcmc_objective, mcmc_model_name, results_log)
+            
+            # Save the objective and/or results if requested
+            if save_dir is not None and (save_objective or save_results):
+                # Create the directory if it doesn't exist
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                    if verbose:
+                        print(f"Created directory: {save_dir}")
+                
+                # Save the objective if requested
+                if save_objective:
+                    objective_filename = os.path.join(save_dir, f"{updated_model_name}_objective.pkl")
+                    try:
+                        with open(objective_filename, 'wb') as f:
+                            pickle.dump(objective, f)
+                        if verbose:
+                            print(f"Saved objective to {objective_filename}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"Error saving objective: {str(e)}")
+                
+                # Save the results if requested
+                if save_results:
+                    # Create a copy of results without the objective (to avoid duplication if saving both)
+                    save_results_copy = results.copy()
+                    if 'objective' in save_results_copy and save_objective:
+                        save_results_copy['objective'] = None  # Remove the objective to avoid duplication
+                    
+                    results_filename = os.path.join(save_dir, f"{updated_model_name}_results.pkl")
+                    try:
+                        with open(results_filename, 'wb') as f:
+                            pickle.dump(save_results_copy, f)
+                        if verbose:
+                            print(f"Saved results to {results_filename}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"Error saving results: {str(e)}")
+                    
+                    # Save a combined file with results and structure
+                    combined_filename = os.path.join(save_dir, f"{updated_model_name}_combined.pkl")
+                    try:
+                        combined_data = {
+                            'results': save_results_copy,
+                            'structure': structure,
+                            'objective': objective if save_objective else None,
+                            'model_name': updated_model_name,
+                            'timestamp': timestamp,
+                            'energy': energy
+                        }
+                        with open(combined_filename, 'wb') as f:
+                            pickle.dump(combined_data, f)
+                        if verbose:
+                            print(f"Saved combined results and structure to {combined_filename}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"Error saving combined data: {str(e)}")
+                    
+                    # Additionally, save MCMC samples as numpy array if they exist
+                    if results['mcmc_samples'] is not None:
+                        mcmc_filename = os.path.join(save_dir, f"{updated_model_name}_mcmc_samples.npy")
+                        try:
+                            np.save(mcmc_filename, results['mcmc_samples'])
+                            if verbose:
+                                print(f"Saved MCMC samples to {mcmc_filename}")
+                        except Exception as e:
+                            if verbose:
+                                print(f"Error saving MCMC samples: {str(e)}")
+            
+            # Store the results in the dictionary
+            results_dict[energy] = results
+            
+            # Update the model name in the objective
+            objective.model.name = updated_model_name
+            
+        except Exception as e:
+            if verbose:
+                print(f"Error during fitting for energy {energy} eV: {str(e)}")
+            # Store minimal information in the results dictionary
+            results_dict[energy] = {
+                'error': str(e),
+                'timestamp': timestamp,
+                'structure': structure,
+                'objective': objective,
+                'initial_chi_squared': results['initial_chi_squared']
+            }
+    
+    # Save the results log if a filename was provided
+    if actual_log_file is not None:
+        # Create directory for results_log_file if it doesn't exist
+        log_dir = os.path.dirname(actual_log_file)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+            if verbose:
+                print(f"Created directory for results log: {log_dir}")
+        
+        try:
+            # Save to CSV
+            results_log.to_csv(actual_log_file, index=False)
+            if verbose:
+                print(f"Saved results log to {actual_log_file}")
+        except Exception as e:
+            if verbose:
+                print(f"Error saving results log: {str(e)}")
+    
+    if verbose:
+        print(f"Completed fitting for {len(results_dict)} models.")
+    
+    return results_dict, results_log, original_objectives_dict
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.gridspec import GridSpec
+import copy
+from IPython.display import display, clear_output
+
+
+def visualize_before_after_fitting(results_dict, original_objectives, structures_dict, 
+                                  energy_list=None, figsize=(16, 12), 
+                                  max_cols=3, title_prefix=""):
+    """
+    Visualize before and after fitting results for multiple energies in a grid layout.
+    
+    Args:
+        results_dict (dict): Dictionary returned by batch_fit_selected_models_enhanced
+        original_objectives (dict): Dictionary mapping energy values to original Objective objects
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to include. If None, uses all available.
+        figsize (tuple): Figure size as (width, height)
+        max_cols (int): Maximum number of columns in the grid
+        title_prefix (str): Optional prefix for plot titles
+        
+    Returns:
+        matplotlib.figure.Figure: Figure with before/after comparison plots
+    """
+    # Extract fitted objectives from results
+    fitted_objectives = {}
+    
+    for energy, result in results_dict.items():
+        if 'objective' in result:
+            fitted_objectives[energy] = result['objective']
+    
+    # Determine the available energies
+    if energy_list is None:
+        available_energies = sorted(list(
+            set(original_objectives.keys()) & 
+            set(fitted_objectives.keys()) & 
+            set(structures_dict.keys())
+        ))
+    else:
+        # Filter by available data
+        available_energies = []
+        for energy in energy_list:
+            if (energy in original_objectives and 
+                energy in fitted_objectives and 
+                energy in structures_dict):
+                available_energies.append(energy)
+    
+    if not available_energies:
+        print("No valid energies found for comparison.")
+        return None
+    
+    # Determine grid layout
+    n_energies = len(available_energies)
+    n_cols = min(n_energies, max_cols)
+    n_rows = (n_energies + n_cols - 1) // n_cols  # Ceiling division
+    
+    # Increase height slightly for extra row of profile plots
+    adjusted_figsize = (figsize[0], figsize[1] + n_rows * 2)
+    
+    # Create figure
+    fig = plt.figure(figsize=adjusted_figsize)
+    
+    # Create a more complex GridSpec to accommodate both reflectivity and SLD profiles
+    gs = GridSpec(n_rows * 2, n_cols, figure=fig, height_ratios=np.ones(n_rows * 2).tolist())
+    
+    # Track total chi-squared values for overall statistics
+    total_original_chi = 0
+    total_fitted_chi = 0
+    
+    # Plot reflectivity and SLD profiles for each energy
+    for i, energy in enumerate(available_energies):
+        # Calculate position in grid (each energy takes two rows)
+        row = (i // n_cols) * 2  # Multiply by 2 for reflectivity and profile rows
+        col = i % n_cols
+        
+        # Create axes
+        ax_refl = fig.add_subplot(gs[row, col])
+        ax_profile = fig.add_subplot(gs[row+1, col])
+        
+        # Get objectives and structure
+        original_obj = original_objectives[energy]
+        fitted_obj = fitted_objectives[energy]
+        structure = structures_dict[energy]
+        
+        # Calculate chi-squared values
+        original_chi = original_obj.chisqr()
+        fitted_chi = fitted_obj.chisqr()
+        improvement = (original_chi - fitted_chi) / original_chi * 100
+        
+        # Add to totals for overall statistics
+        total_original_chi += original_chi
+        total_fitted_chi += fitted_chi
+        
+        # Plot reflectivity data
+        data = original_obj.data
+        
+        # Original model
+        ax_refl.plot(data.data[0], data.data[1], 'o', label='Data', markersize=2, color='black')
+        ax_refl.plot(data.data[0], original_obj.model(data.data[0]), '-', 
+                   label=f'Original (χ²: {original_chi:.2f})', linewidth=2, color='blue', alpha=0.7)
+        
+        # Fitted model
+        ax_refl.plot(data.data[0], fitted_obj.model(data.data[0]), '--', 
+                   label=f'Fitted (χ²: {fitted_chi:.2f})', linewidth=2, color='red')
+        
+        ax_refl.set_yscale('log')
+        ax_refl.set_title(f"{title_prefix}{energy} eV ({improvement:.1f}% better)")
+        
+        # Only add x-axis label for bottom row
+        if row == (n_rows-1) * 2:
+            ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
+        
+        # Add y-axis label only for leftmost column
+        if col == 0:
+            ax_refl.set_ylabel('Reflectivity (a.u)')
+            
+        ax_refl.legend(loc='lower left', fontsize='x-small')
+        ax_refl.grid(True, alpha=0.3)
+        
+        # Plot SLD profiles
+        from Plotting_Refl import profileflip
+        
+        # Apply profile shift
+        profile_shift = -20
+        
+        try:
+            # Original profile
+            # Make a separate copy of the structure with original parameters
+            orig_structure = copy.deepcopy(structure)
+            
+            # Copy original parameters to the structure
+            for param in original_obj.parameters.flattened():
+                # Find matching parameter in structure
+                for struct_param in orig_structure.parameters.flattened():
+                    if param.name == struct_param.name:
+                        struct_param.value = param.value
+                        break
+            
+            # Calculate SLD profiles
+            Real_depth, Real_SLD, Imag_Depth, Imag_SLD = profileflip(orig_structure, depth_shift=0)
+            Real_depth = Real_depth + profile_shift
+            Imag_Depth = Imag_Depth + profile_shift
+            
+            # Plot original profiles
+            ax_profile.plot(Real_depth, Real_SLD, '-', color='blue', 
+                          label='Original Real', linewidth=2, alpha=0.7)
+            ax_profile.plot(Imag_Depth, Imag_SLD, '--', color='blue', 
+                          label='Original Imag', linewidth=2, alpha=0.7)
+            
+            # Fitted profile
+            # Make a copy to avoid changing the original
+            fitted_structure = copy.deepcopy(structure)
+            
+            # Copy fitted parameters to the structure
+            for param in fitted_obj.parameters.flattened():
+                # Find matching parameter in structure
+                for struct_param in fitted_structure.parameters.flattened():
+                    if param.name == struct_param.name:
+                        struct_param.value = param.value
+                        break
+            
+            # Calculate SLD profiles for fitted structure
+            Real_depth_fit, Real_SLD_fit, Imag_Depth_fit, Imag_SLD_fit = profileflip(fitted_structure, depth_shift=0)
+            Real_depth_fit = Real_depth_fit + profile_shift
+            Imag_Depth_fit = Imag_Depth_fit + profile_shift
+            
+            # Plot fitted profiles
+            ax_profile.plot(Real_depth_fit, Real_SLD_fit, '-', color='red', 
+                          label='Fitted Real', linewidth=2)
+            ax_profile.plot(Imag_Depth_fit, Imag_SLD_fit, '--', color='red', 
+                          label='Fitted Imag', linewidth=2)
+        except Exception as e:
+            print(f"Error calculating SLD profiles for energy {energy}: {e}")
+            ax_profile.text(0.5, 0.5, "SLD profile calculation error", 
+                           horizontalalignment='center', verticalalignment='center',
+                           transform=ax_profile.transAxes)
+        
+        # Only add x-axis label for bottom row
+        if row == (n_rows-1) * 2:
+            ax_profile.set_xlabel(r'Distance from Si ($\AA$)')
+            
+        # Add y-axis label only for leftmost column
+        if col == 0:
+            ax_profile.set_ylabel(r'SLD $(10^{-6})$ $\AA^{-2}$')
+            
+        ax_profile.legend(loc='best', fontsize='x-small')
+        ax_profile.grid(True, alpha=0.3)
+    
+    # Calculate overall improvement
+    if total_original_chi > 0:
+        overall_improvement = (total_original_chi - total_fitted_chi) / total_original_chi * 100
+        plt.suptitle(f"Batch Fitting Results - Overall improvement: {overall_improvement:.1f}%", 
+                    fontsize=16, y=0.98)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Add space for title
+    return fig
+
+
+def create_vscode_before_after_explorer(results_dict, original_objectives_dict, structures_dict, 
+                                       energy_list=None, material_name=None):
+    """
+    Create an interactive VSCode-friendly visualization to explore before/after fitting results.
+    
+    Args:
+        results_dict (dict): Dictionary returned by batch_fit_selected_models_enhanced
+        original_objectives_dict (dict): Dictionary of original objectives
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to include. If None, uses all available.
+        material_name (str, optional): Optional material name to display in title
+        
+    Returns:
+        matplotlib.figure.Figure: Interactive figure for exploring fitting results
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.gridspec import GridSpec
+    
+    # Extract fitted objectives from results
+    fitted_objectives = {}
+    for energy, result in results_dict.items():
+        if 'objective' in result:
+            fitted_objectives[energy] = result['objective']
+    
+    # Determine the available energies
+    if energy_list is None:
+        available_energies = sorted(list(
+            set(original_objectives_dict.keys()) & 
+            set(fitted_objectives.keys()) & 
+            set(structures_dict.keys())
+        ))
+    else:
+        # Filter by available data
+        available_energies = []
+        for energy in energy_list:
+            if (energy in original_objectives_dict and 
+                energy in fitted_objectives and 
+                energy in structures_dict):
+                available_energies.append(energy)
+    
+    if not available_energies:
+        print("No valid energies found for comparison.")
+        return None
+    
+    # Create figure with complex layout
+    fig = plt.figure(figsize=(14, 12))
+    
+    # Row 1: Energy selection
+    # Row 2: Reflectivity
+    # Row 3: SLD profiles
+    # Row 4: Parameter comparison
+    gs = GridSpec(4, 1, figure=fig, height_ratios=[0.5, 1, 1, 1.5])
+    
+    # Create axes
+    ax_energy = fig.add_subplot(gs[0])
+    ax_refl = fig.add_subplot(gs[1])
+    ax_profile = fig.add_subplot(gs[2])
+    ax_params = fig.add_subplot(gs[3])
+    
+    # Create vertical line for energy selection
+    current_energy = available_energies[0]
+    energy_line = ax_energy.axvline(x=current_energy, color='red', linestyle='-', linewidth=2)
+    
+    # Create scatter plot for energies with improvement as color
+    improvements = []
+    for energy in available_energies:
+        original_chi = original_objectives_dict[energy].chisqr()
+        fitted_chi = fitted_objectives[energy].chisqr()
+        improvement = (original_chi - fitted_chi) / original_chi * 100
+        improvements.append(improvement)
+    
+    # Create a colormap from red to green based on improvement
+    if improvements:
+        # Create a normalization for the color scale
+        norm = plt.Normalize(min(0, min(improvements)), max(50, max(improvements)))
+        
+        # Create the scatter plot
+        scatter = ax_energy.scatter(
+            available_energies, 
+            np.ones_like(available_energies),  # All at same y-position
+            c=improvements, 
+            cmap='RdYlGn',
+            norm=norm,
+            s=100,
+            picker=5,  # Make points pickable
+            zorder=10
+        )
+        
+        # Add a colorbar
+        cbar = plt.colorbar(scatter, ax=ax_energy, orientation='vertical', pad=0.01)
+        cbar.set_label('Improvement (%)')
+        
+        # Set axis limits and labels
+        ax_energy.set_xlim(min(available_energies) - 2, max(available_energies) + 2)
+        ax_energy.set_ylim(0.5, 1.5)
+        ax_energy.set_yticks([])  # Hide y-axis
+        ax_energy.set_xlabel('Energy (eV)')
+        ax_energy.set_title('Select Energy (Color indicates fitting improvement)')
+        
+        # Add energy labels
+        for energy, improvement in zip(available_energies, improvements):
+            # Position text above or below based on position
+            y_pos = 1.2 if energy % 5 == 0 else 0.8
+            ax_energy.annotate(
+                f"{energy}",
+                xy=(energy, 1),
+                xytext=(0, 0),
+                textcoords="offset points",
+                ha='center',
+                fontsize=8
+            )
+    
+    # Create title with material name if provided
+    if material_name:
+        fig.suptitle(f"{material_name} - Before/After Fitting Comparison", fontsize=16)
+    else:
+        fig.suptitle("Before/After Fitting Comparison", fontsize=16)
+    
+    # Function to update the plots for a given energy
+    def update_plots(energy):
+        nonlocal current_energy
+        current_energy = energy
+        
+        # Update energy selection line
+        energy_line.set_xdata([energy, energy])
+        
+        # Get the objectives and structure
+        original_obj = original_objectives_dict[energy]
+        fitted_obj = fitted_objectives[energy]
+        structure = structures_dict[energy]
+        
+        # Calculate chi-squared values
+        original_chi = original_obj.chisqr()
+        fitted_chi = fitted_obj.chisqr()
+        improvement = (original_chi - fitted_chi) / original_chi * 100
+        
+        # Update reflectivity plot
+        ax_refl.clear()
+        data = original_obj.data
+        
+        # Original model
+        ax_refl.plot(data.data[0], data.data[1], 'o', label='Data', markersize=2, color='black')
+        ax_refl.plot(data.data[0], original_obj.model(data.data[0]), '-', 
+                   label=f'Original (χ²: {original_chi:.4f})', linewidth=2, color='blue', alpha=0.7)
+        
+        # Fitted model
+        ax_refl.plot(data.data[0], fitted_obj.model(data.data[0]), '--', 
+                   label=f'Fitted (χ²: {fitted_chi:.4f})', linewidth=2, color='red')
+        
+        ax_refl.set_yscale('log')
+        ax_refl.set_title(f"Reflectivity - {energy} eV ({improvement:.1f}% better)")
+        ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
+        ax_refl.set_ylabel('Reflectivity (a.u)')
+        ax_refl.legend(loc='best')
+        ax_refl.grid(True, alpha=0.3)
+        
+        # Update SLD profile plot
+        ax_profile.clear()
+        
+        # Apply profile shift
+        profile_shift = -20
+        
+        try:
+            # Original profile
+            from Plotting_Refl import profileflip
+            orig_structure = copy.deepcopy(structure)
+            
+            # Copy original parameters to the structure
+            for param in original_obj.parameters.flattened():
+                # Find matching parameter in structure
+                for struct_param in orig_structure.parameters.flattened():
+                    if param.name == struct_param.name:
+                        struct_param.value = param.value
+                        break
+            
+            # Calculate SLD profiles
+            Real_depth, Real_SLD, Imag_Depth, Imag_SLD = profileflip(orig_structure, depth_shift=0)
+            Real_depth = Real_depth + profile_shift
+            Imag_Depth = Imag_Depth + profile_shift
+            
+            # Plot original profiles
+            ax_profile.plot(Real_depth, Real_SLD, '-', color='blue', 
+                          label='Original Real', linewidth=2, alpha=0.7)
+            ax_profile.plot(Imag_Depth, Imag_SLD, '--', color='blue', 
+                          label='Original Imag', linewidth=2, alpha=0.7)
+            
+            # Fitted profile
+            fitted_structure = copy.deepcopy(structure)
+            
+            # Copy fitted parameters to the structure
+            for param in fitted_obj.parameters.flattened():
+                # Find matching parameter in structure
+                for struct_param in fitted_structure.parameters.flattened():
+                    if param.name == struct_param.name:
+                        struct_param.value = param.value
+                        break
+            
+            # Calculate SLD profiles for fitted structure
+            Real_depth_fit, Real_SLD_fit, Imag_Depth_fit, Imag_SLD_fit = profileflip(fitted_structure, depth_shift=0)
+            Real_depth_fit = Real_depth_fit + profile_shift
+            Imag_Depth_fit = Imag_Depth_fit + profile_shift
+            
+            # Plot fitted profiles
+            ax_profile.plot(Real_depth_fit, Real_SLD_fit, '-', color='red', 
+                          label='Fitted Real', linewidth=2)
+            ax_profile.plot(Imag_Depth_fit, Imag_SLD_fit, '--', color='red', 
+                          label='Fitted Imag', linewidth=2)
+            
+            ax_profile.set_xlabel(r'Distance from Si ($\AA$)')
+            ax_profile.set_ylabel(r'SLD $(10^{-6})$ $\AA^{-2}$')
+            ax_profile.set_title(f'SLD Profile - {energy} eV')
+            ax_profile.legend(loc='best')
+            ax_profile.grid(True, alpha=0.3)
+            
+        except Exception as e:
+            ax_profile.text(0.5, 0.5, f"Error calculating SLD profiles: {str(e)}",
+                         ha='center', va='center', transform=ax_profile.transAxes)
+            ax_profile.set_title('SLD Profile - Error')
+        
+        # Update parameters plot
+        ax_params.clear()
+        
+        # Get all parameters that were varied
+        varied_params = []
+        param_names = []
+        orig_values = []
+        fitted_values = []
+        percent_changes = []
+        
+        for param_fitted in fitted_obj.parameters.flattened():
+            # Only look at parameters that were varied or are important SLD parameters
+            include_param = False
+            
+            if hasattr(param_fitted, 'vary') and param_fitted.vary:
+                include_param = True
+            elif any(x in param_fitted.name for x in ['sld', 'isld', 'thick']):
+                include_param = True
+                
+            if not include_param:
+                continue
+            
+            # Find the same parameter in the original objective
+            for param_orig in original_obj.parameters.flattened():
+                if param_orig.name == param_fitted.name:
+                    # Calculate percent change
+                    if param_orig.value != 0:
+                        percent_change = (param_fitted.value - param_orig.value) / abs(param_orig.value) * 100
+                    else:
+                        percent_change = 0 if param_fitted.value == 0 else 100  # Arbitrary 100% if from 0 to non-zero
+                    
+                    varied_params.append(param_fitted)
+                    param_names.append(param_fitted.name)
+                    orig_values.append(param_orig.value)
+                    fitted_values.append(param_fitted.value)
+                    percent_changes.append(percent_change)
+                    
+                    break
+        
+        # If we have parameters to show
+        if param_names:
+            # Sort by percent change
+            indices = np.argsort(np.abs(percent_changes))[::-1]  # Descending order
+            param_names = [param_names[i] for i in indices]
+            orig_values = [orig_values[i] for i in indices]
+            fitted_values = [fitted_values[i] for i in indices]
+            percent_changes = [percent_changes[i] for i in indices]
+            
+            # Limit to top 15 parameters for readability
+            if len(param_names) > 15:
+                param_names = param_names[:15]
+                orig_values = orig_values[:15]
+                fitted_values = fitted_values[:15]
+                percent_changes = percent_changes[:15]
+            
+            # Create barplot of percent changes
+            x_pos = np.arange(len(param_names))
+            bars = ax_params.bar(x_pos, percent_changes, 
+                              color=['green' if x >= 0 else 'red' for x in percent_changes])
+            
+            # Add value labels
+            for i, (bar, orig, fitted) in enumerate(zip(bars, orig_values, fitted_values)):
+                if abs(percent_changes[i]) > 2:  # Only label significant changes
+                    # Position text at the top/bottom of the bar
+                    height = bar.get_height()
+                    text_pos = height + 1 if height >= 0 else height - 3
+                    ax_params.text(bar.get_x() + bar.get_width()/2., text_pos,
+                                f'{fitted:.2g}\n({percent_changes[i]:+.1f}%)',
+                                ha='center', va='bottom' if height >= 0 else 'top', 
+                                fontsize=8, rotation=45)
+            
+            # Customize the plot
+            ax_params.set_xticks(x_pos)
+            ax_params.set_xticklabels(param_names, rotation=45, ha='right')
+            ax_params.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+            ax_params.set_ylabel('Parameter Change (%)')
+            ax_params.set_title('Parameter Changes')
+            
+            # Add grid
+            ax_params.grid(True, axis='y', alpha=0.3)
+            
+            # Adjust y-limits to better fit the data
+            max_change = max(abs(min(percent_changes)), abs(max(percent_changes)))
+            y_limit = min(100, max(20, max_change * 1.2))  # Cap at 100%, but at least 20%
+            ax_params.set_ylim(-y_limit, y_limit)
+        else:
+            ax_params.text(0.5, 0.5, "No varied parameters found",
+                        ha='center', va='center', transform=ax_params.transAxes)
+            ax_params.set_title('Parameter Changes')
+        
+        # Update the figure
+        fig.canvas.draw_idle()
+    
+    # Function to handle pick events (clicking on energy points)
+    def on_pick(event):
+        # Check if we have a valid pick event with data points
+        if hasattr(event, 'ind') and len(event.ind) > 0:
+            # Get the index of the clicked point in the scatter plot
+            ind = event.ind[0]
+            
+            # Get the energy value
+            energy = available_energies[ind]
+            
+            # Update the plots
+            update_plots(energy)
+    
+    # Connect the pick event to the figure
+    fig.canvas.mpl_connect('pick_event', on_pick)
+    
+    # Key press handler for navigating with arrow keys
+    def on_key(event):
+        if event.key == 'right':
+            # Go to next energy
+            current_index = available_energies.index(current_energy)
+            if current_index < len(available_energies) - 1:
+                update_plots(available_energies[current_index + 1])
+        elif event.key == 'left':
+            # Go to previous energy
+            current_index = available_energies.index(current_energy)
+            if current_index > 0:
+                update_plots(available_energies[current_index - 1])
+    
+    # Connect the key press event
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    
+    # Initial update
+    update_plots(available_energies[0])
+    
+    plt.tight_layout()
+    
+    print("Interactive plot ready. Click on energy points to view details. Use left/right arrow keys to navigate.")
+    
+    return fig
+
+
+def export_best_parameters(results_dict, original_objectives_dict, output_file=None):
+    """
+    Export the best-fit parameters from a batch fitting session.
+    
+    Args:
+        results_dict (dict): Dictionary returned by batch_fit_selected_models_enhanced
+        original_objectives_dict (dict): Dictionary of original objectives
+        output_file (str, optional): Path to save CSV file. If None, returns DataFrame only.
+        
+    Returns:
+        pandas.DataFrame: DataFrame with best-fit parameters and improvement statistics
+    """
+    import pandas as pd
+    
+    # Extract fitted objectives from results
+    fitted_objectives = {}
+    for energy, result in results_dict.items():
+        if 'objective' in result:
+            fitted_objectives[energy] = result['objective']
+    
+    # Initialize lists for DataFrame rows
+    rows = []
+    
+    # Process each energy
+    for energy in sorted(fitted_objectives.keys()):
+        if energy not in original_objectives_dict:
+            continue
+            
+        fitted_obj = fitted_objectives[energy]
+        original_obj = original_objectives_dict[energy]
+        
+        # Calculate improvement
+        original_chi = original_obj.chisqr()
+        fitted_chi = fitted_obj.chisqr()
+        improvement = (original_chi - fitted_chi) / original_chi * 100
+        
+        # Extract all parameter values
+        for param in fitted_obj.parameters.flattened():
+            # Get parameter name and value
+            param_name = param.name
+            value = param.value
+            stderr = getattr(param, 'stderr', None)
+            vary = getattr(param, 'vary', False)
+            
+            # Get original value
+            original_value = None
+            for orig_param in original_obj.parameters.flattened():
+                if orig_param.name == param_name:
+                    original_value = orig_param.value
+                    break
+            
+            # Calculate percent change
+            if original_value is not None and original_value != 0:
+                percent_change = (value - original_value) / abs(original_value) * 100
+            else:
+                percent_change = None
+            
+            # Create a row for this parameter
+            row = {
+                'energy': energy,
+                'parameter': param_name,
+                'original_value': original_value,
+                'fitted_value': value,
+                'stderr': stderr,
+                'percent_change': percent_change,
+                'varied': vary,
+                'original_chi2': original_chi,
+                'fitted_chi2': fitted_chi,
+                'improvement_percent': improvement
+            }
+            rows.append(row)
+    
+    # Create DataFrame
+    df = pd.DataFrame(rows)
+    
+    # Save to CSV if output file is specified
+    if output_file:
+        df.to_csv(output_file, index=False)
+        print(f"Exported parameters to {output_file}")
+    
+    return df
