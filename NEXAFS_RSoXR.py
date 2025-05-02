@@ -4717,7 +4717,8 @@ def visualize_before_after_fitting(results_dict, original_objectives, structures
 
 
 def create_vscode_before_after_explorer(results_dict, original_objectives_dict, structures_dict, 
-                                       energy_list=None, material_name=None):
+                                       energy_list=None, material_name=None, xlim=None,
+                                       figsize=(14, 14)):
     """
     Create an interactive VSCode-friendly visualization to explore before/after fitting results.
     
@@ -4727,13 +4728,15 @@ def create_vscode_before_after_explorer(results_dict, original_objectives_dict, 
         structures_dict (dict): Dictionary mapping energy values to Structure objects
         energy_list (list, optional): List of energies to include. If None, uses all available.
         material_name (str, optional): Optional material name to display in title
+        xlim (tuple, optional): Custom x-axis limits for all plots as (min, max) energy values
+        figsize (tuple, optional): Figure size as (width, height), default is (14, 14)
         
     Returns:
         matplotlib.figure.Figure: Interactive figure for exploring fitting results
     """
     import matplotlib.pyplot as plt
     import numpy as np
-    from matplotlib.gridspec import GridSpec
+    import copy
     
     # Extract fitted objectives from results
     fitted_objectives = {}
@@ -4761,73 +4764,65 @@ def create_vscode_before_after_explorer(results_dict, original_objectives_dict, 
         print("No valid energies found for comparison.")
         return None
     
-    # Create figure with complex layout
-    fig = plt.figure(figsize=(14, 12))
+    # Create figure with proper spacing and sizing
+    fig = plt.figure(figsize=figsize)
     
-    # Row 1: Energy selection
-    # Row 2: Reflectivity
-    # Row 3: SLD profiles
-    # Row 4: Parameter comparison
-    gs = GridSpec(4, 1, figure=fig, height_ratios=[0.5, 1, 1, 1.5])
+    # Create a robust layout with fixed positions
+    # Rows: GOF, Reflectivity, SLD profile, Parameter comparison
+    ax_gof = plt.subplot2grid((4, 4), (0, 0), colspan=4)
+    ax_refl = plt.subplot2grid((4, 4), (1, 0), colspan=4)
+    ax_profile = plt.subplot2grid((4, 4), (2, 0), colspan=4)
     
-    # Create axes
-    ax_energy = fig.add_subplot(gs[0])
-    ax_refl = fig.add_subplot(gs[1])
-    ax_profile = fig.add_subplot(gs[2])
-    ax_params = fig.add_subplot(gs[3])
+    # Parameter comparison will be handled differently - create 4 separate axes
+    ax_sld = plt.subplot2grid((4, 4), (3, 0))
+    ax_isld = plt.subplot2grid((4, 4), (3, 1))
+    ax_thick = plt.subplot2grid((4, 4), (3, 2))
+    ax_rough = plt.subplot2grid((4, 4), (3, 3))
     
-    # Create vertical line for energy selection
+    param_axes = [ax_sld, ax_isld, ax_thick, ax_rough]
+    
+    # Set initial current energy
     current_energy = available_energies[0]
-    energy_line = ax_energy.axvline(x=current_energy, color='red', linestyle='-', linewidth=2)
     
-    # Create scatter plot for energies with improvement as color
+    # Collect GOF data for before and after
+    original_gof_data = []
+    fitted_gof_data = []
     improvements = []
+    
     for energy in available_energies:
         original_chi = original_objectives_dict[energy].chisqr()
         fitted_chi = fitted_objectives[energy].chisqr()
         improvement = (original_chi - fitted_chi) / original_chi * 100
+        
+        original_gof_data.append((energy, original_chi))
+        fitted_gof_data.append((energy, fitted_chi))
         improvements.append(improvement)
     
-    # Create a colormap from red to green based on improvement
-    if improvements:
-        # Create a normalization for the color scale
-        norm = plt.Normalize(min(0, min(improvements)), max(50, max(improvements)))
-        
-        # Create the scatter plot
-        scatter = ax_energy.scatter(
-            available_energies, 
-            np.ones_like(available_energies),  # All at same y-position
-            c=improvements, 
-            cmap='RdYlGn',
-            norm=norm,
-            s=100,
-            picker=5,  # Make points pickable
-            zorder=10
-        )
-        
-        # Add a colorbar
-        cbar = plt.colorbar(scatter, ax=ax_energy, orientation='vertical', pad=0.01)
-        cbar.set_label('Improvement (%)')
-        
-        # Set axis limits and labels
-        ax_energy.set_xlim(min(available_energies) - 2, max(available_energies) + 2)
-        ax_energy.set_ylim(0.5, 1.5)
-        ax_energy.set_yticks([])  # Hide y-axis
-        ax_energy.set_xlabel('Energy (eV)')
-        ax_energy.set_title('Select Energy (Color indicates fitting improvement)')
-        
-        # Add energy labels
-        for energy, improvement in zip(available_energies, improvements):
-            # Position text above or below based on position
-            y_pos = 1.2 if energy % 5 == 0 else 0.8
-            ax_energy.annotate(
-                f"{energy}",
-                xy=(energy, 1),
-                xytext=(0, 0),
-                textcoords="offset points",
-                ha='center',
-                fontsize=8
-            )
+    # Plot GOF comparison
+    ax_gof.plot([e for e, _ in original_gof_data], [g for _, g in original_gof_data], 
+               'bo-', label='Original', linewidth=2, markersize=8, alpha=0.7, 
+               picker=5)  # Make original line clickable
+    ax_gof.plot([e for e, _ in fitted_gof_data], [g for _, g in fitted_gof_data], 
+               'ro-', label='Fitted', linewidth=2, markersize=8, alpha=0.7,
+               picker=5)  # Make fitted line clickable
+    
+    # Add vertical line for current energy in GOF plot
+    gof_energy_line = ax_gof.axvline(x=current_energy, color='red', linestyle='-', linewidth=2, zorder=15)
+    
+    # Set axis labels and title for GOF plot
+    ax_gof.set_ylabel('Goodness of Fit (χ²)', fontsize=14)
+    ax_gof.set_title('Before vs. After GOF Comparison', fontsize=16)
+    ax_gof.legend(fontsize=12)
+    ax_gof.grid(True, alpha=0.3)
+    
+    # Apply xlim to GOF plot if provided
+    if xlim is not None:
+        ax_gof.set_xlim(xlim)
+    
+    # Determine if log scale would be better for GOF
+    gof_values = [g for _, g in original_gof_data] + [g for _, g in fitted_gof_data]
+    if max(gof_values) / min(gof_values) > 10:
+        ax_gof.set_yscale('log')
     
     # Create title with material name if provided
     if material_name:
@@ -4840,8 +4835,8 @@ def create_vscode_before_after_explorer(results_dict, original_objectives_dict, 
         nonlocal current_energy
         current_energy = energy
         
-        # Update energy selection line
-        energy_line.set_xdata([energy, energy])
+        # Update energy selection lines
+        gof_energy_line.set_xdata([energy, energy])
         
         # Get the objectives and structure
         original_obj = original_objectives_dict[energy]
@@ -4936,108 +4931,138 @@ def create_vscode_before_after_explorer(results_dict, original_objectives_dict, 
                          ha='center', va='center', transform=ax_profile.transAxes)
             ax_profile.set_title('SLD Profile - Error')
         
-        # Update parameters plot
-        ax_params.clear()
+        # Define parameter types and their titles
+        param_types = ['sld', 'isld', 'thick', 'rough']
+        param_titles = ['Real SLD', 'Imaginary SLD', 'Thickness', 'Roughness']
         
-        # Get all parameters that were varied
-        varied_params = []
-        param_names = []
-        orig_values = []
-        fitted_values = []
-        percent_changes = []
+        # Get all parameters, grouped by type
+        param_groups = {ptype: [] for ptype in param_types}
         
+        # Populate parameter groups, excluding Si, SiO2, and air
         for param_fitted in fitted_obj.parameters.flattened():
-            # Only look at parameters that were varied or are important SLD parameters
-            include_param = False
-            
-            if hasattr(param_fitted, 'vary') and param_fitted.vary:
-                include_param = True
-            elif any(x in param_fitted.name for x in ['sld', 'isld', 'thick']):
-                include_param = True
-                
-            if not include_param:
+            # Skip parameters for Si, SiO2, and air
+            if any(s in param_fitted.name for s in ['Si ', 'SiO2', 'air']):
                 continue
+                
+            # Determine the parameter type by exact match in name
+            param_type = None
+            if ' sld' in param_fitted.name.lower():  # Note the space before 'sld' to avoid matching 'isld'
+                param_type = 'sld'
+            elif 'isld' in param_fitted.name.lower():
+                param_type = 'isld'
+            elif 'thick' in param_fitted.name.lower():
+                param_type = 'thick'
+            elif 'rough' in param_fitted.name.lower():
+                param_type = 'rough'
+                    
+            if param_type is None:
+                continue  # Skip if not one of our target parameter types
             
             # Find the same parameter in the original objective
             for param_orig in original_obj.parameters.flattened():
                 if param_orig.name == param_fitted.name:
-                    # Calculate percent change
-                    if param_orig.value != 0:
-                        percent_change = (param_fitted.value - param_orig.value) / abs(param_orig.value) * 100
-                    else:
-                        percent_change = 0 if param_fitted.value == 0 else 100  # Arbitrary 100% if from 0 to non-zero
-                    
-                    varied_params.append(param_fitted)
-                    param_names.append(param_fitted.name)
-                    orig_values.append(param_orig.value)
-                    fitted_values.append(param_fitted.value)
-                    percent_changes.append(percent_change)
-                    
+                    # Store parameters with absolute values
+                    param_groups[param_type].append({
+                        'name': param_fitted.name,
+                        'orig_value': param_orig.value,
+                        'fitted_value': param_fitted.value,
+                        'percent_change': ((param_fitted.value - param_orig.value) / abs(param_orig.value) * 100) 
+                                          if param_orig.value != 0 else 100,
+                        'is_varying': getattr(param_fitted, 'vary', False)
+                    })
                     break
         
-        # If we have parameters to show
-        if param_names:
-            # Sort by percent change
-            indices = np.argsort(np.abs(percent_changes))[::-1]  # Descending order
-            param_names = [param_names[i] for i in indices]
-            orig_values = [orig_values[i] for i in indices]
-            fitted_values = [fitted_values[i] for i in indices]
-            percent_changes = [percent_changes[i] for i in indices]
+        # Plot each parameter type in its own subplot
+        for i, (param_type, title, ax_sub) in enumerate(zip(param_types, param_titles, param_axes)):
+            # Clear the current subplot
+            ax_sub.clear()
             
-            # Limit to top 15 parameters for readability
-            if len(param_names) > 15:
-                param_names = param_names[:15]
-                orig_values = orig_values[:15]
-                fitted_values = fitted_values[:15]
-                percent_changes = percent_changes[:15]
+            # Get parameters for this type
+            params = param_groups[param_type]
             
-            # Create barplot of percent changes
-            x_pos = np.arange(len(param_names))
-            bars = ax_params.bar(x_pos, percent_changes, 
-                              color=['green' if x >= 0 else 'red' for x in percent_changes])
+            if not params:
+                ax_sub.text(0.5, 0.5, f"No {title} parameters", ha='center', va='center', 
+                          transform=ax_sub.transAxes)
+                ax_sub.set_title(title)
+                continue
+            
+            # Sort by absolute percent change
+            params.sort(key=lambda x: abs(x['percent_change']), reverse=True)
+            
+            # Limit to top 5 parameters for readability
+            if len(params) > 5:
+                params = params[:5]
+            
+            # Create data for plotting absolute values
+            names = [p['name'].split(' - ')[0] for p in params]  # Just the material name part
+            
+            # Set up bar chart for before/after values
+            x = np.arange(len(names))
+            width = 0.35
+            
+            # Plot original values
+            orig_bars = ax_sub.barh(x - width/2, [p['orig_value'] for p in params], width, 
+                                   label='Original', color='blue', alpha=0.7)
+            
+            # Plot fitted values
+            fitted_bars = ax_sub.barh(x + width/2, [p['fitted_value'] for p in params], width,
+                                     label='Fitted', color='red', alpha=0.7)
             
             # Add value labels
-            for i, (bar, orig, fitted) in enumerate(zip(bars, orig_values, fitted_values)):
-                if abs(percent_changes[i]) > 2:  # Only label significant changes
-                    # Position text at the top/bottom of the bar
-                    height = bar.get_height()
-                    text_pos = height + 1 if height >= 0 else height - 3
-                    ax_params.text(bar.get_x() + bar.get_width()/2., text_pos,
-                                f'{fitted:.2g}\n({percent_changes[i]:+.1f}%)',
-                                ha='center', va='bottom' if height >= 0 else 'top', 
-                                fontsize=8, rotation=45)
+            for j, param in enumerate(params):
+                # Original value
+                ax_sub.text(param['orig_value'] * 1.02, j - width/2, f"{param['orig_value']:.2g}",
+                          ha='left', va='center', fontsize=8, color='blue')
+                
+                # Fitted value
+                ax_sub.text(param['fitted_value'] * 1.02, j + width/2, f"{param['fitted_value']:.2g}",
+                          ha='left', va='center', fontsize=8, color='red')
             
-            # Customize the plot
-            ax_params.set_xticks(x_pos)
-            ax_params.set_xticklabels(param_names, rotation=45, ha='right')
-            ax_params.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-            ax_params.set_ylabel('Parameter Change (%)')
-            ax_params.set_title('Parameter Changes')
+            # Customize the subplot
+            ax_sub.set_yticks(x)
+            ax_sub.set_yticklabels(names)
+            ax_sub.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+            ax_sub.set_title(title)
+            
+            # Add a marker for varying parameters
+            for j, vary in enumerate(param['is_varying'] for param in params):
+                if vary:
+                    ax_sub.plot(-0.01, j, marker='*', markersize=10, color='black')
+            
+            # Add legend for the first subplot only
+            if i == 0:
+                ax_sub.legend(fontsize=8, loc='upper right')
             
             # Add grid
-            ax_params.grid(True, axis='y', alpha=0.3)
+            ax_sub.grid(True, axis='x', alpha=0.3)
             
-            # Adjust y-limits to better fit the data
-            max_change = max(abs(min(percent_changes)), abs(max(percent_changes)))
-            y_limit = min(100, max(20, max_change * 1.2))  # Cap at 100%, but at least 20%
-            ax_params.set_ylim(-y_limit, y_limit)
-        else:
-            ax_params.text(0.5, 0.5, "No varied parameters found",
-                        ha='center', va='center', transform=ax_params.transAxes)
-            ax_params.set_title('Parameter Changes')
+            # Set x-axis limits based on parameter values
+            max_val = max([max(abs(p['orig_value']), abs(p['fitted_value'])) for p in params])
+            ax_sub.set_xlim(-0.05*max_val, max_val*1.2)  # Slight negative space for clarity
+            
+            # Add y-label only to the first subplot
+            if i == 0:
+                ax_sub.set_ylabel('Material')
+            
+            # Add x-label only to the middle subplots
+            if i == 1 or i == 2:
+                ax_sub.set_xlabel('Parameter Value')
+        
+        # Add note about star markers
+        fig.text(0.5, 0.1, '* indicates varying parameters', ha='center', fontsize=10)
         
         # Update the figure
         fig.canvas.draw_idle()
     
-    # Function to handle pick events (clicking on energy points)
+    # Function to handle pick events (clicking on lines in GOF plot)
     def on_pick(event):
-        # Check if we have a valid pick event with data points
+        # Check if we have a valid pick event
         if hasattr(event, 'ind') and len(event.ind) > 0:
-            # Get the index of the clicked point in the scatter plot
+            # Get the index of the clicked point
             ind = event.ind[0]
             
-            # Get the energy value
-            energy = available_energies[ind]
+            # Get the energy value - assume it's the same in both original and fitted data
+            energy = original_gof_data[ind][0]
             
             # Update the plots
             update_plots(energy)
@@ -5064,12 +5089,14 @@ def create_vscode_before_after_explorer(results_dict, original_objectives_dict, 
     # Initial update
     update_plots(available_energies[0])
     
-    plt.tight_layout()
+    # Use tight_layout for better overall spacing
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
     
-    print("Interactive plot ready. Click on energy points to view details. Use left/right arrow keys to navigate.")
+    print("Interactive plot ready. Click on points in the GOF plot to view details.")
+    print("Use left/right arrow keys to navigate between energies.")
+    print(f"Parameter changes are grouped by type. {'' if xlim is None else f'Energy range restricted to {xlim[0]}-{xlim[1]} eV.'}")
     
     return fig
-
 
 def export_best_parameters(results_dict, original_objectives_dict, output_file=None):
     """
