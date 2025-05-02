@@ -5152,3 +5152,1153 @@ def export_best_parameters(results_dict, original_objectives_dict, output_file=N
         print(f"Exported parameters to {output_file}")
     
     return df
+
+
+
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.gridspec import GridSpec
+import matplotlib.cm as cm
+import copy
+import os
+import pickle
+from IPython.display import display, clear_output
+import ipywidgets as widgets
+
+def create_interactive_parameter_updater_v3(objectives_dict, structures_dict, energy_list=None, 
+                                         material_names=None, figsize=(18, 24), xlim=None, 
+                                         bound_threshold=0.02, save_dir=None):
+    """
+    Create an interactive plot for exploring and updating parameter bounds with improved layout.
+    Shows all four parameter types simultaneously with support for multiple materials.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to include. If None, uses all available energies.
+        material_names (list, optional): List of material names to include. If None, uses 'PS'.
+        figsize (tuple): Figure size as (width, height)
+        xlim (tuple, optional): Custom x-axis limits for energy plots as (min, max)
+        bound_threshold (float): Threshold for highlighting values near bounds (as fraction of bound range)
+        save_dir (str, optional): Directory to save updated objectives. If None, defaults to './updated_objectives'
+        
+    Returns:
+        tuple: (fig, updated_objectives_dict) - Interactive figure and dictionary to store updated objectives
+    """
+    import os
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    from matplotlib.gridspec import GridSpec
+    import copy
+    import pickle
+    import ipywidgets as widgets
+    from IPython.display import display, clear_output
+    
+    # Set default material names if not provided
+    if material_names is None:
+        material_names = ["PS"]
+    
+    # Set default save directory if not provided
+    if save_dir is None:
+        save_dir = './updated_objectives'
+    
+    # Ensure save directory exists
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        print(f"Created directory: {save_dir}")
+    
+    # Determine the available energies
+    if energy_list is None:
+        available_energies = sorted(list(set(objectives_dict.keys()) & set(structures_dict.keys())))
+    else:
+        # Filter by available data
+        available_energies = []
+        for energy in energy_list:
+            if energy in objectives_dict and energy in structures_dict:
+                available_energies.append(energy)
+    
+    if not available_energies:
+        print("No valid energies found.")
+        return None, {}
+    
+    # Create a copy of the objectives dictionary for updates
+    updated_objectives_dict = {}
+    for energy in available_energies:
+        updated_objectives_dict[energy] = copy.deepcopy(objectives_dict[energy])
+    
+    # Parameter types for all materials
+    param_types = ['sld', 'isld', 'thick', 'rough']
+    param_labels = ['Real SLD', 'Imag SLD', 'Thickness', 'Roughness']
+    param_colors = ['blue', 'orange', 'green', 'purple']
+    
+    # Create param_strings for all materials
+    all_material_param_data = {}
+    for material_name in material_names:
+        param_strings = [
+            f"{material_name} - sld",
+            f"{material_name} - isld",
+            f"{material_name} - thick",
+            f"{material_name} - rough"
+        ]
+        
+        # Initialize data structure for parameters of this material
+        material_param_data = {param: [] for param in param_strings}
+        all_material_param_data[material_name] = material_param_data
+    
+    # Collect chi-squared data
+    chi_squared_data = []
+    
+    # Collect parameter data for all materials and energies
+    for energy in available_energies:
+        # Get objective for this energy
+        objective = objectives_dict[energy]
+        chi_squared = objective.chisqr()
+        chi_squared_data.append({'energy': energy, 'chi_squared': chi_squared})
+        
+        # For each material, find its parameter values
+        for material_name in material_names:
+            material_param_data = all_material_param_data[material_name]
+            
+            param_strings = [
+                f"{material_name} - sld",
+                f"{material_name} - isld",
+                f"{material_name} - thick",
+                f"{material_name} - rough"
+            ]
+            
+            # Find parameter values for this material
+            for param_string in param_strings:
+                found = False
+                for param in objective.parameters.flattened():
+                    if param.name == param_string:
+                        value = param.value
+                        stderr = getattr(param, 'stderr', None)
+                        bound_low = None
+                        bound_high = None
+                        
+                        try:
+                            bounds = getattr(param, 'bounds', None)
+                            if bounds is not None:
+                                # Extract bound values
+                                if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                                    bound_low = bounds.lb
+                                    bound_high = bounds.ub
+                                elif isinstance(bounds, tuple) and len(bounds) == 2:
+                                    bound_low, bound_high = bounds
+                        except:
+                            pass
+                        
+                        # Calculate if the value is near bounds
+                        near_bound = False
+                        if bound_low is not None and bound_high is not None:
+                            bound_range = bound_high - bound_low
+                            threshold = bound_threshold * bound_range
+                            near_bound = (abs(value - bound_low) < threshold or 
+                                         abs(bound_high - value) < threshold)
+                        
+                        material_param_data[param_string].append({
+                            'energy': energy,
+                            'value': value,
+                            'stderr': stderr if stderr is not None else 0,
+                            'bound_low': bound_low,
+                            'bound_high': bound_high,
+                            'near_bound': near_bound,
+                            'chi_squared': chi_squared
+                        })
+                        found = True
+                        break
+                
+                if not found:
+                    print(f"Parameter {param_string} not found for energy {energy}")
+    
+    # Convert to DataFrames
+    all_param_dfs = {}
+    for material_name in material_names:
+        material_param_data = all_material_param_data[material_name]
+        material_param_dfs = {}
+        
+        for param_string, data in material_param_data.items():
+            if data:
+                df = pd.DataFrame(data)
+                material_param_dfs[param_string] = df.sort_values('energy')
+        
+        all_param_dfs[material_name] = material_param_dfs
+    
+    chi_squared_df = pd.DataFrame(chi_squared_data).sort_values('energy')
+    
+    # Create figure with improved layout - increased height for better plots
+    fig = plt.figure(figsize=figsize)
+    
+    # Layout with drastically improved heights:
+    # Row 1: Material selector and Energy selector with GF (3.0) - TALLER
+    # Row 2: Parameter plots (8.0) - MUCH TALLER
+    # Row 3: Reflectivity (2.0) - Smaller
+    # Row 4: SLD profile (2.0) - Smaller
+    # Row 5: Parameter controls (3.0)
+    gs = GridSpec(5, 1, figure=fig, height_ratios=[3.0, 8.0, 2.0, 2.0, 3.0])
+    
+    # Create axes
+    ax_energy = fig.add_subplot(gs[0])
+    ax_params = fig.add_subplot(gs[1])
+    ax_refl = fig.add_subplot(gs[2])
+    ax_profile = fig.add_subplot(gs[3])
+    ax_controls = fig.add_subplot(gs[4])
+    
+    # Clear the controls axis (will use widgets instead)
+    ax_controls.axis('off')
+    
+    # Create vertical line for energy selection
+    current_energy = available_energies[0]
+    
+    # Get chi-squared values for all energies
+    gf_values = []
+    for energy in available_energies:
+        gf = chi_squared_df[chi_squared_df['energy'] == energy]['chi_squared'].iloc[0]
+        gf_values.append(gf)
+    
+    # Create a colormap from blue to red based on GF (lower is better)
+    norm = plt.Normalize(min(gf_values), max(gf_values))
+    
+    # Create the scatter plot for energy selection with GF coloring AND y-axis position
+    scatter = ax_energy.scatter(
+        available_energies, 
+        gf_values,  # Use GF values for y-axis position
+        c=gf_values, 
+        cmap='viridis_r',  # Reverse viridis - yellow is best (lowest GF), purple is worst
+        norm=norm,
+        s=150,  # Larger points
+        picker=5,  # Make points pickable
+        zorder=10
+    )
+    
+    # Add a colorbar
+    cbar = plt.colorbar(scatter, ax=ax_energy, orientation='vertical', pad=0.01)
+    cbar.set_label('Goodness of Fit (χ²)', fontsize=14)
+    cbar.ax.tick_params(labelsize=12)
+    
+    # Connect GoF points with a line to see trend more clearly
+    ax_energy.plot(available_energies, gf_values, '-', color='gray', alpha=0.5, zorder=5)
+    
+    # Add the vertical line for current energy selection
+    energy_line = ax_energy.axvline(x=current_energy, color='red', linestyle='-', linewidth=2, zorder=15)
+    
+    # Set axis limits and labels for energy selector - larger and clearer
+    # Apply custom xlim to energy plot if provided
+    if xlim is not None:
+        ax_energy.set_xlim(xlim)
+    else:
+        # Default limits with padding
+        ax_energy.set_xlim(min(available_energies) - 2, max(available_energies) + 2)
+    
+    # Calculate good y-limits with padding for the GoF plot
+    gf_min = min(gf_values)
+    gf_max = max(gf_values)
+    y_padding = (gf_max - gf_min) * 0.1 if gf_max > gf_min else gf_max * 0.1
+    ax_energy.set_ylim(max(0, gf_min - y_padding), gf_max + y_padding)
+    
+    ax_energy.set_xlabel('Energy (eV)', fontsize=14)
+    ax_energy.set_ylabel('Goodness of Fit (χ²)', fontsize=14)
+    ax_energy.set_title('Select Energy (Color and height indicate goodness of fit - lower is better)', fontsize=16)
+    ax_energy.tick_params(axis='both', labelsize=12)
+    ax_energy.grid(True, alpha=0.3)  # Add grid for better readability
+    
+    # Add energy labels above the points
+    for energy, gf in zip(available_energies, gf_values):
+        # Only show labels for energies within xlim
+        if xlim is None or (xlim[0] <= energy <= xlim[1]):
+            # Position text above the point
+            ax_energy.annotate(
+                f"{energy}",
+                xy=(energy, gf),
+                xytext=(0, 10),  # Fixed pixel offset upward
+                textcoords="offset points",
+                ha='center',
+                fontsize=12,
+                weight='bold'
+            )
+    
+    # Create a title with multiple materials mention
+    if len(material_names) == 1:
+        fig.suptitle(f"{material_names[0]} - Parameter Bound Explorer & Updater", fontsize=18)
+    else:
+        fig.suptitle(f"Multi-Material Parameter Bound Explorer & Updater", fontsize=18)
+    
+    # Current material selection
+    current_material = material_names[0]
+    
+    # State variables to track current selections
+    current_param_objs = {material_name: {param_type: None for param_type in param_types} 
+                         for material_name in material_names}
+    
+    # Current parameter values label dictionary
+    current_param_values = {material_name: {param_type: None for param_type in param_types} 
+                          for material_name in material_names}
+    
+    # Create widgets for material selection
+    material_dropdown = widgets.Dropdown(
+        options=[(name, name) for name in material_names],
+        value=current_material,
+        description='Material:',
+        layout=widgets.Layout(width='200px')
+    )
+    
+    # Create widgets for all parameter types for all materials
+    # Use a dictionary of dictionaries to store widgets for each material and parameter type
+    all_bound_widgets = {}
+    for material_name in material_names:
+        bound_widgets = {}
+        for param_type in param_types:
+            # Add value label to show current parameter value
+            value_label = widgets.Label(
+                value=f"Current value: N/A",
+                layout=widgets.Layout(width='250px')
+            )
+            
+            bound_widgets[param_type] = {
+                'value_label': value_label,
+                'lower': widgets.FloatText(
+                    description=f'{param_type} Lower:',
+                    disabled=False,
+                    layout=widgets.Layout(width='200px'),
+                    step=0.01,
+                    readout_format='.2f'  # Format with 2 decimal places
+                ),
+                'upper': widgets.FloatText(
+                    description=f'{param_type} Upper:',
+                    disabled=False,
+                    layout=widgets.Layout(width='200px'),
+                    step=0.01,
+                    readout_format='.2f'  # Format with 2 decimal places
+                ),
+                'vary': widgets.Checkbox(
+                    value=False,
+                    description=f'Vary {param_type}',
+                    disabled=False
+                ),
+                'update': widgets.Button(
+                    description=f'Update {param_type}',
+                    button_style='primary',
+                    tooltip=f'Update the bounds for {param_type} parameter',
+                    layout=widgets.Layout(width='150px')
+                ),
+                'reset': widgets.Button(
+                    description=f'Reset {param_type}',
+                    button_style='warning',
+                    tooltip=f'Reset to original bounds for {param_type}',
+                    layout=widgets.Layout(width='150px')
+                )
+            }
+        all_bound_widgets[material_name] = bound_widgets
+    
+    # Global controls
+    save_button = widgets.Button(
+        description='Save Objective',
+        button_style='success',
+        tooltip='Save the updated objective',
+        layout=widgets.Layout(width='200px')
+    )
+    
+    status_label = widgets.Label(
+        value='Ready',
+        layout=widgets.Layout(width='100%')
+    )
+    
+    # Create a widget output area for the controls
+    controls_output = widgets.Output()
+    
+    # Dictionary to store widget containers for each material
+    material_widget_containers = {}
+    
+    with controls_output:
+        # Material selection container
+        material_container = widgets.HBox([material_dropdown])
+        
+        # Create widget containers for each material
+        for material_name in material_names:
+            param_rows = []
+            current_widgets = all_bound_widgets[material_name]
+            
+            for param_type in param_types:
+                param_row = widgets.VBox([
+                    # Add current value label at the top
+                    current_widgets[param_type]['value_label'],
+                    widgets.HBox([current_widgets[param_type]['lower'], current_widgets[param_type]['upper']]),
+                    widgets.HBox([current_widgets[param_type]['vary']]),
+                    widgets.HBox([current_widgets[param_type]['update'], current_widgets[param_type]['reset']])
+                ])
+                param_rows.append(param_row)
+            
+            # Create container for this material's widgets
+            material_widget_containers[material_name] = widgets.VBox(param_rows)
+            
+            # Initially hide all except the first material
+            if material_name != material_names[0]:
+                material_widget_containers[material_name].layout.display = 'none'
+        
+        # Add save button row
+        save_row = widgets.HBox([save_button])
+        
+        # Add status row
+        status_row = widgets.HBox([status_label])
+        
+        # Create the main container with all material widget containers
+        main_container = widgets.VBox([
+            material_container,
+            *list(material_widget_containers.values()),  # Include all material containers
+            save_row,
+            status_row
+        ])
+        
+        display(main_container)
+    
+    # Place the widgets in the figure
+    fig.canvas.draw()
+    controls_pos = ax_controls.get_position()
+    controls_widget = fig.add_axes([controls_pos.x0, controls_pos.y0, 
+                                   controls_pos.width, controls_pos.height])
+    controls_widget.axis('off')
+    controls_widget.figure.canvas.draw()
+    
+    # Function to update a specific parameter bounds and widgets
+    def update_param_info(energy, material_name, param_type):
+        param_string = f"{material_name} - {param_type}"
+        
+        material_param_dfs = all_param_dfs.get(material_name, {})
+        
+        # Get the dataframe for this parameter
+        if param_string not in material_param_dfs:
+            status_label.value = f"Parameter {param_string} not found"
+            current_param_objs[material_name][param_type] = None
+            return None
+        
+        df = material_param_dfs[param_string]
+        
+        # Find the row for this energy
+        row = df[df['energy'] == energy]
+        if row.empty:
+            status_label.value = f"No data for {param_string} at energy {energy}"
+            current_param_objs[material_name][param_type] = None
+            return None
+        
+        # Find the parameter object in the updated objective
+        obj = updated_objectives_dict[energy]
+        param_obj = None
+        for param in obj.parameters.flattened():
+            if param.name == param_string:
+                param_obj = param
+                break
+        
+        if param_obj is not None:
+            # Update the current value label
+            value = param_obj.value
+            bound_widgets = all_bound_widgets[material_name][param_type]
+            bound_widgets['value_label'].value = f"Current value: {value:.4g}"
+            
+            # Store the current value
+            current_param_values[material_name][param_type] = value
+            
+            # Update the widgets with current bounds
+            try:
+                bounds = getattr(param_obj, 'bounds', None)
+                if bounds is not None:
+                    if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                        bound_widgets['lower'].value = bounds.lb
+                        bound_widgets['upper'].value = bounds.ub
+                    elif isinstance(bounds, tuple) and len(bounds) == 2:
+                        bound_widgets['lower'].value = bounds[0]
+                        bound_widgets['upper'].value = bounds[1]
+            except:
+                pass
+            
+            vary = getattr(param_obj, 'vary', False)
+            all_bound_widgets[material_name][param_type]['vary'].value = vary
+            
+            # Store the param object for later use
+            current_param_objs[material_name][param_type] = param_obj
+        
+        return param_obj
+    
+    # Function to update the reflectivity plot
+    def update_reflectivity_plot(energy):
+        ax_refl.clear()
+        
+        # Get the objective for this energy
+        objective = updated_objectives_dict[energy]
+        data = objective.data
+        
+        # Calculate the model
+        chi_squared = objective.chisqr()
+        
+        # Plot the data and model
+        ax_refl.plot(data.data[0], data.data[1], 'o', label='Data', markersize=2, color='black')
+        ax_refl.plot(data.data[0], objective.model(data.data[0]), '-', 
+                   label=f'Model (χ²: {chi_squared:.4f})', linewidth=2, color='blue')
+        
+        ax_refl.set_yscale('log')
+        ax_refl.set_xlabel(r'Q ($\AA^{-1}$)', fontsize=12)
+        ax_refl.set_ylabel('Reflectivity (a.u)', fontsize=12)
+        ax_refl.set_title(f'Reflectivity - {energy} eV', fontsize=14)
+        ax_refl.legend(loc='best', fontsize=10)
+        ax_refl.grid(True, alpha=0.3)
+        ax_refl.tick_params(labelsize=10)
+    
+    # Function to update the SLD profile plot
+    def update_sld_profile(energy):
+        ax_profile.clear()
+        
+        # Get the objective and structure for this energy
+        objective = updated_objectives_dict[energy]
+        structure = structures_dict[energy]
+        
+        # Apply profile shift
+        profile_shift = -20
+        
+        try:
+            # Create a copy of the structure and update its parameters
+            updated_structure = copy.deepcopy(structure)
+            
+            # Copy parameters from the objective to the structure
+            for param in objective.parameters.flattened():
+                # Find matching parameter in structure
+                for struct_param in updated_structure.parameters.flattened():
+                    if param.name == struct_param.name:
+                        struct_param.value = param.value
+                        break
+            
+            # Calculate SLD profiles
+            from Plotting_Refl import profileflip
+            Real_depth, Real_SLD, Imag_Depth, Imag_SLD = profileflip(updated_structure, depth_shift=0)
+            Real_depth = Real_depth + profile_shift
+            Imag_Depth = Imag_Depth + profile_shift
+            
+            # Plot SLD profiles
+            ax_profile.plot(Real_depth, Real_SLD, '-', label='Real SLD', linewidth=2, color='blue')
+            ax_profile.plot(Imag_Depth, Imag_SLD, '--', label='Imag SLD', linewidth=2, color='orange')
+            
+            ax_profile.set_xlabel(r'Distance from Si ($\AA$)', fontsize=12)
+            ax_profile.set_ylabel(r'SLD $(10^{-6})$ $\AA^{-2}$', fontsize=12)
+            ax_profile.set_title(f'SLD Profile - {energy} eV', fontsize=14)
+            ax_profile.legend(loc='best', fontsize=10)
+            ax_profile.grid(True, alpha=0.3)
+            ax_profile.tick_params(labelsize=10)
+            
+        except Exception as e:
+            ax_profile.text(0.5, 0.5, f"Error: {str(e)}",
+                          ha='center', va='center', transform=ax_profile.transAxes)
+    
+    # Function to update the parameter plots for the current material
+    def update_param_plots(material_name):
+        ax_params.clear()
+        
+        # Create grid of plots inside the main parameter axis - larger subplots
+        n_rows = 2  # 2 rows of plots
+        n_cols = 2  # 2 columns of plots
+        
+        # Create mini grid positions with more generous sizing
+        grid_pos = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        
+        # Get parameter DataFrames for this material
+        material_param_dfs = all_param_dfs.get(material_name, {})
+        
+        # Plot each parameter trend
+        for i, (param_type, pos) in enumerate(zip(param_types, grid_pos)):
+            row, col = pos
+            param_string = f"{material_name} - {param_type}"
+            
+            # Calculate position in the grid (0-1 range)
+            x0 = col / n_cols
+            y0 = 1 - (row + 1) / n_rows  # Invert y because it's from top to bottom
+            width = 1 / n_cols
+            height = 1 / n_rows
+            
+            # Adjust positions to avoid overlapping - minimal padding for larger plots
+            padding = 0.02
+            x0 += padding
+            y0 += padding
+            width -= 2 * padding
+            height -= 2 * padding
+            
+            # Create axis within the parameter plot area - larger size
+            param_ax = ax_params.inset_axes([x0, y0, width, height])
+            
+            # Get the dataframe for this parameter
+            if param_string not in material_param_dfs:
+                param_ax.text(0.5, 0.5, "Parameter Not Found",
+                            ha='center', va='center', transform=param_ax.transAxes)
+                param_ax.set_title(f"{param_labels[i]}")
+                continue
+            
+            df = material_param_dfs[param_string]
+            
+            # Extract data
+            energies = df['energy']
+            values = df['value']
+            errors = df['stderr']
+            
+            # Create masked arrays for normal and near-bound points
+            mask_normal = ~df['near_bound']
+            mask_near_bound = df['near_bound']
+            
+            # Plot normal points - larger markers
+            if any(mask_normal):
+                param_ax.errorbar(
+                    df.loc[mask_normal, 'energy'],
+                    df.loc[mask_normal, 'value'],
+                    yerr=df.loc[mask_normal, 'stderr'],
+                    fmt='o-',
+                    color=param_colors[i],
+                    label='Normal',
+                    linewidth=2,
+                    alpha=0.7,
+                    markersize=8  # Larger markers
+                )
+            
+            # Plot near-bound points - larger markers
+            if any(mask_near_bound):
+                param_ax.errorbar(
+                    df.loc[mask_near_bound, 'energy'],
+                    df.loc[mask_near_bound, 'value'],
+                    yerr=df.loc[mask_near_bound, 'stderr'],
+                    fmt='o',
+                    color='red',
+                    label='Near Bound',
+                    linewidth=2,
+                    markersize=10  # Larger markers
+                )
+            
+            # Add vertical line for current energy
+            param_ax.axvline(
+                x=current_energy,
+                color='red',
+                linestyle='-',  # Solid line for better visibility
+                linewidth=2,  # Thicker line
+                label='Current Energy'
+            )
+            
+            # Plot bounds for all energies
+            has_bounds = df['bound_low'].notna().any() and df['bound_high'].notna().any()
+            if has_bounds:
+                # Filter to rows with valid bounds
+                bounds_df = df[df['bound_low'].notna() & df['bound_high'].notna()]
+                
+                # Plot lower bounds
+                param_ax.plot(
+                    bounds_df['energy'],
+                    bounds_df['bound_low'],
+                    '--',
+                    color='gray',
+                    alpha=0.7,
+                    label='Bounds',
+                    linewidth=2  # Thicker lines
+                )
+                
+                # Plot upper bounds
+                param_ax.plot(
+                    bounds_df['energy'],
+                    bounds_df['bound_high'],
+                    '--',
+                    color='gray',
+                    alpha=0.7,
+                    linewidth=2  # Thicker lines
+                )
+                
+                # Add shaded region
+                param_ax.fill_between(
+                    bounds_df['energy'],
+                    bounds_df['bound_low'],
+                    bounds_df['bound_high'],
+                    color='gray',
+                    alpha=0.2
+                )
+            
+            # Set the title based on parameter type - larger font
+            param_ax.set_title(param_labels[i], fontsize=14)
+            
+            # Add grid
+            param_ax.grid(True, alpha=0.3)
+            
+            # Add x and y labels with larger font
+            if row == 1:  # Bottom row
+                param_ax.set_xlabel('Energy (eV)', fontsize=12)
+            
+            # Set ylabel based on parameter type
+            if col == 0:  # Left column
+                if param_type == 'sld':
+                    param_ax.set_ylabel('Real SLD (10⁻⁶ Å⁻²)', fontsize=12)
+                elif param_type == 'isld':
+                    param_ax.set_ylabel('Imag SLD (10⁻⁶ Å⁻²)', fontsize=12)
+                elif param_type == 'thick':
+                    param_ax.set_ylabel('Thickness (Å)', fontsize=12)
+                elif param_type == 'rough':
+                    param_ax.set_ylabel('Roughness (Å)', fontsize=12)
+            
+            # Apply custom xlim to parameter plots if provided
+            if xlim is not None:
+                param_ax.set_xlim(xlim)
+                
+            # Make ticks larger
+            param_ax.tick_params(labelsize=10)
+            
+            # Add legend with larger font
+            param_ax.legend(fontsize=10, loc='best')
+            
+        # Add a global title for the parameter plots
+        ax_params.set_title(f'Parameter Trends for {material_name}', fontsize=16)
+        ax_params.axis('off')  # Hide main axis, only show inset axes
+    
+    # Function to update all plots and parameter info
+    def update_all_plots(energy, material_name):
+        nonlocal current_energy, current_material
+        
+        # Update current selections
+        current_energy = energy
+        current_material = material_name
+        
+        # Update energy indicator
+        energy_line.set_xdata([energy, energy])
+        
+        # Update material dropdown
+        material_dropdown.value = material_name
+        
+        # Update all parameter info for current material
+        for pt in param_types:
+            update_param_info(energy, material_name, pt)
+        
+        # Update reflectivity plot
+        update_reflectivity_plot(energy)
+        
+        # Update SLD profile
+        update_sld_profile(energy)
+        
+        # Update parameter plots for the current material
+        update_param_plots(material_name)
+        
+        # Force the figure to update
+        fig.canvas.draw_idle()
+    
+    # Function to handle material dropdown change
+    def on_material_change(change):
+        if change['type'] == 'change' and change['name'] == 'value':
+            new_material = change['new']
+            
+            # Hide all material widget containers
+            for material_name in material_names:
+                material_widget_containers[material_name].layout.display = 'none'
+            
+            # Show only the selected material's widget container
+            material_widget_containers[new_material].layout.display = 'block'
+            
+            # Update plots and data for the new material
+            update_all_plots(current_energy, new_material)
+    
+    # Connect material dropdown handler
+    material_dropdown.observe(on_material_change, names='value')
+    
+    # Event handlers
+    
+    # Function to handle energy selection
+    def on_energy_pick(event):
+        # Check if we have a valid pick event with data points
+        if hasattr(event, 'ind') and len(event.ind) > 0:
+            # Get the index and corresponding energy
+            ind = event.ind[0]
+            energy = available_energies[ind]
+            
+            # Update plots
+            update_all_plots(energy, current_material)
+            # Connect pick events
+    fig.canvas.mpl_connect('pick_event', lambda event: on_energy_pick(event) 
+                            if event.artist == scatter else None)
+    
+    # Create handlers for each parameter's update button for each material
+    def create_update_handler(material_name, param_type):
+        def handler(b):
+            param_obj = current_param_objs[material_name][param_type]
+            if param_obj is None:
+                status_label.value = f"Error: No {param_type} parameter selected for {material_name}"
+                return
+            
+            try:
+                # Get the new bounds
+                bound_widgets = all_bound_widgets[material_name][param_type]
+                lower = bound_widgets['lower'].value
+                upper = bound_widgets['upper'].value
+                
+                # Validate bounds
+                if lower >= upper:
+                    status_label.value = f"Error: {param_type} lower bound must be less than upper bound for {material_name}"
+                    return
+                
+                # For imaginary SLD, ensure lower bound is not negative
+                if param_type == 'isld' and lower < 0:
+                    lower = 0
+                    bound_widgets['lower'].value = 0
+                    status_label.value = f"Note: Lower bound for iSLD set to 0 (can't be negative) for {material_name}"
+                
+                # Update the parameter bounds
+                param_obj.bounds = (lower, upper)
+                
+                # Update vary setting
+                param_obj.vary = bound_widgets['vary'].value
+                
+                # Update the plots
+                update_all_plots(current_energy, current_material)
+                
+                status_label.value = f"Updated {param_type} bounds to [{lower:.2f}, {upper:.2f}] for {material_name}"
+            except Exception as e:
+                status_label.value = f"Error updating {param_type} for {material_name}: {str(e)}"
+        
+        return handler
+    
+    # Create handlers for each parameter's reset button for each material
+    def create_reset_handler(material_name, param_type):
+        def handler(b):
+            param_obj = current_param_objs[material_name][param_type]
+            if param_obj is None or current_energy is None:
+                status_label.value = f"Error: No {param_type} parameter selected for {material_name}"
+                return
+            
+            try:
+                # Get the original objective
+                orig_obj = objectives_dict[current_energy]
+                param_string = f"{material_name} - {param_type}"
+                
+                # Find the original parameter
+                orig_param = None
+                for param in orig_obj.parameters.flattened():
+                    if param.name == param_string:
+                        orig_param = param
+                        break
+                
+                if orig_param is None:
+                    status_label.value = f"Error: {param_type} parameter not found in original objective for {material_name}"
+                    return
+                
+                # Get original bounds
+                try:
+                    bounds = getattr(orig_param, 'bounds', None)
+                    if bounds is not None:
+                        if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                            lower = bounds.lb
+                            upper = bounds.ub
+                        elif isinstance(bounds, tuple) and len(bounds) == 2:
+                            lower, upper = bounds
+                        
+                        # Update the parameter bounds
+                        param_obj.bounds = (lower, upper)
+                        
+                        # Update vary setting to match original
+                        vary = getattr(orig_param, 'vary', False)
+                        param_obj.vary = vary
+                        all_bound_widgets[material_name][param_type]['vary'].value = vary
+                        
+                        # Update the bound inputs
+                        all_bound_widgets[material_name][param_type]['lower'].value = lower
+                        all_bound_widgets[material_name][param_type]['upper'].value = upper
+                        
+                        # Update the plots
+                        update_all_plots(current_energy, current_material)
+                        
+                        status_label.value = f"Reset {param_type} bounds to original: [{lower:.2f}, {upper:.2f}] for {material_name}"
+                    else:
+                        status_label.value = f"Original {param_type} parameter has no bounds set for {material_name}"
+                except Exception as e:
+                    status_label.value = f"Error getting original {param_type} bounds for {material_name}: {str(e)}"
+                    
+            except Exception as e:
+                status_label.value = f"Error resetting {param_type} bounds for {material_name}: {str(e)}"
+        
+        return handler
+    
+    # Handler for save button
+    def on_save_objective(b):
+        if current_energy is None:
+            status_label.value = "Error: No energy selected"
+            return
+        
+        try:
+            # Get the objective
+            obj = updated_objectives_dict[current_energy]
+            
+            # Create a filename
+            filename = os.path.join(save_dir, f"updated_objective_{current_energy}eV.pkl")
+            
+            # Save the objective
+            with open(filename, 'wb') as f:
+                pickle.dump(obj, f)
+            
+            status_label.value = f"Saved objective for {current_energy} eV to {filename}"
+        except Exception as e:
+            status_label.value = f"Error saving objective: {str(e)}"
+    
+    # Connect button handlers for each material and parameter type
+    for material_name in material_names:
+        for param_type in param_types:
+            all_bound_widgets[material_name][param_type]['update'].on_click(
+                create_update_handler(material_name, param_type)
+            )
+            all_bound_widgets[material_name][param_type]['reset'].on_click(
+                create_reset_handler(material_name, param_type)
+            )
+    
+    save_button.on_click(on_save_objective)
+    
+    # Key press handler for navigating with arrow keys
+    def on_key(event):
+        if event.key == 'right':
+            # Go to next energy
+            current_index = available_energies.index(current_energy)
+            if current_index < len(available_energies) - 1:
+                update_all_plots(available_energies[current_index + 1], current_material)
+        elif event.key == 'left':
+            # Go to previous energy
+            current_index = available_energies.index(current_energy)
+            if current_index > 0:
+                update_all_plots(available_energies[current_index - 1], current_material)
+        elif event.key == 'up' or event.key == 'down':
+            # Cycle through materials
+            current_index = material_names.index(current_material)
+            if event.key == 'up':
+                # Previous material
+                new_index = (current_index - 1) % len(material_names)
+            else:  # event.key == 'down'
+                # Next material
+                new_index = (current_index + 1) % len(material_names)
+            update_all_plots(current_energy, material_names[new_index])
+    
+    # Connect the key press event
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    
+    # Display the controls output in the notebook (only visible in notebook)
+    display(controls_output)
+    
+    # Initialize the plots
+    update_all_plots(available_energies[0], material_names[0])
+    
+    # Adjust figure layout to make room for controls
+    plt.tight_layout(rect=[0, 0.12, 1, 0.98])
+    
+    print("Interactive parameter updater ready.")
+    print("Use the mouse to click on energy points to select an energy.")
+    print("Use left/right arrow keys to navigate between energies.")
+    print("Use the material dropdown or up/down arrow keys to switch between materials.")
+    print("Adjust bounds for all parameters of the current material using the controls at the bottom.")
+    print("Save updated objectives with the 'Save Objective' button.")
+    
+    return fig, updated_objectives_dict
+
+def batch_update_parameter_bounds(objectives_dict, material_name="PS", param_types=None, 
+                                 bound_expansion_factor=1.5, energy_list=None, save_dir=None):
+    """
+    Batch update parameter bounds for all objectives with a consistent expansion factor.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        material_name (str): Name of the material to analyze
+        param_types (list, optional): List of parameter types to update (e.g., ['sld', 'isld']).
+                                   If None, updates all parameter types.
+        bound_expansion_factor (float): Factor to expand bounds by (e.g., 1.5 = 50% expansion)
+        energy_list (list, optional): List of energies to include. If None, uses all available.
+        save_dir (str, optional): Directory to save updated objectives. If None, defaults to './batch_updated'
+        
+    Returns:
+        dict: Dictionary of updated objectives
+    """
+    # Set default parameter types if not provided
+    if param_types is None:
+        param_types = ['sld', 'isld', 'thick', 'rough']
+    
+    # Set default save directory if not provided
+    if save_dir is None:
+        save_dir = './batch_updated'
+    
+    # Ensure save directory exists
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        print(f"Created directory: {save_dir}")
+    
+    # Filter energies if provided
+    if energy_list is None:
+        available_energies = sorted(objectives_dict.keys())
+    else:
+        available_energies = [e for e in energy_list if e in objectives_dict]
+    
+    if not available_energies:
+        print("No valid energies found.")
+        return {}
+    
+    # Create a deep copy of the objectives dictionary for updates
+    updated_objectives_dict = {}
+    for energy in available_energies:
+        updated_objectives_dict[energy] = copy.deepcopy(objectives_dict[energy])
+    
+    # Create parameter strings to match
+    parameter_strings = []
+    for param_type in param_types:
+        parameter_strings.append(f"{material_name} - {param_type}")
+    
+    # Process each energy
+    for energy in available_energies:
+        # Get the objective
+        obj = updated_objectives_dict[energy]
+        
+        # Count of parameters updated
+        updated_count = 0
+        
+        # Update each matching parameter
+        for param in obj.parameters.flattened():
+            if any(param_str in param.name for param_str in parameter_strings):
+                # Get current bounds
+                try:
+                    bounds = getattr(param, 'bounds', None)
+                    if bounds is not None:
+                        if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                            lower = bounds.lb
+                            upper = bounds.ub
+                        elif isinstance(bounds, tuple) and len(bounds) == 2:
+                            lower, upper = bounds
+                        else:
+                            continue  # Skip if bounds format is unknown
+                            
+                        # Calculate new bounds
+                        bound_range = upper - lower
+                        midpoint = (upper + lower) / 2
+                        new_range = bound_range * bound_expansion_factor
+                        new_lower = midpoint - new_range / 2
+                        new_upper = midpoint + new_range / 2
+                        
+                        # For imaginary SLD, ensure lower bound is not negative
+                        if 'isld' in param.name.lower() and new_lower < 0:
+                            new_lower = 0
+                        
+                        # Set the new bounds
+                        param.bounds = (new_lower, new_upper)
+                        updated_count += 1
+                except Exception as e:
+                    print(f"Error updating bounds for {param.name} at {energy} eV: {str(e)}")
+        
+        print(f"Updated {updated_count} parameters for energy {energy} eV")
+        
+        # Save the updated objective
+        filename = os.path.join(save_dir, f"batch_updated_objective_{energy}eV.pkl")
+        with open(filename, 'wb') as f:
+            pickle.dump(obj, f)
+    
+    print(f"All objectives updated and saved to {save_dir}")
+    return updated_objectives_dict
+
+def export_parameter_bounds(objectives_dict, material_name="PS", param_types=None,
+                           energy_list=None, output_file="parameter_bounds.csv"):
+    """
+    Export parameter bounds to a CSV file for review and analysis.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        material_name (str): Name of the material to analyze
+        param_types (list, optional): List of parameter types to export (e.g., ['sld', 'isld']).
+                                   If None, exports all parameter types.
+        energy_list (list, optional): List of energies to include. If None, uses all available.
+        output_file (str): Filename for the output CSV
+        
+    Returns:
+        pandas.DataFrame: DataFrame with parameter bounds information
+    """
+    # Set default parameter types if not provided
+    if param_types is None:
+        param_types = ['sld', 'isld', 'thick', 'rough']
+    
+    # Filter energies if provided
+    if energy_list is None:
+        available_energies = sorted(objectives_dict.keys())
+    else:
+        available_energies = [e for e in energy_list if e in objectives_dict]
+    
+    if not available_energies:
+        print("No valid energies found.")
+        return pd.DataFrame()
+    
+    # Create parameter strings to match
+    parameter_strings = []
+    for param_type in param_types:
+        parameter_strings.append(f"{material_name} - {param_type}")
+    
+    # Initialize list for rows
+    rows = []
+    
+    # Process each energy
+    for energy in available_energies:
+        # Get the objective
+        obj = objectives_dict[energy]
+        
+        # Get chi-squared
+        try:
+            chi_squared = obj.chisqr()
+        except:
+            chi_squared = None
+        
+        # Get parameters
+        for param in obj.parameters.flattened():
+            if any(param_str in param.name for param_str in parameter_strings):
+                # Get parameter name and value
+                param_name = param.name
+                value = param.value
+                
+                # Get bounds
+                bound_low = None
+                bound_high = None
+                
+                try:
+                    bounds = getattr(param, 'bounds', None)
+                    if bounds is not None:
+                        if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                            bound_low = bounds.lb
+                            bound_high = bounds.ub
+                        elif isinstance(bounds, tuple) and len(bounds) == 2:
+                            bound_low, bound_high = bounds
+                except:
+                    pass
+                
+                # Get vary status
+                vary = getattr(param, 'vary', False)
+                
+                # Calculate if value is near bounds
+                near_bound = False
+                if bound_low is not None and bound_high is not None:
+                    bound_range = bound_high - bound_low
+                    threshold = 0.02 * bound_range  # 2% of range
+                    near_bound = (abs(value - bound_low) < threshold or 
+                                 abs(bound_high - value) < threshold)
+                
+                # Add row
+                row = {
+                    'energy': energy,
+                    'parameter': param_name,
+                    'value': value,
+                    'bound_low': bound_low,
+                    'bound_high': bound_high,
+                    'bound_range': bound_high - bound_low if (bound_low is not None and bound_high is not None) else None,
+                    'position_in_range': ((value - bound_low) / (bound_high - bound_low)) if (bound_low is not None and bound_high is not None and bound_high > bound_low) else None,
+                    'near_bound': near_bound,
+                    'vary': vary,
+                    'chi_squared': chi_squared
+                }
+                
+                rows.append(row)
+    
+    # Create DataFrame
+    df = pd.DataFrame(rows)
+    
+    # Sort by energy and parameter
+    if not df.empty:
+        df = df.sort_values(['energy', 'parameter'])
+    
+    # Save to CSV
+    if output_file:
+        df.to_csv(output_file, index=False)
+        print(f"Exported parameter bounds to {output_file}")
+    
+    return df
