@@ -1442,6 +1442,22 @@ def run_parameter_sweep(sweep_info, optimization_method='differential_evolution'
     # Update the results log in the sweep_info
     sweep_info['results_log'] = results_log
     
+    # Find the best fit
+    best_idx = np.argmin(sweep_info['goodness_of_fit'])
+    best_value = sweep_info['parameter_values'][best_idx]
+    best_gof = sweep_info['goodness_of_fit'][best_idx]
+    
+    print(f"\nBest fit at {param_name} = {best_value} with goodness of fit = {best_gof:.6g}")
+    
+    # Add best_fit info to sweep_info
+    sweep_info['best_fit'] = {
+        'index': best_idx,
+        'value': best_value,
+        'gof': best_gof,
+        'model_name': sweep_info['models'][best_idx]
+    }
+    
+    
     # Save combined results if requested
     if save_dir and save_combined:
         sweep_filename = os.path.join(save_dir, f"{base_model_name}_sweep_{param_name}.pkl")
@@ -1477,20 +1493,7 @@ def run_parameter_sweep(sweep_info, optimization_method='differential_evolution'
         'Goodness of Fit': sweep_info['goodness_of_fit']
     })
     
-    # Find the best fit
-    best_idx = np.argmin(sweep_info['goodness_of_fit'])
-    best_value = sweep_info['parameter_values'][best_idx]
-    best_gof = sweep_info['goodness_of_fit'][best_idx]
     
-    print(f"\nBest fit at {param_name} = {best_value} with goodness of fit = {best_gof:.6g}")
-    
-    # Add best_fit info to sweep_info
-    sweep_info['best_fit'] = {
-        'index': best_idx,
-        'value': best_value,
-        'gof': best_gof,
-        'model_name': sweep_info['models'][best_idx]
-    }
     
     return sweep_info, summary_df
 
