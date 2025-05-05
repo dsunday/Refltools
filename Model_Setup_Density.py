@@ -2225,9 +2225,10 @@ def get_param_type(param_name):
 
 def compare_sweep_profiles(sweep_info, indices=None, values=None,
                           include_best=True, figure_size=(12, 8),
-                          sld_xlim=None, profile_shift=0, save_path=None):
+                          sld_xlim=None, profile_shift=0, save_path=None,
+                          plot_imag=True, imag_linestyle='--'):
     """
-    Compare SLD profiles from different points in a parameter sweep.
+    Compare SLD profiles from different points in a parameter sweep, including imaginary components.
     
     Args:
         sweep_info: Dictionary from run_parameter_sweep containing sweep results
@@ -2238,12 +2239,15 @@ def compare_sweep_profiles(sweep_info, indices=None, values=None,
         sld_xlim: x-axis limits for SLD profile as (min, max)
         profile_shift: Shift applied to depth profiles
         save_path: Path to save the figure (None to skip saving)
+        plot_imag: Whether to plot the imaginary SLD component
+        imag_linestyle: Line style to use for imaginary component
         
     Returns:
         matplotlib figure and axes
     """
     import matplotlib.pyplot as plt
     import numpy as np
+    from refnx.reflect.structure import isld_profile
     
     # Validate inputs - either indices or values should be provided, not both
     if indices is not None and values is not None:
@@ -2297,32 +2301,82 @@ def compare_sweep_profiles(sweep_info, indices=None, values=None,
         
         # Generate the SLD profile
         try:
-            # Try to get the SLD profile
-            z, sld = structure.sld_profile(z=None)
+            # Get the real SLD profile
+            z_real, sld_real = structure.sld_profile(z=None)
             
-            # Plot the profile
+            # For the imaginary component, use the isld_profile function directly with slabs
+            # This handles refnx's different methods of storing imaginary SLD
+            if plot_imag:
+                try:
+                    slabs = structure.slabs()
+                    if hasattr(structure, 'isld_profile'):
+                        # If structure has its own isld_profile method, use it
+                        z_imag, sld_imag = structure.isld_profile()
+                    else:
+                        # Otherwise use the imported function
+                        z_imag, sld_imag = isld_profile(slabs)
+                except Exception as e:
+                    print(f"Warning: Could not extract imaginary SLD profile: {str(e)}")
+                    print("Falling back to checking if SLD profile is complex...")
+                    # Fallback: try to extract imaginary part from complex sld
+                    if hasattr(sld_real, 'imag'):
+                        z_imag = z_real
+                        sld_imag = sld_real.imag
+                    else:
+                        sld_imag = np.zeros_like(sld_real)
+                        z_imag = z_real
+                        print("Warning: Imaginary SLD component couldn't be extracted")
+            
+            # Extract parameter value and check if it's the best fit
             value = all_values[idx]
+            is_best = 'best_fit' in sweep_info and idx == sweep_info['best_fit']['index']
+            
+            # Select color for this profile
             color = colors[i % len(colors)]
             
-            # Add marker for the best fit
-            is_best = 'best_fit' in sweep_info and idx == sweep_info['best_fit']['index']
+            # Set marker and line properties based on whether this is the best fit
             marker = 'o' if is_best else None
             markersize = 4 if is_best else 0
-            linestyle = '-' if is_best else '--'
             linewidth = 2 if is_best else 1.5
             
-            # Create label based on parameter value
+            # Create label for the legend
             label = f"{param_name} = {value}"
             if is_best:
                 label += " (Best Fit)"
             
+            # Handle real component
+            if hasattr(sld_real, 'real'):
+                # If the SLD is complex, explicitly use the real part
+                sld_real_part = sld_real.real
+            else:
+                # If it's already a real array
+                sld_real_part = sld_real
+                
             # Plot the real part of the SLD
-            ax.plot(z + profile_shift, sld.real, color=color, linestyle=linestyle, 
+            ax.plot(z_real + profile_shift, sld_real_part, color=color, linestyle='-', 
                    linewidth=linewidth, marker=marker, markersize=markersize,
                    markevery=20, label=label)
             
+            # Plot the imaginary part if requested
+            if plot_imag:
+                # Check if imaginary values are non-zero before plotting
+                if np.any(np.abs(sld_imag) > 1e-10):  # Check for non-zero values with tolerance
+                    imag_label = f"{label} (Im)" if is_best else None  # Only show label for best fit
+                    ax.plot(z_imag + profile_shift, sld_imag, color=color, linestyle=imag_linestyle, 
+                          linewidth=linewidth, alpha=0.7, label=imag_label)
+                else:
+                    print(f"Warning: Imaginary SLD for {label} contains only zeros or very small values")
+            
         except Exception as e:
             print(f"Error generating SLD profile for index {idx}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    # Add a general note about line styles if imaginary SLD is plotted
+    if plot_imag:
+        ax.text(0.02, 0.02, "Solid lines: Real SLD\nDashed lines: Imaginary SLD", 
+               transform=ax.transAxes, fontsize=10, va='bottom', 
+               bbox=dict(facecolor='white', alpha=0.8))
     
     # Set axis labels and title
     ax.set_xlabel(r'Distance from interface ($\AA$)')
