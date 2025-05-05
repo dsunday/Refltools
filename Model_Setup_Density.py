@@ -2882,3 +2882,57 @@ def plot_scan_heatmap(scan_results, x_param, y_param, value_param='goodness_of_f
         print(f"Saved figure to {save_path}")
     
     return fig, ax
+
+
+def load_parameter_sweep(pickle_filepath):
+    """
+    Load a parameter sweep pickle file and extract the sweep information.
+    
+    Args:
+        pickle_filepath: Path to the pickle file containing sweep results
+        
+    Returns:
+        Tuple containing (sweep_info, summary_df)
+    """
+    # Load the pickle file
+    try:
+        with open(pickle_filepath, 'rb') as f:
+            sweep_info = pickle.load(f)
+        print(f"Successfully loaded sweep results from {pickle_filepath}")
+    except Exception as e:
+        raise Exception(f"Error loading sweep results: {str(e)}")
+    
+    # Extract key information from the sweep_info
+    param_name = sweep_info.get('param_name', 'unknown_parameter')
+    sweep_values = sweep_info.get('parameter_values', [])
+    goodness_of_fit = sweep_info.get('goodness_of_fit', [])
+    models = sweep_info.get('models', [])
+    best_fit = sweep_info.get('best_fit', {})
+    all_results = sweep_info.get('all_results', [])
+    
+    # Print summary of loaded sweep results
+    print("\n--- Parameter Sweep Summary ---")
+    print(f"Parameter: {param_name}")
+    print(f"Number of values: {len(sweep_values)}")
+    
+    # Create a summary DataFrame
+    summary_df = pd.DataFrame({
+        'Sweep Value': sweep_values,
+        'Model Name': models,
+        'Goodness of Fit': goodness_of_fit
+    })
+    
+    # Print best fit information if available
+    if best_fit:
+        best_value = best_fit.get('value')
+        best_gof = best_fit.get('gof')
+        print(f"\nBest fit at {param_name} = {best_value} with goodness of fit = {best_gof:.6g}")
+    else:
+        # Find the best fit if not already in the sweep_info
+        best_idx = np.argmin(goodness_of_fit) if goodness_of_fit else None
+        if best_idx is not None:
+            best_value = sweep_values[best_idx]
+            best_gof = goodness_of_fit[best_idx]
+            print(f"\nBest fit at {param_name} = {best_value} with goodness of fit = {best_gof:.6g}")
+    
+    return sweep_info, summary_df
