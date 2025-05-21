@@ -1,4 +1,8 @@
 
+import sys
+
+sys.path.append('/homes/dfs1/nist_cdsaxs/src/cdsaxs/Fitting/')
+import CDSAXSFunctions as CD
 
 import numpy as np
 import os
@@ -7,7 +11,7 @@ from typing import Optional, Union
 import numpy as np
 import os
 import matplotlib.pyplot as plt
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, Dict
 
 def loadSAXS(filename: str, 
              keep_third_column: bool = False, 
@@ -253,9 +257,14 @@ def apply_power_law_scaling_and_plot(data, q_min, q_max, power, normalize_to_one
 import numpy as np
 from scipy.signal import find_peaks
 
+import numpy as np
+from scipy.signal import find_peaks
+from scipy.integrate import trapezoid
+
 def find_peaks_by_sections(data, sections):
     """
-    Find peaks in different sections of data with different parameters.
+    Find peaks in different sections of data with different parameters and
+    calculate integrated intensities for each section.
     
     Parameters:
     -----------
@@ -267,24 +276,38 @@ def find_peaks_by_sections(data, sections):
         - 'height': float or tuple, height parameter for find_peaks
         - 'width': tuple (w_min, w_max), width parameter for find_peaks
         - 'prominence': float or tuple, optional prominence parameter
+        - 'background': float or callable, optional background level for subtraction
+            If float: constant background level across the section
+            If callable: function taking q values and returning background intensity
+            If not provided: no background subtraction is performed
     
     Returns:
     --------
-    peak_results : dict
+    results : dict
         Dictionary containing:
         - 'q_values': Q values of detected peaks
         - 'intensities': Intensity values of detected peaks
         - 'widths': Width values of detected peaks in Q units
         - 'indices': Original indices of peaks in the data array
+        - 'section_integrals': List of dictionaries with integration results for each section
+            Each dict contains:
+            - 'q_range': The q range of the section
+            - 'raw_integral': Integrated intensity without background subtraction
+            - 'background_subtracted_integral': Integrated intensity with background subtraction
+            - 'background_level': Background level used (constant or average if function)
+            - 'q_points': Q values within the section
+            - 'intensity_points': Intensity values within the section
+            - 'background_points': Background values at each Q point
     """
     # Initialize lists to store results
     all_q_peaks = []
     all_intensities = []
     all_widths = []
     all_indices = []
+    section_integrals = []
     
     # Process each section with its own parameters
-    for section in sections:
+    for section_idx, section in enumerate(sections):
         q_min, q_max = section['q_range']
         
         # Find indices corresponding to the Q range
@@ -296,6 +319,43 @@ def find_peaks_by_sections(data, sections):
         
         # Extract the section data
         section_data = data[section_mask]
+        q_section = section_data[:, 0]
+        intensity_section = section_data[:, 1]
+        
+        # Calculate background for this section
+        if 'background' in section:
+            bg = section['background']
+            if callable(bg):
+                # If background is a function, apply it to q values
+                background_points = bg(q_section)
+                background_level = np.mean(background_points)  # Average for reporting
+            else:
+                # Constant background
+                background_points = np.full_like(q_section, bg)
+                background_level = bg
+        else:
+            # No background specified, use zeros
+            background_points = np.zeros_like(q_section)
+            background_level = 0
+        
+        # Calculate background-subtracted intensities
+        subtracted_intensity = intensity_section - background_points
+        
+        # Calculate integrals using trapezoidal rule
+        raw_integral = trapezoid(intensity_section, q_section)
+        background_subtracted_integral = trapezoid(subtracted_intensity, q_section)
+        
+        # Store integration results for this section
+        section_integral_info = {
+            'q_range': (q_min, q_max),
+            'raw_integral': raw_integral,
+            'background_subtracted_integral': background_subtracted_integral,
+            'background_level': background_level,
+            'q_points': q_section,
+            'intensity_points': intensity_section,
+            'background_points': background_points
+        }
+        section_integrals.append(section_integral_info)
         
         # Prepare parameters for find_peaks
         params = {}
@@ -365,15 +425,162 @@ def find_peaks_by_sections(data, sections):
             'q_values': np.array(all_q_peaks)[sort_idx],
             'intensities': np.array(all_intensities)[sort_idx],
             'widths': np.array(all_widths)[sort_idx],
-            'indices': np.array(all_indices)[sort_idx]
+            'indices': np.array(all_indices)[sort_idx],
+            'section_integrals': section_integrals
         }
     else:
         return {
             'q_values': np.array([]),
             'intensities': np.array([]),
             'widths': np.array([]),
-            'indices': np.array([])
+            'indices': np.array([]),
+            'section_integrals': section_integrals
         }
+
+def plot_integrated_sections(data, peak_results, figsize=(12, 10)):
+    """
+    Plot detected peaks and integrated sections with background subtraction visualization.
+    
+    Parameters:
+    -----------
+    data : ndarray of shape (n, 2)
+        Array with [Q, Intensity] values
+    peak_results : dict
+        Dictionary containing peak and integration information from find_peaks_by_sections
+    figsize : tuple, optional
+        Figure size (width, height) in inches
+        
+    Returns:
+    --------
+    fig : matplotlib figure
+        The created figure for further customization if needed
+    """
+    # Check if section_integrals exists in peak_results
+    if 'section_integrals' not in peak_results or not peak_results['section_integrals']:
+        raise ValueError("No section integration results found in peak_results")
+    
+    # Create figure with two subplots (stacked vertically)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, height_ratios=[3, 1])
+    
+    # First subplot: Original data with peaks and sections
+    # Plot the original data
+    ax1.plot(data[:, 0], data[:, 1], 'b-', linewidth=1, label='Original Data')
+    
+    # Set y-axis to log scale
+    ax1.set_yscale('log')
+    
+    # Get min and max for y-axis limits
+    min_positive = np.min(data[data[:, 1] > 0, 1])
+    max_intensity = np.max(data[:, 1])
+    y_min = min_positive / 2
+    y_max = max_intensity * 2
+    ax1.set_ylim(y_min, y_max)
+    
+    # Define section colors
+    section_colors = ['lightblue', 'lightgreen', 'lightyellow', 'lightpink', 'lavender']
+    
+    # Highlight sections and plot background levels
+    for i, section_info in enumerate(peak_results['section_integrals']):
+        # Get section boundaries
+        q_min, q_max = section_info['q_range']
+        q_points = section_info['q_points']
+        intensities = section_info['intensity_points']
+        background = section_info['background_points']
+        raw_integral = section_info['raw_integral']
+        bg_sub_integral = section_info['background_subtracted_integral']
+        
+        # Add section shading with transparency
+        color = section_colors[i % len(section_colors)]
+        rect = Rectangle((q_min, y_min), q_max - q_min, y_max - y_min, 
+                         facecolor=color, alpha=0.2, zorder=0)
+        ax1.add_patch(rect)
+        
+        # Plot background level
+        ax1.plot(q_points, background, 'r--', linewidth=1.5, alpha=0.7)
+        
+        # Add section label with integration results
+        label_y = 0.92 - i * 0.05  # Position labels vertically
+        ax1.text(0.02, label_y, 
+                f"Section {i+1} ({q_min:.2f}-{q_max:.2f}): Raw={raw_integral:.2e}, BG Sub={bg_sub_integral:.2e}",
+                transform=ax1.transAxes, fontsize=9, 
+                bbox=dict(facecolor=color, alpha=0.5, boxstyle='round'))
+        
+        # Add vertical lines at section boundaries
+        ax1.axvline(q_min, color='gray', linestyle='--', alpha=0.5, zorder=1)
+        ax1.axvline(q_max, color='gray', linestyle='--', alpha=0.5, zorder=1)
+    
+    # Plot the detected peaks
+    if len(peak_results['q_values']) > 0:
+        ax1.plot(peak_results['q_values'], peak_results['intensities'], 'ro', 
+                markersize=8, label='Detected Peaks')
+        
+        # Annotate each peak with its Q value
+        for i, (q, intensity) in enumerate(zip(peak_results['q_values'], peak_results['intensities'])):
+            # In log scale, position the text above the peak
+            log_intensity = np.log10(intensity)
+            text_y = 10**(log_intensity + 0.1)
+            
+            ax1.annotate(f'{q:.2f}', (q, text_y), xytext=(0, 5), 
+                        textcoords='offset points', fontsize=9, ha='center')
+    
+    # Set axes labels and title for first subplot
+    ax1.set_xlabel('Q (Å$^{-1}$)', fontsize=12)
+    ax1.set_ylabel('Intensity (log scale)', fontsize=12)
+    ax1.set_title('Peak Detection and Section Integration Results', fontsize=14)
+    ax1.legend(loc='upper right')
+    ax1.grid(True, which='major', linestyle='-', alpha=0.5)
+    ax1.grid(True, which='minor', linestyle=':', alpha=0.3)
+    
+    # Second subplot: Bar chart of integrated intensities
+    # Extract section data for plotting
+    section_numbers = [f"Sec {i+1}" for i in range(len(peak_results['section_integrals']))]
+    raw_integrals = [info['raw_integral'] for info in peak_results['section_integrals']]
+    bg_sub_integrals = [info['background_subtracted_integral'] for info in peak_results['section_integrals']]
+    
+    # Decide whether to use log scale based on data range
+    log_scale_bars = max(raw_integrals) / min(filter(lambda x: x > 0, raw_integrals + bg_sub_integrals)) > 100
+    
+    # Set up bar positions
+    x = np.arange(len(section_numbers))
+    width = 0.35
+    
+    # Create bar chart
+    if log_scale_bars:
+        ax2.set_yscale('log')
+    
+    bar_colors = [section_colors[i % len(section_colors)] for i in range(len(section_numbers))]
+    bars1 = ax2.bar(x - width/2, raw_integrals, width, label='Raw Integral', 
+                   alpha=0.7, color=bar_colors)
+    bars2 = ax2.bar(x + width/2, bg_sub_integrals, width, label='BG Subtracted', 
+                   alpha=0.7, color=[c + '80' for c in bar_colors])  # Lighter shade
+    
+    # Add labels and formatting
+    ax2.set_xlabel('Section', fontsize=12)
+    ax2.set_ylabel('Integrated Intensity', fontsize=12)
+    ax2.set_title('Comparison of Raw and Background-Subtracted Integrals', fontsize=14)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(section_numbers)
+    ax2.legend()
+    ax2.grid(True, which='major', linestyle='--', alpha=0.5)
+    
+    # Add value labels on bars
+    def autolabel(bars):
+        for bar in bars:
+            height = bar.get_height()
+            if log_scale_bars:
+                y_pos = height * 1.1
+            else:
+                y_pos = height + 0.05 * max(raw_integrals)
+            
+            ax2.text(bar.get_x() + bar.get_width()/2, y_pos,
+                    f'{height:.1e}',
+                    ha='center', va='bottom', fontsize=8, rotation=45)
+    
+    autolabel(bars1)
+    autolabel(bars2)
+    
+    plt.tight_layout()
+    return fig
 
 # Example usage:
 # Define different sections with appropriate parameters
@@ -539,7 +746,433 @@ def plot_peaks_over_data(data, peak_results, sections=None, figsize=(12, 8), plo
     plt.tight_layout()
     return fig, ax
 
+def BCPSimFit_2DParameterSweep_Modified(data: np.ndarray, 
+                                       Pitch_mean: float,
+                                       Fraction_start: float,
+                                       Fraction_end: float,
+                                       Fraction_steps: int,
+                                       DW_start: float, 
+                                       DW_end: float, 
+                                       DW_steps: int, 
+                                       I0: float, 
+                                       Bk: float, 
+                                       additional_data: Optional[np.ndarray] = None,
+                                       highlight_percent: float = 5, 
+                                       logfit: bool = False, 
+                                       plot_results: bool = True,
+                                       fit_pitch: bool = False,
+                                       intensity_scale: Optional[Tuple[float, float]] = None,
+                                       custom_cmap: str = 'viridis',
+                                       show_3d_plot: bool = True) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, np.ndarray]]:
+    """
+    Fit scattering data while sweeping both the Debye-Waller (DW) and Fraction parameters
+    over a 2D grid of values to find the optimal combination, with customizable intensity scaling.
+    
+    Parameters:
+    -----------
+    data : np.ndarray of shape (n, 2)
+        Array with [Q, Intensity] values to fit
+    Pitch_mean : float
+        Pitch value for the model (fixed if fit_pitch=False)
+    Fraction_start : float
+        Lower bound for Fraction parameter sweep
+    Fraction_end : float
+        Upper bound for Fraction parameter sweep
+    Fraction_steps : int
+        Number of steps between Fraction_start and Fraction_end
+    DW_start : float
+        Lower bound for DW parameter sweep
+    DW_end : float
+        Upper bound for DW parameter sweep
+    DW_steps : int
+        Number of steps between DW_start and DW_end
+    I0 : float
+        Initial intensity scaling factor
+    Bk : float
+        Initial background value
+    additional_data : np.ndarray of shape (m, 2), optional
+        Additional [Q, Intensity] data to plot alongside the fitted data
+    highlight_percent : float, optional
+        Percentage difference from best fit to highlight (default: 5%)
+    logfit : bool, optional
+        Whether to fit in log space (default: False)
+    plot_results : bool, optional
+        Whether to plot the results (default: True)
+    fit_pitch : bool, optional
+        Whether to fit the Pitch parameter or keep it fixed (default: False)
+    intensity_scale : tuple(float, float), optional
+        Custom scale for the intensity (vmin, vmax) in the 2D plot. If None,
+        auto-scaling will be used based on data and highlight_percent.
+    custom_cmap : str, optional
+        Name of the colormap to use for the 2D plot (default: 'viridis')
+    show_3d_plot : bool, optional
+        Whether to show the 3D plot alongside the 2D plot (default: True)
+        
+    Returns:
+    --------
+    best_params : np.ndarray
+        Best fit parameters [Pitch, Fraction, I0, DW, Bk]
+    best_cov : np.ndarray or None
+        Covariance matrix for best fit (may be None if not available)
+    sweep_results : dict
+        Dictionary containing:
+        - 'dw_values': Array of DW values used in sweep
+        - 'fraction_values': Array of Fraction values used in sweep
+        - 'gf_values': 2D array of goodness of fit values for each parameter combination
+        - 'parameters': 2D array of parameter sets for each combination
+        
+    Raises:
+    -------
+    ValueError
+        If input data is not properly formatted or if all fits fail
+    RuntimeError
+        If the fitting process fails completely
+    """
+    # Validate input data
+    if not isinstance(data, np.ndarray) or data.ndim != 2 or data.shape[1] != 2:
+        raise ValueError("data must be a numpy array of shape (n, 2) containing [Q, Intensity] values")
+    
+    if additional_data is not None and (not isinstance(additional_data, np.ndarray) or 
+                                       additional_data.ndim != 2 or 
+                                       additional_data.shape[1] != 2):
+        raise ValueError("additional_data must be a numpy array of shape (m, 2) containing [Q, Intensity] values")
+    
+    if DW_steps < 2 or Fraction_steps < 2:
+        raise ValueError("DW_steps and Fraction_steps must both be at least 2")
+    
+    if DW_start >= DW_end:
+        raise ValueError("DW_start must be less than DW_end")
+        
+    if Fraction_start >= Fraction_end:
+        raise ValueError("Fraction_start must be less than Fraction_end")
 
+    # Create arrays of parameter values to sweep
+    dw_values = np.linspace(DW_start, DW_end, DW_steps)
+    fraction_values = np.linspace(Fraction_start, Fraction_end, Fraction_steps)
+    
+    # Create meshgrid for 2D parameter space
+    DW_grid, Fraction_grid = np.meshgrid(dw_values, fraction_values)
+    
+    # Initialize arrays to store fit results
+    gf_values = np.full((Fraction_steps, DW_steps), np.nan)
+    all_params = np.full((Fraction_steps, DW_steps), None, dtype=object)
+    all_covs = np.full((Fraction_steps, DW_steps), None, dtype=object)
+    
+    # Define goodness of fit (GF) function - lower is better
+    def calc_gf(y_true, y_pred):
+        if logfit:
+            # For log fit, use mean squared error in log space
+            y_true_log = np.log(y_true)
+            y_pred_log = np.log(y_pred)
+            return np.mean((y_true_log - y_pred_log) ** 2)
+        else:
+            # For linear fit, use normalized chi-squared
+            # (sum of squared relative errors)
+            return np.mean(((y_true - y_pred) / y_true) ** 2)
+    
+    LD = np.log(data[:, 1])
+    
+    # Track progress
+    total_fits = Fraction_steps * DW_steps
+    successful_fits = 0
+    
+    print(f"Starting 2D parameter sweep with {total_fits} combinations...")
+    
+    # Sweep through parameter combinations
+    for i, fraction in enumerate(fraction_values):
+        for j, dw in enumerate(dw_values):
+            try:
+                if fit_pitch:
+                    # Set initial parameters and bounds for fitting Pitch, I0, and Bk
+                    # (Fraction and DW are fixed)
+                    param_init = [Pitch_mean, I0, Bk]
+                    bounds = ([Pitch_mean * 0.99, I0 * 0.01, Bk * 0.95], 
+                              [Pitch_mean * 1.01, I0 * 100, Bk * 1.05])
+                    
+                    if not logfit:
+                        # Create a wrapper function with fixed Fraction and DW
+                        def wrapper(q, Pitch, I0, Bk):
+                            return SimInt_BCP(q, Pitch, fraction, I0, dw, Bk)
+                        
+                        params, params_cov = scipy.optimize.curve_fit(
+                            wrapper, data[:, 0], data[:, 1], p0=param_init, bounds=bounds
+                        )
+                        
+                        # Insert the fixed parameters into the parameter list
+                        full_params = np.array([params[0], fraction, params[1], dw, params[2]])
+                        
+                        # Calculate goodness of fit
+                        y_pred = SimInt_BCP(data[:, 0], *full_params)
+                        gf = calc_gf(data[:, 1], y_pred)
+                    else:
+                        # Create a wrapper function with fixed Fraction and DW for log fitting
+                        def wrapper(q, Pitch, I0, Bk):
+                            return SimIntLog_BCP(q, Pitch, fraction, I0, dw, Bk)
+                        
+                        params, params_cov = scipy.optimize.curve_fit(
+                            wrapper, data[:, 0], LD, p0=param_init, bounds=bounds
+                        )
+                        
+                        # Insert the fixed parameters into the parameter list
+                        full_params = np.array([params[0], fraction, params[1], dw, params[2]])
+                        
+                        # Calculate goodness of fit
+                        y_pred = SimInt_BCP(data[:, 0], *full_params)
+                        gf = calc_gf(data[:, 1], y_pred)
+                else:
+                    # Fixed Pitch: set initial parameters and bounds for fitting only I0 and Bk
+                    # (Pitch, Fraction, and DW are all fixed)
+                    param_init = [I0, Bk]
+                    bounds = ([I0 * 0.01, Bk * 0.95], 
+                              [I0 * 100, Bk * 1.05])
+                    
+                    if not logfit:
+                        # Create a wrapper function with fixed Pitch, Fraction, and DW
+                        def wrapper(q, I0, Bk):
+                            return SimInt_BCP(q, Pitch_mean, fraction, I0, dw, Bk)
+                        
+                        params, params_cov = scipy.optimize.curve_fit(
+                            wrapper, data[:, 0], data[:, 1], p0=param_init, bounds=bounds
+                        )
+                        
+                        # Insert the fixed parameters into the parameter list
+                        full_params = np.array([Pitch_mean, fraction, params[0], dw, params[1]])
+                        
+                        # Calculate goodness of fit
+                        y_pred = SimInt_BCP(data[:, 0], *full_params)
+                        gf = calc_gf(data[:, 1], y_pred)
+                    else:
+                        # Create a wrapper function with fixed Pitch, Fraction, and DW for log fitting
+                        def wrapper(q, I0, Bk):
+                            return SimIntLog_BCP(q, Pitch_mean, fraction, I0, dw, Bk)
+                        
+                        params, params_cov = scipy.optimize.curve_fit(
+                            wrapper, data[:, 0], LD, p0=param_init, bounds=bounds
+                        )
+                        
+                        # Insert the fixed parameters into the parameter list
+                        full_params = np.array([Pitch_mean, fraction, params[0], dw, params[1]])
+                        
+                        # Calculate goodness of fit
+                        y_pred = SimInt_BCP(data[:, 0], *full_params)
+                        gf = calc_gf(data[:, 1], y_pred)
+                
+                # Store results
+                gf_values[i, j] = gf
+                all_params[i, j] = full_params
+                all_covs[i, j] = params_cov
+                successful_fits += 1
+                
+                # Print progress every 10% completion
+                progress = (i * DW_steps + j + 1) / total_fits * 100
+                if (i * DW_steps + j + 1) % max(1, total_fits // 10) == 0:
+                    print(f"Progress: {progress:.1f}% ({successful_fits} successful fits)")
+                
+            except Exception as e:
+                # Quietly continue on failure - we'll handle the NaN values later
+                pass
+    
+    # Find best fit
+    valid_mask = ~np.isnan(gf_values)
+    if not np.any(valid_mask):
+        raise ValueError("All fits failed. Try adjusting the parameter ranges or the data.")
+    
+    best_idx = np.nanargmin(gf_values.flatten())
+    best_i, best_j = np.unravel_index(best_idx, gf_values.shape)
+    best_params = all_params[best_i, best_j]
+    best_cov = all_covs[best_i, best_j]
+    best_fraction = fraction_values[best_i]
+    best_dw = dw_values[best_j]
+    best_gf = gf_values[best_i, best_j]
+    
+    print(f"\nCompleted {successful_fits} of {total_fits} fits successfully.")
+    
+    # Print best fit info
+    pitch_status = "variable" if fit_pitch else "fixed"
+    print(f"Best fit found at Fraction = {best_fraction:.4f}, DW = {best_dw:.4f} with goodness of fit = {best_gf:.4e}")
+    print(f"Best parameters: Pitch = {best_params[0]:.4f}" + (" (fixed)" if not fit_pitch else "") + 
+          f", Fraction = {best_params[1]:.4f}, I0 = {best_params[2]:.4e}, " +
+          f"DW = {best_params[3]:.4f}, Bk = {best_params[4]:.4e}")
+    
+    if plot_results:
+        # Create a figure with the appropriate number of subplots
+        if show_3d_plot:
+            fig = plt.figure(figsize=(18, 6))
+            gs = fig.add_gridspec(1, 3)
+            ax1 = fig.add_subplot(gs[0, 0])
+            ax2 = fig.add_subplot(gs[0, 1])
+            ax3 = fig.add_subplot(gs[0, 2], projection='3d')
+        else:
+            fig = plt.figure(figsize=(12, 6))
+            gs = fig.add_gridspec(1, 2)
+            ax1 = fig.add_subplot(gs[0, 0])
+            ax2 = fig.add_subplot(gs[0, 1])
+        
+        # First subplot: Best fit
+        # Plot additional data first if provided
+        if additional_data is not None:
+            ax1.plot(additional_data[:, 0], additional_data[:, 1], 'b-', 
+                    label='Additional Data', alpha=0.7, linewidth=1)
+        
+        # Plot original data and best fit
+        ax1.plot(data[:, 0], data[:, 1], 'k-', label='Exp Data', linewidth=1)
+        ax1.plot(data[:, 0], SimInt_BCP(data[:, 0], *best_params), 
+                color='r', label=f'Best Fit', linewidth=2)
+        ax1.scatter(data[:, 0], data[:, 1], color='r', alpha=0.4, s=20)
+        ax1.set_yscale('log')
+        ax1.set_xlabel('q (Å$^{-1}$)', fontsize=14)
+        ax1.set_ylabel('Intensity (a.u)', fontsize=14)
+        ax1.set_title(f'Best Fit Result', fontsize=16)
+        ax1.legend(loc='upper right')
+        ax1.grid(True, which='both', linestyle='--', alpha=0.5)
+        
+        # Show the best parameters
+        param_names = ['Pitch', 'Fraction', 'I0', 'DW', 'Bk']
+        param_text = "Best Parameters:\n"
+        for i, (name, val) in enumerate(zip(param_names, best_params)):
+            if name == 'Pitch' and not fit_pitch:
+                param_text += f"{name}: {val:.4e} (fixed)\n"
+            else:
+                param_text += f"{name}: {val:.4e}\n"
+        
+        # Add text box with best parameters
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+        ax1.text(0.05, 0.05, param_text, transform=ax1.transAxes, fontsize=10,
+                verticalalignment='bottom', bbox=props)
+        
+        # Second subplot: 2D heatmap of goodness of fit
+        # Create a mask for invalid values
+        masked_gf = np.ma.masked_invalid(gf_values)
+        
+        # Calculate threshold for highlighting
+        threshold = best_gf * (1 + highlight_percent / 100)
+        
+        # Create a custom colormap that highlights the best values
+        cmap = plt.cm.get_cmap(custom_cmap).copy()
+        cmap.set_bad('gray', 0.5)  # Gray color for masked values
+        
+        # Determine intensity scale (vmin, vmax) for the heatmap
+        if intensity_scale is None:
+            vmin = np.nanmin(gf_values)
+            vmax = threshold * 2  # Default scale based on threshold
+        else:
+            vmin, vmax = intensity_scale
+        
+        # Plot heatmap with the specified intensity scale
+        pcm = ax2.pcolormesh(DW_grid, Fraction_grid, masked_gf, 
+                           norm=Normalize(vmin=vmin, vmax=vmax),
+                           cmap=cmap, shading='auto')
+        
+        # Add a colorbar
+        cbar = fig.colorbar(pcm, ax=ax2)
+        cbar.set_label('Goodness of Fit (lower is better)', fontsize=12)
+        
+        # Add contour lines for the threshold
+        if np.any(masked_gf < threshold):
+            ax2.contour(DW_grid, Fraction_grid, masked_gf, 
+                       levels=[threshold], colors='red', linestyles='dashed', 
+                       linewidths=2, alpha=0.7)
+        
+        # Mark the best fit point
+        ax2.plot(best_dw, best_fraction, 'ro', markersize=10, markeredgecolor='white')
+        
+        ax2.set_xlabel('Debye-Waller Factor', fontsize=14)
+        ax2.set_ylabel('Fraction', fontsize=14)
+        ax2.set_title('2D Parameter Space Goodness of Fit', fontsize=16)
+        
+        # Third subplot: 3D surface plot (if requested)
+        if show_3d_plot:
+            # Create X, Y for plotting
+            X, Y = np.meshgrid(dw_values, fraction_values)
+            
+            # Plot the 3D surface
+            surf = ax3.plot_surface(X, Y, masked_gf, cmap=custom_cmap, 
+                                   linewidth=0, antialiased=True, alpha=0.8)
+            
+            # Add a contour plot at the bottom
+            cset = ax3.contourf(X, Y, masked_gf, zdir='z', offset=np.nanmin(gf_values),
+                               cmap=custom_cmap, alpha=0.5)
+            
+            # Mark the best fit point
+            ax3.scatter([best_dw], [best_fraction], [best_gf], color='red', s=100, 
+                       edgecolor='white', linewidth=1.5)
+            
+            ax3.set_xlabel('Debye-Waller Factor', fontsize=12)
+            ax3.set_ylabel('Fraction', fontsize=12)
+            ax3.set_zlabel('Goodness of Fit', fontsize=12)
+            ax3.set_title('3D Parameter Space Visualization', fontsize=16)
+        
+        fig.tight_layout()
+        plt.show()
+        
+        # Also create a focused view around the best parameter combination
+        # Calculate the region of interest (within threshold)
+        try:
+            within_threshold = (gf_values <= threshold) & (~np.isnan(gf_values))
+            if np.any(within_threshold):
+                plt.figure(figsize=(10, 8))
+                
+                # Find indices within threshold
+                i_indices, j_indices = np.where(within_threshold)
+                
+                # Get min/max values with padding
+                min_i, max_i = max(0, np.min(i_indices) - 1), min(Fraction_steps - 1, np.max(i_indices) + 1)
+                min_j, max_j = max(0, np.min(j_indices) - 1), min(DW_steps - 1, np.max(j_indices) + 1)
+                
+                # Extract the focused region of the parameter grid
+                focused_gf = gf_values[min_i:max_i+1, min_j:max_j+1]
+                focused_fraction = fraction_values[min_i:max_i+1]
+                focused_dw = dw_values[min_j:max_j+1]
+                
+                # Create new meshgrid for the focused region
+                focused_X, focused_Y = np.meshgrid(focused_dw, focused_fraction)
+                
+                # Create a mask for invalid values
+                masked_focused_gf = np.ma.masked_invalid(focused_gf)
+                
+                # Determine focused intensity scale
+                if intensity_scale is None:
+                    focused_vmin = np.nanmin(gf_values)
+                    focused_vmax = threshold * 1.2
+                else:
+                    focused_vmin, focused_vmax = intensity_scale
+                
+                # Plot heatmap for the focused region with the intensity scale
+                plt.pcolormesh(focused_X, focused_Y, masked_focused_gf, 
+                              norm=Normalize(vmin=focused_vmin, vmax=focused_vmax),
+                              cmap=cmap, shading='auto')
+                
+                # Add contour for the threshold
+                plt.contour(focused_X, focused_Y, masked_focused_gf, 
+                           levels=[threshold], colors='red', linestyles='dashed', 
+                           linewidths=2, alpha=0.7)
+                
+                # Mark the best fit point
+                plt.plot(best_dw, best_fraction, 'ro', markersize=10, markeredgecolor='white')
+                
+                # Add colorbar
+                cbar = plt.colorbar()
+                cbar.set_label('Goodness of Fit (lower is better)', fontsize=12)
+                
+                plt.xlabel('Debye-Waller Factor', fontsize=14)
+                plt.ylabel('Fraction', fontsize=14)
+                plt.title(f'Focused View of Optimal Region (within {highlight_percent}%)', fontsize=16)
+                plt.grid(True, linestyle='--', alpha=0.5)
+                
+                plt.tight_layout()
+                plt.show()
+        except Exception as e:
+            print(f"Could not create focused view: {e}")
+    
+    # Prepare return dictionary with sweep results
+    sweep_results = {
+        'dw_values': dw_values,
+        'fraction_values': fraction_values,
+        'gf_values': gf_values,
+        'parameters': all_params
+    }
+    
+    return best_params, best_cov, sweep_results
 
 def extract_peak_data(peak_results):
     """
@@ -562,6 +1195,36 @@ def extract_peak_data(peak_results):
     # Create a numpy array with q values and intensities
     q_values = peak_results['q_values']
     intensities = peak_results['intensities']
+    
+    # Stack into a 2D array
+    peak_data = np.column_stack((q_values, intensities))
+    
+    # Sort by q values (should already be sorted, but just to be sure)
+    peak_data = peak_data[np.argsort(peak_data[:, 0])]
+    
+    return peak_data
+
+def extract_integrated_peaks(peak_results):
+    """
+    Extract peak Q values and intensities from find_peaks_by_sections results
+    and convert them to a numpy array.
+    
+    Parameters:
+    -----------
+    peak_results : dict
+        Dictionary containing peak information from find_peaks_by_sections
+        
+    Returns:
+    --------
+    peak_data : ndarray of shape (n, 2)
+        Array with [Q, Intensity] values for each peak
+    """
+    if len(peak_results['q_values']) == 0:
+        return np.array([]).reshape(0, 2)
+    
+    # Create a numpy array with q values and intensities
+    q_values = peak_results['q_values']
+    intensities = peak_results['raw_integral']
     
     # Stack into a 2D array
     peak_data = np.column_stack((q_values, intensities))
@@ -1624,3 +2287,210 @@ def BCPSimFit_2DParameterSweep(data: np.ndarray,
     }
     
     return best_params, best_cov, sweep_results
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib import cm
+from typing import Tuple, Optional, Dict, List, Any, Union
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib import cm
+from typing import Tuple, Optional, Dict, List, Any, Union
+
+def create_3D_parameter_plot(sweep_results: Dict[str, Any], 
+                             best_params: np.ndarray = None,
+                             elev: float = 30, 
+                             azim: float = -60,
+                             figsize: Tuple[int, int] = (10, 8),
+                             custom_cmap: str = 'viridis',
+                             intensity_scale: Optional[Tuple[float, float]] = None,
+                             highlight_threshold: Optional[float] = None,
+                             title: Optional[str] = None,
+                             show_contour: bool = True,
+                             alpha_surface: float = 0.8,
+                             zlabel: str = 'Goodness of Fit',
+                             invert_z: bool = False,
+                             add_colorbar: bool = True,
+                             add_best_point: bool = True,
+                             contour_offset: Optional[float] = None,
+                             contour_colors: str = 'viridis',
+                             contour_alpha: float = 0.5,
+                             contour_levels: int = 10,
+                             lightdir: Optional[Tuple[float, float, float]] = None):
+    """
+    Create a 3D surface plot with customizable perspective from parameter sweep results.
+    
+    Parameters:
+    -----------
+    sweep_results : dict
+        Dictionary containing parameter sweep results, with keys:
+        - 'dw_values': Array of DW values used in sweep
+        - 'fraction_values': Array of Fraction values used in sweep
+        - 'gf_values': 2D array of goodness of fit values for each parameter combination
+    best_params : np.ndarray, optional
+        Best fit parameters [Pitch, Fraction, I0, DW, Bk], used to mark best point
+    elev : float, optional
+        Elevation angle in degrees (default: 30)
+    azim : float, optional
+        Azimuth angle in degrees (default: -60)
+    figsize : tuple(int, int), optional
+        Figure size as (width, height) in inches (default: (10, 8))
+    custom_cmap : str, optional
+        Name of the colormap to use (default: 'viridis')
+    intensity_scale : tuple(float, float), optional
+        Custom scale for the intensity (vmin, vmax). If None, auto-scaling will be used.
+    highlight_threshold : float, optional
+        Threshold value for highlighting region of interest. If None, no threshold highlighting.
+    title : str, optional
+        Custom title for the plot. If None, a default title will be used.
+    show_contour : bool, optional
+        Whether to show contour plot at the bottom (default: True)
+    alpha_surface : float, optional
+        Alpha transparency for the 3D surface (default: 0.8)
+    zlabel : str, optional
+        Label for the z-axis (default: 'Goodness of Fit')
+    invert_z : bool, optional
+        Whether to invert the z-axis to show lower values at the top (default: False)
+    add_colorbar : bool, optional
+        Whether to add a colorbar to the plot (default: True)
+    add_best_point : bool, optional
+        Whether to highlight the best fit point (default: True)
+    contour_offset : float, optional
+        Offset for the contour plot at the bottom. If None, minimum value is used.
+    contour_colors : str, optional
+        Colormap for the contour plot (default: same as surface plot)
+    contour_alpha : float, optional
+        Alpha transparency for the contour plot (default: 0.5)
+    contour_levels : int, optional
+        Number of contour levels to show (default: 10)
+    lightdir : tuple(float, float, float), optional
+        Direction of the light source as (x, y, z). If None, default lighting is used.
+        
+    Returns:
+    --------
+    fig : matplotlib.figure.Figure
+        The created figure
+    ax : matplotlib.axes.Axes
+        The created axes with the 3D plot
+    """
+    # Extract parameter sweep data
+    dw_values = sweep_results['dw_values']
+    fraction_values = sweep_results['fraction_values']
+    gf_values = sweep_results['gf_values']
+    
+    # Create a mask for invalid values
+    masked_gf = np.ma.masked_invalid(gf_values)
+    
+    # Extract best point if available
+    best_dw = None
+    best_fraction = None
+    best_gf = None
+    if best_params is not None and len(best_params) >= 4:
+        best_fraction = best_params[1]
+        best_dw = best_params[3]
+        
+        # Find the closest grid point to the best parameters
+        best_i = np.abs(fraction_values - best_fraction).argmin()
+        best_j = np.abs(dw_values - best_dw).argmin()
+        best_gf = gf_values[best_i, best_j]
+    
+    # Create figure and 3D axis
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Create meshgrid for 3D surface
+    X, Y = np.meshgrid(dw_values, fraction_values)
+    
+    # Determine intensity scale (vmin, vmax) for the plot
+    if intensity_scale is None:
+        vmin = np.nanmin(masked_gf)
+        vmax = np.nanmax(masked_gf)
+    else:
+        vmin, vmax = intensity_scale
+        
+    # Set colormap
+    cmap = plt.get_cmap(custom_cmap)
+    
+    # Plot the 3D surface
+    surf = ax.plot_surface(X, Y, masked_gf, cmap=cmap, 
+                          linewidth=0, antialiased=True, alpha=alpha_surface,
+                          norm=Normalize(vmin=vmin, vmax=vmax))
+    
+    # Add contour at the bottom if requested
+    if show_contour:
+        # Determine contour offset
+        if contour_offset is None:
+            contour_offset = np.nanmin(masked_gf)
+        
+        # Create contour levels
+        levels = np.linspace(vmin, vmax, contour_levels)
+        
+        # Add contour
+        cset = ax.contourf(X, Y, masked_gf, zdir='z', offset=contour_offset,
+                          cmap=contour_colors, alpha=contour_alpha, levels=levels)
+    
+    # Mark the best fit point if available and requested
+    if add_best_point and best_dw is not None and best_fraction is not None and best_gf is not None:
+        ax.scatter([best_dw], [best_fraction], [best_gf], color='red', s=100, 
+                  edgecolor='white', linewidth=1.5)
+    
+    # Set plot labels
+    ax.set_xlabel('Debye-Waller Factor', fontsize=12)
+    ax.set_ylabel('Fraction', fontsize=12)
+    ax.set_zlabel(zlabel, fontsize=12)
+    
+    # Set custom view angle
+    ax.view_init(elev=elev, azim=azim)
+    
+    # Invert z-axis if requested (to show lower values at the top)
+    if invert_z:
+        ax.invert_zaxis()
+    
+    # Set custom lighting if requested
+    if lightdir is not None:
+        from matplotlib.colors import LightSource
+        ls = LightSource(azdeg=lightdir[0], altdeg=lightdir[1])
+        # Apply lighting to the surface (this would require reconfiguring the surface plot)
+        # In this case, just update the light position parameters
+        surf._shade_colors = ls.shade_normals
+    
+    # Add colorbar if requested
+    if add_colorbar:
+        cbar = fig.colorbar(surf, ax=ax, shrink=0.8, aspect=20)
+        cbar.set_label('Goodness of Fit (lower is better)', fontsize=12)
+    
+    # Set title
+    if title is None:
+        title = '3D Parameter Space Visualization'
+    ax.set_title(title, fontsize=16)
+    
+    # Add threshold contour if requested
+    if highlight_threshold is not None:
+        # Add a horizontal plane at the threshold value
+        try:
+            xl, xh = ax.get_xlim()
+            yl, yh = ax.get_ylim()
+            xx, yy = np.meshgrid(np.linspace(xl, xh, 10), np.linspace(yl, yh, 10))
+            zz = np.full_like(xx, highlight_threshold)
+            
+            # Plot the plane with some transparency
+            ax.plot_surface(xx, yy, zz, alpha=0.3, color='red')
+            
+            # Add text annotation for the threshold
+            ax.text(
+                (xl + xh) / 2,
+                yl,
+                highlight_threshold,
+                f'Threshold: {highlight_threshold:.4e}',
+                color='red', fontsize=10
+            )
+        except Exception as e:
+            print(f"Could not add threshold plane: {e}")
+    
+    plt.tight_layout()
+    
+    return fig, ax
