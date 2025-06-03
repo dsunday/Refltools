@@ -259,12 +259,35 @@ from scipy.signal import find_peaks
 
 import numpy as np
 from scipy.signal import find_peaks
-from scipy.integrate import trapezoid
+from typing import List, Dict, Tuple, Optional, Union, Callable
 
-def find_peaks_by_sections(data, sections):
+import numpy as np
+from scipy.signal import find_peaks
+from typing import List, Dict, Tuple, Optional, Union, Callable
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.gridspec import GridSpec
+from scipy.signal import find_peaks
+from typing import List, Dict, Tuple, Optional, Union, Callable
+
+def find_peaks_by_sections(data: np.ndarray, 
+                          sections: List[Dict],
+                          integration_method: str = 'sum',
+                          plot_results: bool = True,
+                          figsize: Tuple[int, int] = (12, 10),
+                          log_scale: bool = True,
+                          show_background: bool = True,
+                          show_peak_contributions: bool = True,
+                          show_table: bool = True,
+                          title: Optional[str] = None,
+                          save_path: Optional[str] = None) -> Tuple[Dict, Optional[Tuple]]:
     """
     Find peaks in different sections of data with different parameters and
-    calculate integrated intensities for each section.
+    calculate integrated intensities for each peak using the full section width.
+    The integration is performed between the peak height and a background defined
+    by a linear fit between intensities at the section boundaries.
     
     Parameters:
     -----------
@@ -276,32 +299,59 @@ def find_peaks_by_sections(data, sections):
         - 'height': float or tuple, height parameter for find_peaks
         - 'width': tuple (w_min, w_max), width parameter for find_peaks
         - 'prominence': float or tuple, optional prominence parameter
-        - 'background': float or callable, optional background level for subtraction
-            If float: constant background level across the section
-            If callable: function taking q values and returning background intensity
-            If not provided: no background subtraction is performed
+        - 'distance': float, optional minimum distance between peaks
+    integration_method : str, optional
+        Method to use for calculating integrated intensities:
+        - 'sum': Simple summation of intensity values (default)
+        - 'trapz': Trapezoidal rule integration
+    plot_results : bool, optional
+        Whether to plot the results (default: False)
+    figsize : tuple(int, int), optional
+        Figure size as (width, height) in inches (default: (12, 10))
+    log_scale : bool, optional
+        Whether to use log scale for intensity values (default: True)
+    show_background : bool, optional
+        Whether to show the linear background for each section (default: True)
+    show_peak_contributions : bool, optional
+        Whether to show the individual peak contributions (default: True)
+    show_table : bool, optional
+        Whether to show a table of results instead of a bar chart (default: True)
+    title : str, optional
+        Custom title for the plot (default: None)
+    save_path : str, optional
+        Path to save the figure (default: None, figure is not saved)
     
     Returns:
     --------
     results : dict
         Dictionary containing:
-        - 'q_values': Q values of detected peaks
-        - 'intensities': Intensity values of detected peaks
+        - 'peaks_max': ndarray of shape (n, 2) with [q_values, intensities]
+          for each peak (peak maximum/height values)
+        - 'peaks_raw': ndarray of shape (n, 2) with [q_values, raw_section_integrals]
+          for each peak (raw section integrated intensities)
+        - 'peaks_net': ndarray of shape (n, 2) with [q_values, net_section_integrals]
+          for each peak (background-subtracted section integrated intensities)
+        - 'peaks_norm': ndarray of shape (n, 4) with [normalized_q, normalized_intensity,
+          normalized_raw_integral, normalized_net_integral] where each column
+          is normalized by dividing by its maximum value
         - 'widths': Width values of detected peaks in Q units
         - 'indices': Original indices of peaks in the data array
         - 'section_integrals': List of dictionaries with integration results for each section
-            Each dict contains:
-            - 'q_range': The q range of the section
-            - 'raw_integral': Integrated intensity without background subtraction
-            - 'background_subtracted_integral': Integrated intensity with background subtraction
-            - 'background_level': Background level used (constant or average if function)
-            - 'q_points': Q values within the section
-            - 'intensity_points': Intensity values within the section
-            - 'background_points': Background values at each Q point
+    
+    plot_output : tuple or None
+        If plot_results=True, returns (fig, axes) from the generated plot
+        
+    Note:
+    -----
+    - For each peak, the values in 'peaks_raw' and 'peaks_net' are the section
+      integrals from the section containing that peak. If multiple peaks are in
+      the same section, they all get the same section integral values.
+    - The background is calculated as a linear fit between intensities at the section boundaries.
     """
     # Initialize lists to store results
     all_q_peaks = []
     all_intensities = []
+    all_section_indices = []  # To track which section each peak belongs to
     all_widths = []
     all_indices = []
     section_integrals = []
@@ -322,38 +372,64 @@ def find_peaks_by_sections(data, sections):
         q_section = section_data[:, 0]
         intensity_section = section_data[:, 1]
         
-        # Calculate background for this section
-        if 'background' in section:
-            bg = section['background']
-            if callable(bg):
-                # If background is a function, apply it to q values
-                background_points = bg(q_section)
-                background_level = np.mean(background_points)  # Average for reporting
-            else:
-                # Constant background
-                background_points = np.full_like(q_section, bg)
-                background_level = bg
+        # Calculate linear background between section boundaries
+        # Get intensities at the section boundaries (or closest points)
+        if q_min <= data[0, 0]:
+            # If q_min is before the first data point, use the first point
+            i_min = data[0, 1]
         else:
-            # No background specified, use zeros
-            background_points = np.zeros_like(q_section)
-            background_level = 0
+            # Find closest point before q_min
+            idx_min = np.where(data[:, 0] <= q_min)[0][-1]
+            i_min = data[idx_min, 1]
+        
+        if q_max >= data[-1, 0]:
+            # If q_max is after the last data point, use the last point
+            i_max = data[-1, 1]
+        else:
+            # Find closest point after q_max
+            idx_max = np.where(data[:, 0] >= q_max)[0][0]
+            i_max = data[idx_max, 1]
+        
+        # Calculate linear background for the entire section
+        slope = (i_max - i_min) / (q_max - q_min)
+        background_points = i_min + slope * (q_section - q_min)
+        background_level = (i_min + i_max) / 2  # Average for reporting
         
         # Calculate background-subtracted intensities
         subtracted_intensity = intensity_section - background_points
         
-        # Calculate integrals using trapezoidal rule
-        raw_integral = trapezoid(intensity_section, q_section)
-        background_subtracted_integral = trapezoid(subtracted_intensity, q_section)
+        # Calculate section integrals based on the selected method
+        if integration_method == 'trapz':
+            # Use trapezoidal rule for integration
+            from scipy.integrate import trapz
+            raw_integral = trapz(intensity_section, q_section)
+            background_integral = trapz(background_points, q_section)
+            background_subtracted_integral = trapz(subtracted_intensity, q_section)
+        else:  # 'sum' (default)
+            # Simple summation of intensity values
+            # For more accurate summation, we scale by the average step size
+            if len(q_section) > 1:
+                avg_step = (q_section[-1] - q_section[0]) / (len(q_section) - 1)
+                raw_integral = np.sum(intensity_section) * avg_step
+                background_integral = np.sum(background_points) * avg_step
+                background_subtracted_integral = np.sum(subtracted_intensity) * avg_step
+            else:
+                raw_integral = intensity_section[0]
+                background_integral = background_points[0]
+                background_subtracted_integral = subtracted_intensity[0]
         
-        # Store integration results for this section
+        # Store section integration results
         section_integral_info = {
             'q_range': (q_min, q_max),
             'raw_integral': raw_integral,
+            'background_integral': background_integral,
             'background_subtracted_integral': background_subtracted_integral,
             'background_level': background_level,
             'q_points': q_section,
             'intensity_points': intensity_section,
-            'background_points': background_points
+            'background_points': background_points,
+            'integration_method': integration_method,
+            'boundary_intensities': (i_min, i_max)
         }
         section_integrals.append(section_integral_info)
         
@@ -378,10 +454,10 @@ def find_peaks_by_sections(data, sections):
         global_indices = section_indices[peak_indices]
         
         # Get Q values and intensities for these peaks
-        q_peaks = data[global_indices, 0]
-        intensities = data[global_indices, 1]
+        q_peaks = section_data[peak_indices, 0]
+        intensities = section_data[peak_indices, 1]
         
-        # Calculate widths in Q units rather than sample units
+        # Calculate widths in Q units from peak properties
         if 'width' in section and 'widths' in properties:
             # Get left and right interpolated positions
             left_ips = properties['left_ips']
@@ -410,177 +486,505 @@ def find_peaks_by_sections(data, sections):
                 
                 widths_q.append(right_q - left_q)
         else:
-            widths_q = np.zeros(len(q_peaks))
+            # Default width if not found from peak properties
+            widths_q = np.full(len(q_peaks), 0.1)
         
         # Add results to master lists
         all_q_peaks.extend(q_peaks)
         all_intensities.extend(intensities)
+        all_section_indices.extend([section_idx] * len(q_peaks))  # Record which section each peak belongs to
         all_widths.extend(widths_q)
         all_indices.extend(global_indices)
     
-    # Convert lists to arrays and sort by Q value
+    # Convert lists to arrays and prepare for sorting
     if all_q_peaks:
-        sort_idx = np.argsort(all_q_peaks)
-        return {
-            'q_values': np.array(all_q_peaks)[sort_idx],
-            'intensities': np.array(all_intensities)[sort_idx],
-            'widths': np.array(all_widths)[sort_idx],
-            'indices': np.array(all_indices)[sort_idx],
-            'section_integrals': section_integrals
+        # Create arrays from lists
+        q_values = np.array(all_q_peaks)
+        intensities = np.array(all_intensities)
+        section_indices = np.array(all_section_indices)
+        widths = np.array(all_widths)
+        indices = np.array(all_indices)
+        
+        # Sort all arrays by q-value
+        sort_idx = np.argsort(q_values)
+        
+        # Apply sorting to all arrays
+        q_values = q_values[sort_idx]
+        intensities = intensities[sort_idx]
+        section_indices = section_indices[sort_idx]
+        widths = widths[sort_idx]
+        indices = indices[sort_idx]
+        
+        # Create the peaks_max array
+        peaks_max = np.column_stack((q_values, intensities))
+        
+        # Create peaks_raw and peaks_net arrays using section integrals
+        raw_integrals = np.array([section_integrals[idx]['raw_integral'] for idx in section_indices])
+        net_integrals = np.array([section_integrals[idx]['background_subtracted_integral'] for idx in section_indices])
+        
+        peaks_raw = np.column_stack((q_values, raw_integrals))
+        peaks_net = np.column_stack((q_values, net_integrals))
+        
+        # Create normalized values array
+        # Normalize each column by its maximum value
+        if len(q_values) > 0:
+            q_norm = q_values / np.min(q_values)
+            intensity_norm = intensities / np.max(intensities)
+            raw_norm = raw_integrals / np.max(raw_integrals)
+            net_norm = net_integrals / np.max(net_integrals)
+            
+            peaks_norm = np.column_stack((q_norm, intensity_norm, raw_norm, net_norm))
+        else:
+            peaks_norm = np.array([]).reshape(0, 4)
+        
+        # Prepare the results dictionary
+        results = {
+            'peaks_max': peaks_max,     # [q_values, intensities]
+            'peaks_raw': peaks_raw,     # [q_values, raw_section_integrals]
+            'peaks_net': peaks_net,     # [q_values, net_section_integrals]
+            'peaks_norm': peaks_norm,   # [normalized_q, normalized_intensity, normalized_raw, normalized_net]
+            'widths': widths,
+            'indices': indices,
+            'section_integrals': section_integrals,
+            'section_indices': section_indices  # Store which section each peak belongs to
         }
     else:
-        return {
-            'q_values': np.array([]),
-            'intensities': np.array([]),
+        # Return empty arrays if no peaks found
+        empty_array = np.array([]).reshape(0, 2)
+        empty_norm_array = np.array([]).reshape(0, 4)
+        results = {
+            'peaks_max': empty_array,   # Empty [q_values, intensities]
+            'peaks_raw': empty_array,   # Empty [q_values, raw_section_integrals]
+            'peaks_net': empty_array,   # Empty [q_values, net_section_integrals]
+            'peaks_norm': empty_norm_array,  # Empty normalized values
             'widths': np.array([]),
             'indices': np.array([]),
-            'section_integrals': section_integrals
+            'section_integrals': section_integrals,
+            'section_indices': np.array([])
         }
+    
+    # Plot the results if requested
+    if plot_results:
+        plot_output = _plot_section_integration(
+            data=data, 
+            peak_results=results,
+            figsize=figsize,
+            log_scale=log_scale,
+            show_background=show_background,
+            show_peak_contributions=show_peak_contributions,
+            show_table=show_table,
+            title=title,
+            save_path=save_path
+        )
+        return results, plot_output
+    else:
+        return results, None
 
-def plot_integrated_sections(data, peak_results, figsize=(12, 10)):
+def _plot_section_integration(data: np.ndarray, 
+                             peak_results: Dict, 
+                             figsize: Tuple[int, int] = (12, 10),
+                             show_background: bool = True,
+                             show_peak_contributions: bool = True,
+                             log_scale: bool = True,
+                             show_table: bool = True,
+                             title: Optional[str] = None,
+                             save_path: Optional[str] = None) -> Tuple:
     """
-    Plot detected peaks and integrated sections with background subtraction visualization.
+    Internal function to visualize the section-based integration approach.
     
-    Parameters:
-    -----------
-    data : ndarray of shape (n, 2)
-        Array with [Q, Intensity] values
-    peak_results : dict
-        Dictionary containing peak and integration information from find_peaks_by_sections
-    figsize : tuple, optional
-        Figure size (width, height) in inches
-        
-    Returns:
-    --------
-    fig : matplotlib figure
-        The created figure for further customization if needed
+    Note: This is an internal helper function called by find_peaks_by_sections
+    when plot_results=True.
     """
-    # Check if section_integrals exists in peak_results
-    if 'section_integrals' not in peak_results or not peak_results['section_integrals']:
-        raise ValueError("No section integration results found in peak_results")
+    # Determine layout based on whether to show table
+    if show_table:
+        fig = plt.figure(figsize=figsize)
+        gs = GridSpec(2, 1, height_ratios=[3, 1], figure=fig)
+        ax_main = fig.add_subplot(gs[0])
+        ax_table = fig.add_subplot(gs[1])
+        axes = {'main': ax_main, 'table': ax_table}
+    else:
+        fig, ax_main = plt.subplots(figsize=figsize)
+        axes = {'main': ax_main}
     
-    # Create figure with two subplots (stacked vertically)
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, height_ratios=[3, 1])
+    # Extract peak data
+    peaks_max = peak_results['peaks_max']
+    peaks_net = peak_results['peaks_net']
+    peaks_raw = peak_results['peaks_raw']
+    peaks_norm = peak_results.get('peaks_norm', None)
+    section_indices = peak_results.get('section_indices', np.array([]))
     
-    # First subplot: Original data with peaks and sections
+    if len(peaks_max) > 0:
+        peak_positions = peaks_max[:, 0]
+        peak_intensities = peaks_max[:, 1]
+        peak_raw_integrals = peaks_raw[:, 1]
+        peak_net_integrals = peaks_net[:, 1]
+    else:
+        peak_positions = np.array([])
+        peak_intensities = np.array([])
+        peak_raw_integrals = np.array([])
+        peak_net_integrals = np.array([])
+    
+    # Extract section data
+    section_integrals = peak_results.get('section_integrals', [])
+    
     # Plot the original data
-    ax1.plot(data[:, 0], data[:, 1], 'b-', linewidth=1, label='Original Data')
+    ax_main.plot(data[:, 0], data[:, 1], 'k-', linewidth=1.5, label='Data')
     
-    # Set y-axis to log scale
-    ax1.set_yscale('log')
-    
-    # Get min and max for y-axis limits
-    min_positive = np.min(data[data[:, 1] > 0, 1])
-    max_intensity = np.max(data[:, 1])
-    y_min = min_positive / 2
-    y_max = max_intensity * 2
-    ax1.set_ylim(y_min, y_max)
-    
-    # Define section colors
-    section_colors = ['lightblue', 'lightgreen', 'lightyellow', 'lightpink', 'lavender']
-    
-    # Highlight sections and plot background levels
-    for i, section_info in enumerate(peak_results['section_integrals']):
-        # Get section boundaries
-        q_min, q_max = section_info['q_range']
-        q_points = section_info['q_points']
-        intensities = section_info['intensity_points']
-        background = section_info['background_points']
-        raw_integral = section_info['raw_integral']
-        bg_sub_integral = section_info['background_subtracted_integral']
+    # Set y-axis scale
+    if log_scale:
+        ax_main.set_yscale('log')
         
-        # Add section shading with transparency
-        color = section_colors[i % len(section_colors)]
-        rect = Rectangle((q_min, y_min), q_max - q_min, y_max - y_min, 
-                         facecolor=color, alpha=0.2, zorder=0)
-        ax1.add_patch(rect)
+    # Define colors for sections
+    section_colors = plt.cm.tab10(np.linspace(0, 1, len(section_integrals)))
+    
+    # Process each section
+    for i, section_info in enumerate(section_integrals):
+        q_range = section_info['q_range']
+        q_min, q_max = q_range
         
-        # Plot background level
-        ax1.plot(q_points, background, 'r--', linewidth=1.5, alpha=0.7)
+        # Get section data
+        q_section = section_info['q_points']
+        intensity_section = section_info['intensity_points']
+        background_points = section_info['background_points']
+        section_color = section_colors[i]
         
-        # Add section label with integration results
-        label_y = 0.92 - i * 0.05  # Position labels vertically
-        ax1.text(0.02, label_y, 
-                f"Section {i+1} ({q_min:.2f}-{q_max:.2f}): Raw={raw_integral:.2e}, BG Sub={bg_sub_integral:.2e}",
-                transform=ax1.transAxes, fontsize=9, 
-                bbox=dict(facecolor=color, alpha=0.5, boxstyle='round'))
+        # Highlight section with transparent fill
+        ax_main.axvspan(q_min, q_max, alpha=0.1, color=section_color, 
+                       label=f'Section {i+1}: [{q_min:.2f}-{q_max:.2f}]')
         
         # Add vertical lines at section boundaries
-        ax1.axvline(q_min, color='gray', linestyle='--', alpha=0.5, zorder=1)
-        ax1.axvline(q_max, color='gray', linestyle='--', alpha=0.5, zorder=1)
-    
-    # Plot the detected peaks
-    if len(peak_results['q_values']) > 0:
-        ax1.plot(peak_results['q_values'], peak_results['intensities'], 'ro', 
-                markersize=8, label='Detected Peaks')
+        ax_main.axvline(q_min, color=section_color, linestyle='--', alpha=0.7, linewidth=1)
+        ax_main.axvline(q_max, color=section_color, linestyle='--', alpha=0.7, linewidth=1)
         
-        # Annotate each peak with its Q value
-        for i, (q, intensity) in enumerate(zip(peak_results['q_values'], peak_results['intensities'])):
-            # In log scale, position the text above the peak
-            log_intensity = np.log10(intensity)
-            text_y = 10**(log_intensity + 0.1)
+        # Plot background if requested
+        if show_background:
+            ax_main.plot(q_section, background_points, '-', color=section_color, 
+                        linewidth=2, alpha=0.7, label=f'Background Section {i+1}')
+        
+        # Find peaks in this section
+        if len(section_indices) > 0:
+            section_peaks_mask = (section_indices == i)
+            section_peaks = peak_positions[section_peaks_mask]
+            section_intensities = peak_intensities[section_peaks_mask]
+            section_net_integrals = peak_net_integrals[section_peaks_mask]
+        else:
+            section_peaks = np.array([])
+            section_intensities = np.array([])
+            section_net_integrals = np.array([])
+        
+        # Plot peaks in this section
+        if len(section_peaks) > 0:
+            ax_main.plot(section_peaks, section_intensities, 'o', color=section_color,
+                        markersize=8, label=f'Peaks Section {i+1}')
             
-            ax1.annotate(f'{q:.2f}', (q, text_y), xytext=(0, 5), 
-                        textcoords='offset points', fontsize=9, ha='center')
-    
-    # Set axes labels and title for first subplot
-    ax1.set_xlabel('Q (Å$^{-1}$)', fontsize=12)
-    ax1.set_ylabel('Intensity (log scale)', fontsize=12)
-    ax1.set_title('Peak Detection and Section Integration Results', fontsize=14)
-    ax1.legend(loc='upper right')
-    ax1.grid(True, which='major', linestyle='-', alpha=0.5)
-    ax1.grid(True, which='minor', linestyle=':', alpha=0.3)
-    
-    # Second subplot: Bar chart of integrated intensities
-    # Extract section data for plotting
-    section_numbers = [f"Sec {i+1}" for i in range(len(peak_results['section_integrals']))]
-    raw_integrals = [info['raw_integral'] for info in peak_results['section_integrals']]
-    bg_sub_integrals = [info['background_subtracted_integral'] for info in peak_results['section_integrals']]
-    
-    # Decide whether to use log scale based on data range
-    log_scale_bars = max(raw_integrals) / min(filter(lambda x: x > 0, raw_integrals + bg_sub_integrals)) > 100
-    
-    # Set up bar positions
-    x = np.arange(len(section_numbers))
-    width = 0.35
-    
-    # Create bar chart
-    if log_scale_bars:
-        ax2.set_yscale('log')
-    
-    bar_colors = [section_colors[i % len(section_colors)] for i in range(len(section_numbers))]
-    bars1 = ax2.bar(x - width/2, raw_integrals, width, label='Raw Integral', 
-                   alpha=0.7, color=bar_colors)
-    bars2 = ax2.bar(x + width/2, bg_sub_integrals, width, label='BG Subtracted', 
-                   alpha=0.7, color=[c + '80' for c in bar_colors])  # Lighter shade
-    
-    # Add labels and formatting
-    ax2.set_xlabel('Section', fontsize=12)
-    ax2.set_ylabel('Integrated Intensity', fontsize=12)
-    ax2.set_title('Comparison of Raw and Background-Subtracted Integrals', fontsize=14)
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(section_numbers)
-    ax2.legend()
-    ax2.grid(True, which='major', linestyle='--', alpha=0.5)
-    
-    # Add value labels on bars
-    def autolabel(bars):
-        for bar in bars:
-            height = bar.get_height()
-            if log_scale_bars:
-                y_pos = height * 1.1
-            else:
-                y_pos = height + 0.05 * max(raw_integrals)
+            # Add peak labels with section integral value
+            raw_integral = section_info['raw_integral']
+            bg_sub_integral = section_info['background_subtracted_integral']
             
-            ax2.text(bar.get_x() + bar.get_width()/2, y_pos,
-                    f'{height:.1e}',
-                    ha='center', va='bottom', fontsize=8, rotation=45)
+            for j, (q, intensity) in enumerate(zip(section_peaks, section_intensities)):
+                # Calculate y position for label based on scale
+                if log_scale:
+                    text_y = intensity * 1.2
+                else:
+                    text_y = intensity + (np.max(data[:, 1]) - np.min(data[:, 1])) * 0.05
+                
+                # Add text label
+                ax_main.text(q, text_y, f'q={q:.3f}\nSection Integral={bg_sub_integral:.2e}', 
+                            ha='center', va='bottom', fontsize=9,
+                            bbox=dict(facecolor='white', alpha=0.7, boxstyle='round'))
+            
+            # Show peak contributions if requested
+            if show_peak_contributions:
+                for j, (q, intensity) in enumerate(zip(section_peaks, section_intensities)):
+                    # Find the background value at this peak position
+                    bg_at_peak = np.interp(q, q_section, background_points)
+                    
+                    # Draw a line from the background to the peak
+                    ax_main.plot([q, q], [bg_at_peak, intensity], '-', 
+                                color=section_color, linewidth=1.5, alpha=0.6)
+                    
+                    # Add a marker at the background level
+                    ax_main.plot(q, bg_at_peak, 'X', color=section_color, 
+                                markersize=6, alpha=0.8)
+        
+        # Add section integral text
+        raw_integral = section_info['raw_integral']
+        bg_integral = section_info.get('background_integral', 0)
+        bg_sub_integral = section_info['background_subtracted_integral']
+        
+        # Position the text in the middle of the section
+        q_pos = (q_min + q_max) / 2
+        if log_scale:
+            # In log scale, position at the top of the plot
+            y_pos = ax_main.get_ylim()[1] * 0.9
+        else:
+            # In linear scale, position at the top of the plot
+            y_pos = ax_main.get_ylim()[1] * 0.9
+        
+        # Add text with section integral information
+        section_text = f"Section {i+1} Integrals:\nRaw: {raw_integral:.2e}\nBG: {bg_integral:.2e}\nNet: {bg_sub_integral:.2e}"
+        ax_main.text(q_pos, y_pos, section_text, 
+                    ha='center', va='top', fontsize=9, color=section_color,
+                    bbox=dict(facecolor='white', alpha=0.7, boxstyle='round'))
     
-    autolabel(bars1)
-    autolabel(bars2)
+    # Set labels and title
+    ax_main.set_xlabel('q (Å$^{-1}$)', fontsize=12)
+    ax_main.set_ylabel('Intensity' + (' (log scale)' if log_scale else ''), fontsize=12)
     
+    if title:
+        ax_main.set_title(title, fontsize=14)
+    else:
+        ax_main.set_title('Section-Based Peak Integration', fontsize=14)
+    
+    # Add grid and legend
+    ax_main.grid(True, which='both', linestyle='--', alpha=0.5)
+    ax_main.legend(loc='upper right', fontsize=9)
+    
+    # Create a table of results instead of a bar chart
+    if show_table and 'table' in axes and len(peak_positions) > 0:
+        # Hide the table axes
+        ax_table.axis('off')
+        
+        # Prepare the table data
+        # Create data arrays for table - both raw and normalized values
+        if peaks_norm is not None and len(peaks_norm) > 0:
+            # We have normalized data
+            norm_q = peaks_norm[:, 0]
+            norm_intensity = peaks_norm[:, 1]
+            norm_raw = peaks_norm[:, 2]
+            norm_net = peaks_norm[:, 3]
+        else:
+            # Calculate normalized data on the fly
+            norm_q = peak_positions / np.min(peak_positions)
+            norm_intensity = peak_intensities / np.max(peak_intensities)
+            norm_raw = peak_raw_integrals / np.max(peak_raw_integrals)
+            norm_net = peak_net_integrals / np.max(peak_net_integrals)
+        
+        # Create table data
+        table_data = []
+        for i in range(len(peak_positions)):
+            # Get the section index for this peak
+            section_idx = section_indices[i] if len(section_indices) > 0 else -1
+            
+            # Format the row data
+            row = [
+                f"{peak_positions[i]:.4f}",  # q-value
+                f"{peak_intensities[i]:.2e}",  # Peak intensity
+                f"{peak_raw_integrals[i]:.2e}",  # Raw section integral
+                f"{peak_net_integrals[i]:.2e}",  # Net section integral
+                f"{norm_q[i]:.4f}",  # Normalized q-value
+                f"{norm_intensity[i]:.4f}",  # Normalized intensity
+                f"{norm_raw[i]:.4f}",  # Normalized raw integral
+                f"{norm_net[i]:.4f}",  # Normalized net integral
+                f"{section_idx + 1}"  # Section index (1-based)
+            ]
+            table_data.append(row)
+        
+        # Create column labels
+        col_labels = [
+            "q",
+            "Max I",
+            "Raw Int",
+            "Net Int",
+            "Norm q",
+            "Norm I",
+            "Norm Raw",
+            "Norm Net",
+            "Section"
+        ]
+        
+        # Create the table
+        table = ax_table.table(
+            cellText=table_data,
+            colLabels=col_labels,
+            loc='center',
+            cellLoc='center',
+            colWidths=[0.09] * len(col_labels),
+            bbox=[0.05, 0.0, 0.9, 0.9]  # [left, bottom, width, height]
+        )
+        
+        # Style the table
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        
+        # Highlight the header row
+        for i, key in enumerate(col_labels):
+            cell = table[0, i]
+            cell.set_facecolor('lightblue')
+            cell.set_text_props(weight='bold')
+        
+        # Color cells by section
+        for i, row_data in enumerate(table_data):
+            section_idx = int(row_data[-1]) - 1  # Convert to 0-based index
+            section_color = section_colors[section_idx] if section_idx < len(section_colors) else 'white'
+            
+            # Set a lighter version of the section color
+            light_color = section_color.copy()
+            light_color[3] = 0.3  # Reduce alpha for transparency
+            
+            # Apply color to cells
+            for j in range(len(row_data)):
+                cell = table[i+1, j]
+                cell.set_facecolor(light_color)
+        
+        # Set the table title
+        ax_table.set_title("Peak Data (Raw and Normalized Values)", fontsize=14, pad=20)
+    
+    # Adjust layout
     plt.tight_layout()
-    return fig
+    
+    # Save figure if requested
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    return fig, axes
+      
+        
+        
+# def plot_integrated_sections(data, peak_results, figsize=(12, 10)):
+#     """
+#     Plot detected peaks and integrated sections with background subtraction visualization.
+    
+#     Parameters:
+#     -----------
+#     data : ndarray of shape (n, 2)
+#         Array with [Q, Intensity] values
+#     peak_results : dict
+#         Dictionary containing peak and integration information from find_peaks_by_sections
+#     figsize : tuple, optional
+#         Figure size (width, height) in inches
+        
+#     Returns:
+#     --------
+#     fig : matplotlib figure
+#         The created figure for further customization if needed
+#     """
+#     # Check if section_integrals exists in peak_results
+#     if 'section_integrals' not in peak_results or not peak_results['section_integrals']:
+#         raise ValueError("No section integration results found in peak_results")
+    
+#     # Create figure with two subplots (stacked vertically)
+#     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, height_ratios=[3, 1])
+    
+#     # First subplot: Original data with peaks and sections
+#     # Plot the original data
+#     ax1.plot(data[:, 0], data[:, 1], 'b-', linewidth=1, label='Original Data')
+    
+#     # Set y-axis to log scale
+#     ax1.set_yscale('log')
+    
+#     # Get min and max for y-axis limits
+#     min_positive = np.min(data[data[:, 1] > 0, 1])
+#     max_intensity = np.max(data[:, 1])
+#     y_min = min_positive / 2
+#     y_max = max_intensity * 2
+#     ax1.set_ylim(y_min, y_max)
+    
+#     # Define section colors
+#     section_colors = ['lightblue', 'lightgreen', 'lightyellow', 'lightpink', 'lavender']
+    
+#     # Highlight sections and plot background levels
+#     for i, section_info in enumerate(peak_results['section_integrals']):
+#         # Get section boundaries
+#         q_min, q_max = section_info['q_range']
+#         q_points = section_info['q_points']
+#         intensities = section_info['intensity_points']
+#         background = section_info['background_points']
+#         raw_integral = section_info['raw_integral']
+#         bg_sub_integral = section_info['background_subtracted_integral']
+        
+#         # Add section shading with transparency
+#         color = section_colors[i % len(section_colors)]
+#         rect = Rectangle((q_min, y_min), q_max - q_min, y_max - y_min, 
+#                          facecolor=color, alpha=0.2, zorder=0)
+#         ax1.add_patch(rect)
+        
+#         # Plot background level
+#         ax1.plot(q_points, background, 'r--', linewidth=1.5, alpha=0.7)
+        
+#         # Add section label with integration results
+#         label_y = 0.92 - i * 0.05  # Position labels vertically
+#         ax1.text(0.02, label_y, 
+#                 f"Section {i+1} ({q_min:.2f}-{q_max:.2f}): Raw={raw_integral:.2e}, BG Sub={bg_sub_integral:.2e}",
+#                 transform=ax1.transAxes, fontsize=9, 
+#                 bbox=dict(facecolor=color, alpha=0.5, boxstyle='round'))
+        
+#         # Add vertical lines at section boundaries
+#         ax1.axvline(q_min, color='gray', linestyle='--', alpha=0.5, zorder=1)
+#         ax1.axvline(q_max, color='gray', linestyle='--', alpha=0.5, zorder=1)
+    
+#     # Plot the detected peaks
+#     if len(peak_results['q_values']) > 0:
+#         ax1.plot(peak_results['q_values'], peak_results['intensities'], 'ro', 
+#                 markersize=8, label='Detected Peaks')
+        
+#         # Annotate each peak with its Q value
+#         for i, (q, intensity) in enumerate(zip(peak_results['q_values'], peak_results['intensities'])):
+#             # In log scale, position the text above the peak
+#             log_intensity = np.log10(intensity)
+#             text_y = 10**(log_intensity + 0.1)
+            
+#             ax1.annotate(f'{q:.2f}', (q, text_y), xytext=(0, 5), 
+#                         textcoords='offset points', fontsize=9, ha='center')
+    
+#     # Set axes labels and title for first subplot
+#     ax1.set_xlabel('Q (Å$^{-1}$)', fontsize=12)
+#     ax1.set_ylabel('Intensity (log scale)', fontsize=12)
+#     ax1.set_title('Peak Detection and Section Integration Results', fontsize=14)
+#     ax1.legend(loc='upper right')
+#     ax1.grid(True, which='major', linestyle='-', alpha=0.5)
+#     ax1.grid(True, which='minor', linestyle=':', alpha=0.3)
+    
+#     # Second subplot: Bar chart of integrated intensities
+#     # Extract section data for plotting
+#     section_numbers = [f"Sec {i+1}" for i in range(len(peak_results['section_integrals']))]
+#     raw_integrals = [info['raw_integral'] for info in peak_results['section_integrals']]
+#     bg_sub_integrals = [info['background_subtracted_integral'] for info in peak_results['section_integrals']]
+    
+#     # Decide whether to use log scale based on data range
+#     log_scale_bars = max(raw_integrals) / min(filter(lambda x: x > 0, raw_integrals + bg_sub_integrals)) > 100
+    
+#     # Set up bar positions
+#     x = np.arange(len(section_numbers))
+#     width = 0.35
+    
+#     # Create bar chart
+#     if log_scale_bars:
+#         ax2.set_yscale('log')
+    
+#     bar_colors = [section_colors[i % len(section_colors)] for i in range(len(section_numbers))]
+#     bars1 = ax2.bar(x - width/2, raw_integrals, width, label='Raw Integral', 
+#                    alpha=0.7, color=bar_colors)
+#     bars2 = ax2.bar(x + width/2, bg_sub_integrals, width, label='BG Subtracted', 
+#                    alpha=0.7, color=[c + '80' for c in bar_colors])  # Lighter shade
+    
+#     # Add labels and formatting
+#     ax2.set_xlabel('Section', fontsize=12)
+#     ax2.set_ylabel('Integrated Intensity', fontsize=12)
+#     ax2.set_title('Comparison of Raw and Background-Subtracted Integrals', fontsize=14)
+#     ax2.set_xticks(x)
+#     ax2.set_xticklabels(section_numbers)
+#     ax2.legend()
+#     ax2.grid(True, which='major', linestyle='--', alpha=0.5)
+    
+#     # Add value labels on bars
+#     def autolabel(bars):
+#         for bar in bars:
+#             height = bar.get_height()
+#             if log_scale_bars:
+#                 y_pos = height * 1.1
+#             else:
+#                 y_pos = height + 0.05 * max(raw_integrals)
+            
+#             ax2.text(bar.get_x() + bar.get_width()/2, y_pos,
+#                     f'{height:.1e}',
+#                     ha='center', va='bottom', fontsize=8, rotation=45)
+    
+#     autolabel(bars1)
+#     autolabel(bars2)
+    
+#     plt.tight_layout()
+#     return fig
 
 # Example usage:
 # Define different sections with appropriate parameters
@@ -614,11 +1018,20 @@ import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from matplotlib.patches import Rectangle
 
-def plot_peaks_over_data(data, peak_results, sections=None, figsize=(12, 8), plot_widths=True):
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from typing import Dict, List, Tuple, Optional
+
+def plot_peaks_over_data(data: np.ndarray, 
+                        peak_results: Dict, 
+                        sections: Optional[List[Dict]] = None, 
+                        figsize: Tuple[int, int] = (12, 8), 
+                        plot_widths: bool = True,
+                        show_integrals: bool = False):
     """
     Plot detected peaks over the original intensity vs. Q data with different sections highlighted.
-    Uses log scale for the y-axis, with section shading covering the entire y-axis and
-    section headings at the top of the figure.
+    Compatible with both old and new formats of peak_results.
     
     Parameters:
     -----------
@@ -626,18 +1039,51 @@ def plot_peaks_over_data(data, peak_results, sections=None, figsize=(12, 8), plo
         Array with [Q, Intensity] values
     peak_results : dict
         Dictionary containing peak information from find_peaks_by_sections
+        Can contain either:
+        - 'q_values', 'intensities', and 'widths' keys (old format)
+        - 'peaks' array with [q, intensity, integral] and 'widths' (new format)
     sections : list of dicts, optional
         Section definitions used for peak finding, to highlight different regions
     figsize : tuple, optional
         Figure size (width, height) in inches
     plot_widths : bool, optional
         Whether to indicate peak widths on the plot
+    show_integrals : bool, optional
+        Whether to show integrated intensities in annotations (only available with new format)
         
     Returns:
     --------
     fig, ax : matplotlib figure and axes objects
         The created figure and axes for further customization if needed
     """
+    # Extract peak data based on format
+    if 'peaks' in peak_results and isinstance(peak_results['peaks'], np.ndarray) and peak_results['peaks'].shape[1] >= 2:
+        # New format - extract from peaks array
+        peaks_array = peak_results['peaks']
+        q_values = peaks_array[:, 0]
+        intensities = peaks_array[:, 1]
+        if show_integrals and peaks_array.shape[1] >= 3:
+            integrals = peaks_array[:, 2]
+        else:
+            integrals = None
+    elif 'q_values' in peak_results and 'intensities' in peak_results:
+        # Old format - use separate arrays
+        q_values = peak_results['q_values']
+        intensities = peak_results['intensities']
+        integrals = None
+    else:
+        # No valid peaks found
+        q_values = np.array([])
+        intensities = np.array([])
+        integrals = None
+    
+    # Extract widths
+    if 'widths' in peak_results:
+        widths = peak_results['widths']
+    else:
+        widths = np.zeros_like(q_values)
+        plot_widths = False  # Disable width plotting if no widths available
+    
     # Create figure and axes
     fig, ax = plt.subplots(figsize=figsize)
     
@@ -672,8 +1118,6 @@ def plot_peaks_over_data(data, peak_results, sections=None, figsize=(12, 8), plo
         # Second pass: add section labels at the top
         # First, determine the height for the text by getting the top of the plot in data coordinates
         fig_height = 0.95  # Place text at 95% of the figure height
-        trans = ax.transAxes.inverted()  # Transform from data to axes coordinates
-        inv_trans = trans.inverted()     # Transform from axes to data coordinates
         
         for i, section in enumerate(sections):
             q_min, q_max = section['q_range']
@@ -693,24 +1137,28 @@ def plot_peaks_over_data(data, peak_results, sections=None, figsize=(12, 8), plo
             ax.axvline(q_max, color='gray', linestyle='--', alpha=0.5, zorder=1)
     
     # Plot the detected peaks
-    if len(peak_results['q_values']) > 0:
-        ax.plot(peak_results['q_values'], peak_results['intensities'], 'ro', 
+    if len(q_values) > 0:
+        ax.plot(q_values, intensities, 'ro', 
                 markersize=8, label='Detected Peaks')
         
-        # Annotate each peak with its Q value
-        for i, (q, intensity) in enumerate(zip(peak_results['q_values'], peak_results['intensities'])):
+        # Annotate each peak with its Q value and optionally its integral
+        for i, (q, intensity) in enumerate(zip(q_values, intensities)):
             # In log scale, position the text above the peak
             log_intensity = np.log10(intensity)
             text_y = 10**(log_intensity + 0.1)  # Move further up in log space
             
-            ax.annotate(f'{q:.2f}', (q, text_y), xytext=(0, 5), 
+            # Create annotation text
+            if integrals is not None and show_integrals:
+                annotation_text = f'q={q:.2f}\nInt={integrals[i]:.2e}'
+            else:
+                annotation_text = f'{q:.2f}'
+            
+            ax.annotate(annotation_text, (q, text_y), xytext=(0, 5), 
                         textcoords='offset points', fontsize=9, ha='center')
         
         # Visualize peak widths if requested
-        if plot_widths and len(peak_results['widths']) > 0:
-            for i, (q, intensity, width) in enumerate(zip(peak_results['q_values'], 
-                                                         peak_results['intensities'], 
-                                                         peak_results['widths'])):
+        if plot_widths and len(widths) > 0:
+            for i, (q, intensity, width) in enumerate(zip(q_values, intensities, widths)):
                 if width > 0:
                     # Use a fixed fraction of the peak height that looks good on log scale
                     visual_half_height = intensity / 3
@@ -1204,57 +1652,218 @@ def extract_peak_data(peak_results):
     
     return peak_data
 
-def extract_integrated_peaks(peak_results):
+import numpy as np
+from scipy.integrate import trapezoid
+from typing import Dict, List, Tuple, Optional, Union
+
+def extract_peak_intensities(data: np.ndarray, 
+                            peak_results: Dict, 
+                            integration_width: Union[float, List[float], np.ndarray] = None,
+                            background_subtracted: bool = True,
+                            local_background: bool = True,
+                            integration_method: str = 'sum') -> np.ndarray:
     """
-    Extract peak Q values and intensities from find_peaks_by_sections results
-    and convert them to a numpy array.
+    Extract peak positions (Q) and their integrated intensities as a simple 2D array.
+    Uses either the peak widths or a specified integration width for each peak.
+    Integration can be done using simple summation or trapezoidal rule.
     
     Parameters:
     -----------
+    data : ndarray of shape (n, 2)
+        Array with [Q, Intensity] values from the original dataset
     peak_results : dict
         Dictionary containing peak information from find_peaks_by_sections
+    integration_width : float or list or ndarray, optional
+        Width in Q units to use for integration around each peak.
+        - If float: Same width for all peaks
+        - If list/array: Custom width for each peak (must match number of peaks)
+        - If None: Use peak widths from peak_results if available, otherwise default to 0.1
+    background_subtracted : bool, optional
+        Whether to return background-subtracted intensities (True) or raw intensities (False)
+        Default is True (background-subtracted)
+    local_background : bool, optional
+        Whether to subtract local background from integrated intensities (default: True)
+        Only used if background_subtracted=True
+    integration_method : str, optional
+        Method to use for calculating integrated intensities:
+        - 'sum': Simple summation of intensity values (default)
+        - 'trapz': Trapezoidal rule integration
         
     Returns:
     --------
-    peak_data : ndarray of shape (n, 2)
-        Array with [Q, Intensity] values for each peak
+    peak_intensities : ndarray of shape (n, 2)
+        Array with [Q, Integrated_Intensity] values for each peak
     """
-    if len(peak_results['q_values']) == 0:
+    # Check if peak_results has detected peaks
+    if 'q_values' not in peak_results or len(peak_results['q_values']) == 0:
         return np.array([]).reshape(0, 2)
     
-    # Create a numpy array with q values and intensities
+    # Extract peak data
     q_values = peak_results['q_values']
-    intensities = peak_results['raw_integral']
+    num_peaks = len(q_values)
     
-    # Stack into a 2D array
-    peak_data = np.column_stack((q_values, intensities))
+    # Determine integration widths
+    if integration_width is None:
+        if 'widths' in peak_results and len(peak_results['widths']) == num_peaks:
+            # Use provided peak widths, but ensure they're all positive
+            integration_widths = np.maximum(peak_results['widths'], 0.05)
+        else:
+            # Default to fixed width of 0.1 for all peaks
+            integration_widths = np.full(num_peaks, 0.1)
+    elif isinstance(integration_width, (int, float)):
+        # Same width for all peaks
+        integration_widths = np.full(num_peaks, float(integration_width))
+    elif isinstance(integration_width, (list, np.ndarray)):
+        # Check that provided widths match number of peaks
+        if len(integration_width) != num_peaks:
+            raise ValueError(f"Number of integration widths ({len(integration_width)}) must match number of peaks ({num_peaks})")
+        integration_widths = np.array(integration_width, dtype=float)
+    else:
+        raise TypeError("integration_width must be a float, list, numpy array, or None")
     
-    # Sort by q values (should already be sorted, but just to be sure)
-    peak_data = peak_data[np.argsort(peak_data[:, 0])]
+    # Create arrays to store results
+    integrated_intensities = np.zeros(num_peaks)
     
-    return peak_data
+    # Sort data by q value to ensure correct integration
+    sorted_data = data[np.argsort(data[:, 0])]
+    q_data = sorted_data[:, 0]
+    intensity_data = sorted_data[:, 1]
+    
+    # Process each peak
+    for i, (q_peak, width) in enumerate(zip(q_values, integration_widths)):
+        # Define integration range around peak
+        half_width = width / 2
+        q_min = q_peak - half_width
+        q_max = q_peak + half_width
+        
+        # Find data points within integration range
+        in_range = (q_data >= q_min) & (q_data <= q_max)
+        
+        # Skip if no data points in range
+        if not np.any(in_range):
+            integrated_intensities[i] = 0
+            continue
+        
+        # Extract data points for integration
+        q_range = q_data[in_range]
+        intensity_range = intensity_data[in_range]
+        
+        # Determine background if requested
+        if background_subtracted and local_background:
+            # Use linear interpolation between edges of integration range
+            # First, check if we need to find points outside the range
+            if q_min <= q_data[0] or q_max >= q_data[-1]:
+                # We're at the edge of the data, use the closest edge value as background
+                if q_min <= q_data[0]:
+                    left_bg = intensity_range[0]
+                else:
+                    # Find closest point just before q_min
+                    idx_left = np.where(q_data < q_min)[0]
+                    if len(idx_left) > 0:
+                        left_bg = intensity_data[idx_left[-1]]
+                    else:
+                        left_bg = intensity_range[0]
+                
+                if q_max >= q_data[-1]:
+                    right_bg = intensity_range[-1]
+                else:
+                    # Find closest point just after q_max
+                    idx_right = np.where(q_data > q_max)[0]
+                    if len(idx_right) > 0:
+                        right_bg = intensity_data[idx_right[0]]
+                    else:
+                        right_bg = intensity_range[-1]
+            else:
+                # Find closest points just outside the range
+                idx_left = np.where(q_data < q_min)[0][-1]
+                idx_right = np.where(q_data > q_max)[0][0]
+                left_bg = intensity_data[idx_left]
+                right_bg = intensity_data[idx_right]
+            
+            # Linear interpolation for background
+            slope = (right_bg - left_bg) / (q_max - q_min)
+            background = left_bg + slope * (q_range - q_min)
+        else:
+            # No background subtraction, set background to zero
+            background = np.zeros_like(q_range)
+        
+        # Calculate integrated intensities based on the selected method
+        if background_subtracted:
+            # Subtract background before integration
+            subtracted_intensity = intensity_range - background
+            
+            if integration_method == 'trapz':
+                # Use trapezoidal rule for integration
+                from scipy.integrate import trapz
+                integrated_intensity = trapz(subtracted_intensity, q_range)
+            else:  # 'sum' (default)
+                # Simple summation of intensity values
+                # For more accurate summation, we scale by the average step size
+                if len(q_range) > 1:
+                    avg_step = (q_range[-1] - q_range[0]) / (len(q_range) - 1)
+                    integrated_intensity = np.sum(subtracted_intensity) * avg_step
+                else:
+                    integrated_intensity = subtracted_intensity[0]
+        else:
+            # Just integrate the raw intensity
+            if integration_method == 'trapz':
+                from scipy.integrate import trapz
+                integrated_intensity = trapz(intensity_range, q_range)
+            else:  # 'sum' (default)
+                if len(q_range) > 1:
+                    avg_step = (q_range[-1] - q_range[0]) / (len(q_range) - 1)
+                    integrated_intensity = np.sum(intensity_range) * avg_step
+                else:
+                    integrated_intensity = intensity_range[0]
+        
+        # Store the integrated intensity
+        integrated_intensities[i] = integrated_intensity
+    
+    # Create the final result array with [Q, Integrated_Intensity]
+    peak_intensities = np.column_stack((q_values, integrated_intensities))
+    
+    # Sort by Q value to ensure consistent order
+    peak_intensities = peak_intensities[np.argsort(peak_intensities[:, 0])]
+    
+    return peak_intensities
 
-def pitchcalc_from_results(peak_results):
+def pitchcalc_from_results(peak_results: Dict) -> Tuple[Optional[float], np.ndarray]:
     """
     Calculate the pitch from peak detection results using 2π/mean(spacing).
+    Works with both old and new formats of peak_results.
     
     Parameters:
     -----------
     peak_results : dict
         Dictionary containing peak information from find_peaks_by_sections
+        Can contain either:
+        - 'q_values' key (old format)
+        - 'peaks' array with [q, intensity, integral] (new format)
         
     Returns:
     --------
-    pitch : float
-        Calculated pitch value
+    pitch : float or None
+        Calculated pitch value, or None if fewer than 2 peaks detected
     spacing : ndarray
         Array of spacings between adjacent peaks
     """
-    if len(peak_results['q_values']) < 2:
+    # Check which format we're dealing with
+    if 'peaks_max' in peak_results and isinstance(peak_results['peaks_max'], np.ndarray) and peak_results['peaks_max'].shape[1] >= 1:
+        # New format - extract q_values from peaks array (first column)
+        q_values = peak_results['peaks_max'][:, 0]
+    elif 'q_values' in peak_results:
+        # Old format - use q_values directly
+        q_values = peak_results['q_values']
+    else:
+        # No valid peaks found
+        return None, np.array([])
+    
+    # Check if we have enough peaks
+    if len(q_values) < 2:
         return None, np.array([])
     
     # Sort q values (should already be sorted, but to be safe)
-    q_values = np.sort(peak_results['q_values'])
+    q_values = np.sort(q_values)
     
     # Calculate spacings between adjacent peaks
     spacings = np.diff(q_values)
@@ -2494,3 +3103,57 @@ def create_3D_parameter_plot(sweep_results: Dict[str, Any],
     plt.tight_layout()
     
     return fig, ax
+
+import numpy as np
+from typing import Tuple, Union, Dict
+
+def split_peak_data(peak_data: Union[np.ndarray, Dict]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Split a peak data array with [Q, Intensity, integrated_intensity] columns
+    into two separate arrays: [Q, Intensity] and [Q, integrated_intensity].
+    
+    Parameters:
+    -----------
+    peak_data : ndarray of shape (n, 3) or dict
+        Either:
+        - A numpy array with columns [Q, Intensity, integrated_intensity]
+        - A dictionary with a 'peaks' key containing such an array
+    
+    Returns:
+    --------
+    peak_heights : ndarray of shape (n, 2)
+        Array with columns [Q, Intensity] for peak heights
+    peak_integrals : ndarray of shape (n, 2)
+        Array with columns [Q, integrated_intensity] for integrated intensities
+    
+    Raises:
+    -------
+    ValueError
+        If input array doesn't have the expected shape
+    """
+    # Handle dictionary input (extract 'peaks' array)
+    if isinstance(peak_data, dict):
+        if 'peaks' in peak_data and isinstance(peak_data['peaks'], np.ndarray):
+            peak_array = peak_data['peaks']
+        else:
+            raise ValueError("Input dictionary must contain a 'peaks' key with a numpy array")
+    else:
+        peak_array = peak_data
+    
+    # Check input shape
+    if not isinstance(peak_array, np.ndarray):
+        raise ValueError("Input must be a numpy array or a dictionary containing a 'peaks' array")
+    
+    if peak_array.ndim != 2 or peak_array.shape[1] < 3:
+        raise ValueError(f"Input array must have shape (n, 3+), but got {peak_array.shape}")
+    
+    # Extract columns
+    q_values = peak_array[:, 0]
+    intensities = peak_array[:, 1]
+    integrated_intensities = peak_array[:, 2]
+    
+    # Create output arrays
+    peak_heights = np.column_stack((q_values, intensities))
+    peak_integrals = np.column_stack((q_values, integrated_intensities))
+    
+    return peak_heights, peak_integrals

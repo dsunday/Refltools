@@ -615,7 +615,7 @@ def print_fit_results(results_df, model_spec='recent', filter_parameters=None, s
 # Fitting and Optimization
 
 def run_fitting(objective, optimization_method='differential_evolution', 
-                opt_workers=8, opt_popsize=20, burn_samples=5, 
+                opt_workers=8, opt_popsize=50, burn_samples=5, 
                 production_samples=5, prod_steps=1, pool=16,
                 results_log=None, log_mcmc_stats=True,
                 save_dir=None, save_objective=False, save_results=False,
