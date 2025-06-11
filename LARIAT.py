@@ -1582,3 +1582,372 @@ class LariatDataProcessor:
         
         return organized_data, comparison_summary
 
+    def create_spectral_animation(self, spectrum_np=None, roi=None, output_filename='spectrum_animation.gif', 
+                                dpi=100, total_time=10.0, energy_range=None, contrast_percentiles=(5, 95)):
+        """
+        Create an animation showing the xarray data at each energy alongside the spectrum.
+        A vertical line moves through the spectrum to indicate the current energy.
+        
+        Parameters:
+        -----------
+        spectrum_np : numpy.ndarray, optional
+            2D numpy array with columns [Energy, Intensity] for the processed spectrum.
+            If None, will extract spectrum from the provided ROI or use the full average.
+        roi : tuple, optional
+            (x_min, y_min, width, height) defining the ROI to highlight in the image.
+            If spectrum_np is None, this ROI will be used to extract the spectrum.
+        output_filename : str, optional
+            Filename for the output animation (must end with .mp4 or .gif)
+        dpi : int, optional
+            Resolution of the animation in dots per inch
+        total_time : float, optional
+            Total duration of the animation in seconds. Default is 10.0 seconds.
+        energy_range : tuple, optional
+            (min_energy, max_energy) to limit the animation to a specific energy range
+        contrast_percentiles : tuple, optional
+            (low, high) percentiles for dynamic contrast adjustment. Default is (5, 95)
+            
+        Returns:
+        --------
+        animation : matplotlib.animation.Animation
+            The animation object (also saves the animation to the specified file if possible)
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+        from matplotlib.patches import Rectangle
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        # Extract spectrum if not provided
+        if spectrum_np is None:
+            if roi is not None:
+                print("Extracting spectrum from provided ROI...")
+                spectrum_xr, spectrum_np = self.extract_roi_spectrum(roi, plot=False)
+            else:
+                print("No spectrum or ROI provided. Using average spectrum from entire image...")
+                # Create a spectrum from the entire image
+                full_spectrum = self.data.mean(dim=['pix_x', 'pix_y'])
+                energy_values = full_spectrum.energy.values
+                intensity_values = full_spectrum.values
+                spectrum_np = np.column_stack((energy_values, intensity_values))
+        
+        # Filter data by energy range if specified
+        data_to_use = self.data
+        if energy_range is not None:
+            energy_mask = (data_to_use.energy >= energy_range[0]) & (data_to_use.energy <= energy_range[1])
+            data_to_use = data_to_use.isel(energy=energy_mask)
+            
+            # Also filter the spectrum
+            spec_energy_mask = (spectrum_np[:, 0] >= energy_range[0]) & (spectrum_np[:, 0] <= energy_range[1])
+            spectrum_np = spectrum_np[spec_energy_mask]
+            
+            print(f"Animation limited to energy range: {energy_range[0]:.2f} - {energy_range[1]:.2f} eV")
+        
+        # Extract energy values from filtered data
+        energies = data_to_use.energy.values
+        n_frames = len(energies)
+        
+        if n_frames == 0:
+            raise ValueError("No energy points found in the specified range.")
+        
+        # Calculate fps from total time and number of frames
+        fps = n_frames / total_time
+        interval_ms = 1000 / fps  # Convert to milliseconds for matplotlib
+        
+        print(f"Creating animation with {n_frames} frames over {total_time:.1f} seconds")
+        print(f"Calculated fps: {fps:.2f}, interval: {interval_ms:.1f} ms per frame")
+        print(f"Energy range: {energies[0]:.2f} to {energies[-1]:.2f} eV")
+        
+        # Set up the figure with two subplots
+        fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=(15, 5),
+                                            gridspec_kw={'width_ratios': [1, 2]})
+        
+        # Initialize the image plot
+        img_data = data_to_use.isel(energy=0)
+        img = ax_img.imshow(img_data, cmap='viridis', origin='lower')
+        img_title = ax_img.set_title(f'Energy: {energies[0]:.2f} eV')
+        plt.colorbar(img, ax=ax_img, label='Intensity')
+        ax_img.set_xlabel('Pixel X')
+        ax_img.set_ylabel('Pixel Y')
+        
+        # Add ROI rectangle if provided
+        roi_rect = None
+        if roi is not None:
+            x_min, y_min, width, height = roi
+            roi_rect = Rectangle((x_min, y_min), width, height, 
+                                edgecolor='red', facecolor='none', linewidth=2)
+            ax_img.add_patch(roi_rect)
+            ax_img.text(x_min + width/2, y_min + height + 2, 'ROI', 
+                    color='red', fontweight='bold', ha='center')
+        
+        # Plot the spectrum
+        ax_spec.plot(spectrum_np[:, 0], spectrum_np[:, 1], 'o-', markersize=3, linewidth=1)
+        ax_spec.set_xlabel('Energy (eV)')
+        ax_spec.set_ylabel('Intensity')
+        ax_spec.set_title('Spectrum')
+        ax_spec.grid(True, alpha=0.3)
+        
+        # Set spectrum plot limits
+        ax_spec.set_xlim(spectrum_np[0, 0] - 1, spectrum_np[-1, 0] + 1)
+        ax_spec.set_ylim(np.min(spectrum_np[:, 1]) * 0.95, np.max(spectrum_np[:, 1]) * 1.05)
+        
+        # Add a vertical line to indicate the current energy
+        energy_line = ax_spec.axvline(x=energies[0], color='red', linestyle='-', linewidth=2, alpha=0.8)
+        
+        # Add energy text and animation info on the spectrum plot
+        energy_text = ax_spec.text(0.02, 0.98, f'Current: {energies[0]:.2f} eV', 
+                                transform=ax_spec.transAxes, verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        time_text = ax_spec.text(0.02, 0.90, f'Time: {total_time:.1f}s | FPS: {fps:.1f}', 
+                                transform=ax_spec.transAxes, verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        
+        # Function to update the animation for each frame
+        def update_frame(frame):
+            # Update the image data
+            img_data = data_to_use.isel(energy=frame)
+            img.set_array(img_data)
+            
+            # Adjust contrast dynamically using percentiles
+            vmin, vmax = np.nanpercentile(img_data, contrast_percentiles)
+            img.set_clim(vmin, vmax)
+            
+            # Update the image title
+            current_energy = energies[frame]
+            img_title.set_text(f'Energy: {current_energy:.2f} eV')
+            
+            # Update the vertical line position
+            energy_line.set_xdata(current_energy)
+            
+            # Update energy text
+            energy_text.set_text(f'Current: {current_energy:.2f} eV')
+            
+            return img, img_title, energy_line, energy_text
+        
+        # Create the animation
+        anim = animation.FuncAnimation(fig, update_frame, frames=n_frames, 
+                                    interval=interval_ms, blit=True, repeat=True)
+        
+        # Try to save the animation with fallbacks
+        try:
+            # If output file is .mp4, try to save using FFmpeg
+            if output_filename.endswith('.mp4'):
+                try:
+                    from matplotlib.animation import FFMpegWriter
+                    writer = FFMpegWriter(fps=fps, bitrate=5000, codec='h264')
+                    anim.save(output_filename, writer=writer, dpi=dpi)
+                    print(f"Animation saved to {output_filename}")
+                except (FileNotFoundError, RuntimeError):
+                    print("FFmpeg not found or failed. Falling back to GIF format.")
+                    output_filename = output_filename.replace('.mp4', '.gif')
+                    from matplotlib.animation import PillowWriter
+                    writer = PillowWriter(fps=fps)
+                    anim.save(output_filename, writer=writer, dpi=dpi)
+                    print(f"Animation saved to {output_filename}")
+            
+            # If output file is .gif, use PillowWriter
+            elif output_filename.endswith('.gif'):
+                from matplotlib.animation import PillowWriter
+                writer = PillowWriter(fps=fps)
+                anim.save(output_filename, writer=writer, dpi=dpi)
+                print(f"Animation saved to {output_filename}")
+            
+            else:
+                print("Warning: Output filename must end with .mp4 or .gif. Saving as GIF.")
+                output_filename = output_filename.split('.')[0] + '.gif'
+                from matplotlib.animation import PillowWriter
+                writer = PillowWriter(fps=fps)
+                anim.save(output_filename, writer=writer, dpi=dpi)
+                print(f"Animation saved to {output_filename}")
+        
+        except Exception as e:
+            print(f"Error saving animation: {e}")
+            print("Returning animation object instead. Display it using: plt.show()")
+            print("In Jupyter notebooks, you can also use: HTML(anim.to_html5_video())")
+        
+        plt.tight_layout()
+        return anim
+
+
+    def create_roi_comparison_animation(self, roi_list, roi_labels=None, output_filename='roi_comparison_animation.gif',
+                                    dpi=100, total_time=12.0, energy_range=None, normalize_spectra=False,
+                                    contrast_percentiles=(5, 95)):
+        """
+        Create an animation comparing multiple ROIs, showing the image with all ROIs marked
+        and their corresponding spectra with moving energy indicators.
+        
+        Parameters:
+        -----------
+        roi_list : list of tuples
+            List of ROIs, each as (x_min, y_min, width, height)
+        roi_labels : list of str, optional
+            Labels for each ROI. If None, will use "ROI 1", "ROI 2", etc.
+        output_filename : str, optional
+            Filename for the output animation (must end with .mp4 or .gif)
+        dpi : int, optional
+            Resolution of the animation in dots per inch
+        total_time : float, optional
+            Total duration of the animation in seconds. Default is 12.0 seconds.
+        energy_range : tuple, optional
+            (min_energy, max_energy) to limit the animation to a specific energy range
+        normalize_spectra : bool, optional
+            If True, normalize all spectra to their maximum value for comparison
+        contrast_percentiles : tuple, optional
+            (low, high) percentiles for dynamic contrast adjustment
+            
+        Returns:
+        --------
+        animation : matplotlib.animation.Animation
+            The animation object
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+        from matplotlib.patches import Rectangle
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        if roi_labels is None:
+            roi_labels = [f"ROI {i+1}" for i in range(len(roi_list))]
+        
+        # Extract spectra for all ROIs
+        print("Extracting spectra from ROIs...")
+        spectra_dict = {}
+        for roi, label in zip(roi_list, roi_labels):
+            spectrum_xr, spectrum_np = self.extract_roi_spectrum(roi, plot=False)
+            if normalize_spectra:
+                max_intensity = np.max(spectrum_np[:, 1])
+                if max_intensity > 0:
+                    spectrum_np[:, 1] = spectrum_np[:, 1] / max_intensity
+            spectra_dict[label] = spectrum_np
+        
+        # Filter data by energy range if specified
+        data_to_use = self.data
+        if energy_range is not None:
+            energy_mask = (data_to_use.energy >= energy_range[0]) & (data_to_use.energy <= energy_range[1])
+            data_to_use = data_to_use.isel(energy=energy_mask)
+            print(f"Animation limited to energy range: {energy_range[0]:.2f} - {energy_range[1]:.2f} eV")
+        
+        energies = data_to_use.energy.values
+        n_frames = len(energies)
+        
+        # Calculate fps from total time and number of frames
+        fps = n_frames / total_time
+        interval_ms = 1000 / fps  # Convert to milliseconds for matplotlib
+        
+        print(f"Creating comparison animation with {n_frames} frames for {len(roi_list)} ROIs")
+        print(f"Total time: {total_time:.1f} seconds, calculated fps: {fps:.2f}")
+        
+        # Set up the figure
+        fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=(16, 6),
+                                            gridspec_kw={'width_ratios': [1, 2]})
+        
+        # Initialize the image plot
+        img_data = data_to_use.isel(energy=0)
+        img = ax_img.imshow(img_data, cmap='viridis', origin='lower')
+        img_title = ax_img.set_title(f'Energy: {energies[0]:.2f} eV')
+        plt.colorbar(img, ax=ax_img, label='Intensity')
+        ax_img.set_xlabel('Pixel X')
+        ax_img.set_ylabel('Pixel Y')
+        
+        # Add all ROI rectangles with different colors
+        colors = plt.cm.tab10(np.linspace(0, 1, len(roi_list)))
+        roi_patches = []
+        for i, (roi, label) in enumerate(zip(roi_list, roi_labels)):
+            x_min, y_min, width, height = roi
+            rect = Rectangle((x_min, y_min), width, height, 
+                            edgecolor=colors[i], facecolor='none', linewidth=2)
+            ax_img.add_patch(rect)
+            ax_img.text(x_min + width/2, y_min + height + 2, label, 
+                    color=colors[i], fontweight='bold', ha='center')
+            roi_patches.append(rect)
+        
+        # Plot all spectra
+        energy_lines = []
+        for i, (label, spectrum_data) in enumerate(spectra_dict.items()):
+            ax_spec.plot(spectrum_data[:, 0], spectrum_data[:, 1], 'o-', 
+                        color=colors[i], label=label, markersize=2, linewidth=1)
+            # Add vertical line for each spectrum
+            line = ax_spec.axvline(x=energies[0], color=colors[i], linestyle='-', 
+                                linewidth=2, alpha=0.8)
+            energy_lines.append(line)
+        
+        ax_spec.set_xlabel('Energy (eV)')
+        if normalize_spectra:
+            ax_spec.set_ylabel('Normalized Intensity')
+            ax_spec.set_title('Normalized Spectra Comparison')
+        else:
+            ax_spec.set_ylabel('Intensity')
+            ax_spec.set_title('Spectra Comparison')
+        ax_spec.legend(loc='upper right')
+        ax_spec.grid(True, alpha=0.3)
+        
+        # Add energy text and animation info
+        energy_text = ax_spec.text(0.02, 0.98, f'Current: {energies[0]:.2f} eV', 
+                                transform=ax_spec.transAxes, verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        time_text = ax_spec.text(0.02, 0.90, f'Time: {total_time:.1f}s | FPS: {fps:.1f}', 
+                                transform=ax_spec.transAxes, verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        
+        # Function to update the animation for each frame
+        def update_frame(frame):
+            # Update the image data
+            img_data = data_to_use.isel(energy=frame)
+            img.set_array(img_data)
+            
+            # Adjust contrast dynamically
+            vmin, vmax = np.nanpercentile(img_data, contrast_percentiles)
+            img.set_clim(vmin, vmax)
+            
+            # Update the image title
+            current_energy = energies[frame]
+            img_title.set_text(f'Energy: {current_energy:.2f} eV')
+            
+            # Update all vertical lines
+            for line in energy_lines:
+                line.set_xdata(current_energy)
+            
+            # Update energy text
+            energy_text.set_text(f'Current: {current_energy:.2f} eV')
+            
+            return [img, img_title, energy_text] + energy_lines
+        
+        # Create the animation
+        anim = animation.FuncAnimation(fig, update_frame, frames=n_frames, 
+                                    interval=interval_ms, blit=True, repeat=True)
+        
+        # Save the animation
+        try:
+            if output_filename.endswith('.mp4'):
+                try:
+                    from matplotlib.animation import FFMpegWriter
+                    writer = FFMpegWriter(fps=fps, bitrate=5000, codec='h264')
+                    anim.save(output_filename, writer=writer, dpi=dpi)
+                    print(f"ROI comparison animation saved to {output_filename}")
+                except (FileNotFoundError, RuntimeError):
+                    print("FFmpeg not found. Saving as GIF instead.")
+                    output_filename = output_filename.replace('.mp4', '.gif')
+                    from matplotlib.animation import PillowWriter
+                    writer = PillowWriter(fps=fps)
+                    anim.save(output_filename, writer=writer, dpi=dpi)
+                    print(f"ROI comparison animation saved to {output_filename}")
+            else:
+                from matplotlib.animation import PillowWriter
+                writer = PillowWriter(fps=fps)
+                anim.save(output_filename, writer=writer, dpi=dpi)
+                print(f"ROI comparison animation saved to {output_filename}")
+        
+        except Exception as e:
+            print(f"Error saving animation: {e}")
+            print("Returning animation object instead.")
+        
+        plt.tight_layout()
+        return anim
+
+
