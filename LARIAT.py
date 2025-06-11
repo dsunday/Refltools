@@ -1951,3 +1951,449 @@ class LariatDataProcessor:
         return anim
 
 
+
+    def generate_sensitivity_calibration(self, calibration_energy, normalization_method='min_pixel', 
+                                        normalization_pixel=None, exclude_zero=True, min_threshold=None,
+                                        plot=True, save_calibration=False, save_path=None, 
+                                        calibration_name='sensitivity_calibration'):
+        """
+        Generate an image sensitivity calibration from a specific energy slice.
+        
+        Parameters:
+        -----------
+        calibration_energy : float
+            Energy value to use for generating the calibration
+        normalization_method : str, optional
+            Method for normalization:
+            - 'min_pixel': Divide by the minimum intensity pixel (default)
+            - 'specific_pixel': Divide by a user-specified pixel location
+            - 'mean': Divide by the mean intensity of the image
+            - 'median': Divide by the median intensity of the image
+        normalization_pixel : tuple, optional
+            (x, y) coordinates of pixel to use for normalization when method is 'specific_pixel'
+        exclude_zero : bool, optional
+            If True, exclude zero/near-zero pixels from min calculation. Default is True.
+        min_threshold : float, optional
+            Minimum threshold for valid pixels. If None, uses 1% of max intensity.
+        plot : bool, optional
+            If True, plot the calibration image and statistics
+        save_calibration : bool, optional
+            If True, save the calibration to file
+        save_path : str, optional
+            Directory to save calibration files. If None, uses current directory.
+        calibration_name : str, optional
+            Base name for saved calibration files
+            
+        Returns:
+        --------
+        calibration_image : numpy.ndarray
+            2D array containing the sensitivity calibration factors
+        calibration_info : dict
+            Dictionary containing calibration metadata and statistics
+        """
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        # Find the closest energy to the requested calibration energy
+        energy_slice = self.data.sel(energy=calibration_energy, method='nearest')
+        actual_energy = float(energy_slice.energy.values)
+        
+        print(f"Generating sensitivity calibration from energy {actual_energy:.2f} eV")
+        print(f"(Requested: {calibration_energy:.2f} eV)")
+        
+        # Get the 2D image data
+        image_data = energy_slice.values.astype(float)
+        
+        # Handle zero/low intensity pixels
+        if min_threshold is None:
+            min_threshold = np.max(image_data) * 0.01  # 1% of max intensity
+        
+        if exclude_zero:
+            valid_mask = image_data > min_threshold
+            if not np.any(valid_mask):
+                raise ValueError(f"No pixels above threshold {min_threshold:.3f}. Try lowering min_threshold.")
+            print(f"Excluding {np.sum(~valid_mask)} pixels below threshold {min_threshold:.3f}")
+        else:
+            valid_mask = np.ones_like(image_data, dtype=bool)
+        
+        # Calculate normalization value based on method
+        if normalization_method == 'min_pixel':
+            if exclude_zero:
+                norm_value = np.min(image_data[valid_mask])
+            else:
+                norm_value = np.min(image_data)
+            norm_description = f"minimum pixel value: {norm_value:.3f}"
+            
+        elif normalization_method == 'specific_pixel':
+            if normalization_pixel is None:
+                raise ValueError("normalization_pixel must be specified when using 'specific_pixel' method")
+            x, y = normalization_pixel
+            if x < 0 or x >= image_data.shape[1] or y < 0 or y >= image_data.shape[0]:
+                raise ValueError(f"Pixel coordinates ({x}, {y}) are outside image bounds")
+            norm_value = image_data[y, x]
+            norm_description = f"pixel at ({x}, {y}): {norm_value:.3f}"
+            
+        elif normalization_method == 'mean':
+            if exclude_zero:
+                norm_value = np.mean(image_data[valid_mask])
+            else:
+                norm_value = np.mean(image_data)
+            norm_description = f"mean intensity: {norm_value:.3f}"
+            
+        elif normalization_method == 'median':
+            if exclude_zero:
+                norm_value = np.median(image_data[valid_mask])
+            else:
+                norm_value = np.median(image_data)
+            norm_description = f"median intensity: {norm_value:.3f}"
+            
+        else:
+            raise ValueError(f"Unknown normalization method: {normalization_method}")
+        
+        print(f"Normalizing by {norm_description}")
+        
+        # Generate calibration image
+        # Avoid division by zero
+        safe_image = np.where(image_data > min_threshold/10, image_data, min_threshold/10)
+        calibration_image = safe_image / norm_value
+        
+        # Handle invalid pixels
+        if exclude_zero:
+            calibration_image[~valid_mask] = 1.0  # Set invalid pixels to no correction
+        
+        # Calculate statistics
+        cal_stats = {
+            'mean': np.mean(calibration_image[valid_mask]),
+            'median': np.median(calibration_image[valid_mask]),
+            'std': np.std(calibration_image[valid_mask]),
+            'min': np.min(calibration_image[valid_mask]),
+            'max': np.max(calibration_image[valid_mask]),
+            'range': np.max(calibration_image[valid_mask]) - np.min(calibration_image[valid_mask])
+        }
+        
+        # Store calibration info
+        calibration_info = {
+            'calibration_energy': actual_energy,
+            'requested_energy': calibration_energy,
+            'normalization_method': normalization_method,
+            'normalization_value': norm_value,
+            'normalization_pixel': normalization_pixel,
+            'min_threshold': min_threshold,
+            'exclude_zero': exclude_zero,
+            'image_shape': image_data.shape,
+            'valid_pixels': np.sum(valid_mask),
+            'total_pixels': image_data.size,
+            'statistics': cal_stats
+        }
+        
+        print(f"Calibration statistics:")
+        print(f"  Valid pixels: {calibration_info['valid_pixels']:,} / {calibration_info['total_pixels']:,}")
+        print(f"  Mean correction factor: {cal_stats['mean']:.3f}")
+        print(f"  Correction range: {cal_stats['min']:.3f} - {cal_stats['max']:.3f}")
+        print(f"  Standard deviation: {cal_stats['std']:.3f}")
+        
+        # Plot calibration if requested
+        if plot:
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+            
+            # Original image
+            im1 = ax1.imshow(image_data, cmap='viridis', origin='lower')
+            ax1.set_title(f'Original Image\nEnergy: {actual_energy:.2f} eV')
+            ax1.set_xlabel('Pixel X')
+            ax1.set_ylabel('Pixel Y')
+            plt.colorbar(im1, ax=ax1, label='Intensity')
+            
+            # Mark normalization pixel if using specific pixel method
+            if normalization_method == 'specific_pixel':
+                ax1.plot(normalization_pixel[0], normalization_pixel[1], 'r+', 
+                        markersize=15, markeredgewidth=3, label='Norm pixel')
+                ax1.legend()
+            
+            # Calibration image
+            im2 = ax2.imshow(calibration_image, cmap='RdBu_r', origin='lower')
+            ax2.set_title('Sensitivity Calibration')
+            ax2.set_xlabel('Pixel X')
+            ax2.set_ylabel('Pixel Y')
+            plt.colorbar(im2, ax=ax2, label='Correction Factor')
+            
+            # Histogram of original intensities
+            ax3.hist(image_data[valid_mask].flatten(), bins=50, alpha=0.7, edgecolor='black')
+            ax3.axvline(norm_value, color='red', linestyle='--', linewidth=2, 
+                    label=f'Norm value: {norm_value:.3f}')
+            ax3.set_xlabel('Original Intensity')
+            ax3.set_ylabel('Pixel Count')
+            ax3.set_title('Original Intensity Distribution')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+            
+            # Histogram of calibration factors
+            ax4.hist(calibration_image[valid_mask].flatten(), bins=50, alpha=0.7, 
+                    edgecolor='black', color='orange')
+            ax4.axvline(1.0, color='red', linestyle='--', linewidth=2, label='No correction')
+            ax4.set_xlabel('Correction Factor')
+            ax4.set_ylabel('Pixel Count')
+            ax4.set_title('Correction Factor Distribution')
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Save calibration if requested
+        if save_calibration:
+            import os
+            if save_path is None:
+                save_path = os.getcwd()
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Save calibration image as numpy array
+            cal_filename = f"{calibration_name}.npz"
+            cal_filepath = os.path.join(save_path, cal_filename)
+            np.savez_compressed(cal_filepath,
+                            calibration_image=calibration_image,
+                            calibration_info=calibration_info,
+                            original_image=image_data)
+            
+            # Save calibration info as text
+            info_filename = f"{calibration_name}_info.txt"
+            info_filepath = os.path.join(save_path, info_filename)
+            with open(info_filepath, 'w') as f:
+                f.write("Image Sensitivity Calibration Information\n")
+                f.write("=" * 50 + "\n")
+                f.write(f"Calibration energy: {calibration_info['calibration_energy']:.3f} eV\n")
+                f.write(f"Requested energy: {calibration_info['requested_energy']:.3f} eV\n")
+                f.write(f"Normalization method: {calibration_info['normalization_method']}\n")
+                f.write(f"Normalization value: {calibration_info['normalization_value']:.6f}\n")
+                if calibration_info['normalization_pixel']:
+                    f.write(f"Normalization pixel: {calibration_info['normalization_pixel']}\n")
+                f.write(f"Minimum threshold: {calibration_info['min_threshold']:.6f}\n")
+                f.write(f"Exclude zero pixels: {calibration_info['exclude_zero']}\n")
+                f.write(f"Image shape: {calibration_info['image_shape']}\n")
+                f.write(f"Valid pixels: {calibration_info['valid_pixels']:,} / {calibration_info['total_pixels']:,}\n")
+                f.write("\nStatistics:\n")
+                for key, value in calibration_info['statistics'].items():
+                    f.write(f"  {key}: {value:.6f}\n")
+            
+            print(f"Calibration saved to {cal_filepath}")
+            print(f"Calibration info saved to {info_filepath}")
+        
+        return calibration_image, calibration_info
+
+
+    def apply_sensitivity_calibration(self, calibration_image=None, calibration_file=None, 
+                                    method='divide', invert_calibration=False):
+        """
+        Apply sensitivity calibration to all images in the dataset.
+        
+        Parameters:
+        -----------
+        calibration_image : numpy.ndarray, optional
+            2D calibration image to apply. Either this or calibration_file must be provided.
+        calibration_file : str, optional
+            Path to saved calibration file (.npz format). Either this or calibration_image must be provided.
+        method : str, optional
+            How to apply calibration:
+            - 'divide': Divide each image by calibration (default, removes sensitivity variations)
+            - 'multiply': Multiply each image by calibration
+        invert_calibration : bool, optional
+            If True, invert the calibration before applying (1/calibration). Default is False.
+            
+        Returns:
+        --------
+        None (modifies self.data in place)
+        calibration_info : dict
+            Information about the applied calibration
+        """
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        # Load calibration
+        if calibration_image is not None:
+            cal_image = calibration_image.copy()
+            cal_info = {'source': 'provided_array', 'method': method}
+            print("Using provided calibration image")
+        elif calibration_file is not None:
+            print(f"Loading calibration from {calibration_file}")
+            cal_data = np.load(calibration_file)
+            cal_image = cal_data['calibration_image']
+            if 'calibration_info' in cal_data:
+                cal_info = cal_data['calibration_info'].item()  # .item() converts numpy array back to dict
+                cal_info['source'] = calibration_file
+                cal_info['method'] = method
+            else:
+                cal_info = {'source': calibration_file, 'method': method}
+            print(f"Loaded calibration from energy {cal_info.get('calibration_energy', 'unknown'):.3f} eV")
+        else:
+            raise ValueError("Either calibration_image or calibration_file must be provided")
+        
+        # Check image dimensions
+        data_shape = self.data.isel(energy=0).shape
+        if cal_image.shape != data_shape:
+            raise ValueError(f"Calibration image shape {cal_image.shape} does not match "
+                            f"data image shape {data_shape}")
+        
+        # Invert calibration if requested
+        if invert_calibration:
+            # Avoid division by zero
+            cal_image = np.where(np.abs(cal_image) > 1e-10, 1.0 / cal_image, 1.0)
+            print("Applied calibration inversion")
+        
+        # Apply calibration to all energy slices
+        print(f"Applying sensitivity calibration to {len(self.data.energy)} energy slices...")
+        
+        if method == 'divide':
+            # Avoid division by zero
+            safe_cal = np.where(np.abs(cal_image) > 1e-10, cal_image, 1.0)
+            corrected_data = self.data / safe_cal
+            print("Applied calibration by division (removing sensitivity variations)")
+        elif method == 'multiply':
+            corrected_data = self.data * cal_image
+            print("Applied calibration by multiplication")
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'divide' or 'multiply'.")
+        
+        # Update the data
+        self.data = corrected_data
+        
+        # Update attributes
+        if not hasattr(self.data, 'attrs'):
+            self.data.attrs = {}
+        self.data.attrs['sensitivity_calibration_applied'] = True
+        self.data.attrs['calibration_method'] = method
+        self.data.attrs['calibration_inverted'] = invert_calibration
+        if 'calibration_energy' in cal_info:
+            self.data.attrs['calibration_energy'] = cal_info['calibration_energy']
+        
+        print("Sensitivity calibration applied successfully")
+        
+        return cal_info
+
+
+    def load_sensitivity_calibration(self, calibration_file):
+        """
+        Load a sensitivity calibration from file without applying it.
+        
+        Parameters:
+        -----------
+        calibration_file : str
+            Path to saved calibration file (.npz format)
+            
+        Returns:
+        --------
+        calibration_image : numpy.ndarray
+            2D calibration image
+        calibration_info : dict
+            Calibration metadata and statistics
+        """
+        print(f"Loading calibration from {calibration_file}")
+        cal_data = np.load(calibration_file)
+        calibration_image = cal_data['calibration_image']
+        
+        if 'calibration_info' in cal_data:
+            calibration_info = cal_data['calibration_info'].item()
+            print(f"Calibration from energy {calibration_info.get('calibration_energy', 'unknown'):.3f} eV")
+            print(f"Normalization method: {calibration_info.get('normalization_method', 'unknown')}")
+            print(f"Image shape: {calibration_info.get('image_shape', 'unknown')}")
+        else:
+            calibration_info = {'source': calibration_file}
+            print("Limited calibration information available")
+        
+        return calibration_image, calibration_info
+
+
+    def preview_sensitivity_calibration(self, calibration_image=None, calibration_file=None, 
+                                    preview_energy=None, method='divide', invert_calibration=False):
+        """
+        Preview the effect of sensitivity calibration on a specific energy slice.
+        
+        Parameters:
+        -----------
+        calibration_image : numpy.ndarray, optional
+            2D calibration image. Either this or calibration_file must be provided.
+        calibration_file : str, optional
+            Path to saved calibration file (.npz format)
+        preview_energy : float, optional
+            Energy to use for preview. If None, uses the middle energy of the dataset.
+        method : str, optional
+            How calibration would be applied ('divide' or 'multiply')
+        invert_calibration : bool, optional
+            Whether to invert calibration before applying
+            
+        Returns:
+        --------
+        None (creates comparison plot)
+        """
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        # Load calibration
+        if calibration_image is not None:
+            cal_image = calibration_image.copy()
+            print("Using provided calibration image")
+        elif calibration_file is not None:
+            cal_image, cal_info = self.load_sensitivity_calibration(calibration_file)
+            print(f"Loaded calibration for preview")
+        else:
+            raise ValueError("Either calibration_image or calibration_file must be provided")
+        
+        # Select preview energy
+        if preview_energy is None:
+            mid_idx = len(self.data.energy) // 2
+            preview_energy = float(self.data.energy.isel(energy=mid_idx).values)
+        
+        # Get original image
+        original_slice = self.data.sel(energy=preview_energy, method='nearest')
+        original_image = original_slice.values
+        actual_energy = float(original_slice.energy.values)
+        
+        # Apply calibration for preview
+        if invert_calibration:
+            cal_preview = np.where(np.abs(cal_image) > 1e-10, 1.0 / cal_image, 1.0)
+        else:
+            cal_preview = cal_image
+        
+        if method == 'divide':
+            safe_cal = np.where(np.abs(cal_preview) > 1e-10, cal_preview, 1.0)
+            corrected_image = original_image / safe_cal
+        else:  # multiply
+            corrected_image = original_image * cal_preview
+        
+        # Create comparison plot
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # Original image
+        im1 = ax1.imshow(original_image, cmap='viridis', origin='lower')
+        ax1.set_title(f'Original Image\nEnergy: {actual_energy:.2f} eV')
+        plt.colorbar(im1, ax=ax1, label='Intensity')
+        
+        # Calibration image
+        im2 = ax2.imshow(cal_preview, cmap='RdBu_r', origin='lower')
+        cal_title = 'Calibration'
+        if invert_calibration:
+            cal_title += ' (Inverted)'
+        ax2.set_title(cal_title)
+        plt.colorbar(im2, ax=ax2, label='Correction Factor')
+        
+        # Corrected image
+        im3 = ax3.imshow(corrected_image, cmap='viridis', origin='lower')
+        ax3.set_title(f'After Calibration ({method})')
+        plt.colorbar(im3, ax=ax3, label='Corrected Intensity')
+        
+        # Difference image
+        difference = corrected_image - original_image
+        im4 = ax4.imshow(difference, cmap='RdBu_r', origin='lower')
+        ax4.set_title('Difference (After - Before)')
+        plt.colorbar(im4, ax=ax4, label='Intensity Change')
+        
+        for ax in [ax1, ax2, ax3, ax4]:
+            ax.set_xlabel('Pixel X')
+            ax.set_ylabel('Pixel Y')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print statistics
+        print(f"\nPreview Statistics for Energy {actual_energy:.2f} eV:")
+        print(f"Original image - Mean: {np.mean(original_image):.3f}, Std: {np.std(original_image):.3f}")
+        print(f"Corrected image - Mean: {np.mean(corrected_image):.3f}, Std: {np.std(corrected_image):.3f}")
+        print(f"Relative change in std: {(np.std(corrected_image) / np.std(original_image) - 1) * 100:.1f}%")
