@@ -2094,7 +2094,7 @@ class LariatDataProcessor:
         
         # Plot calibration if requested
         if plot:
-            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
             
             # Original image
             im1 = ax1.imshow(image_data, cmap='viridis', origin='lower')
@@ -2110,31 +2110,57 @@ class LariatDataProcessor:
                 ax1.legend()
             
             # Calibration image
-            im2 = ax2.imshow(calibration_image, cmap='RdBu_r', origin='lower')
-            ax2.set_title('Sensitivity Calibration')
+            im2 = ax2.imshow(calibration_image, cmap='RdBu_r', origin='lower', vmin=0.5, vmax=1.5)
+            ax2.set_title('Sensitivity Calibration\n(Correction Factors)')
             ax2.set_xlabel('Pixel X')
             ax2.set_ylabel('Pixel Y')
             plt.colorbar(im2, ax=ax2, label='Correction Factor')
             
-            # Histogram of original intensities
-            ax3.hist(image_data[valid_mask].flatten(), bins=50, alpha=0.7, edgecolor='black')
-            ax3.axvline(norm_value, color='red', linestyle='--', linewidth=2, 
-                    label=f'Norm value: {norm_value:.3f}')
-            ax3.set_xlabel('Original Intensity')
-            ax3.set_ylabel('Pixel Count')
-            ax3.set_title('Original Intensity Distribution')
-            ax3.legend()
+            # Line profiles through the center
+            center_y = image_data.shape[0] // 2
+            center_x = image_data.shape[1] // 2
+            
+            # Horizontal line profile
+            ax3.plot(image_data[center_y, :], 'b-', linewidth=2, label='Original')
+            ax3_twin = ax3.twinx()
+            ax3_twin.plot(calibration_image[center_y, :], 'r-', linewidth=2, label='Correction')
+            ax3.set_xlabel('Pixel X')
+            ax3.set_ylabel('Original Intensity', color='b')
+            ax3_twin.set_ylabel('Correction Factor', color='r')
+            ax3.set_title(f'Horizontal Profile (Y = {center_y})')
             ax3.grid(True, alpha=0.3)
             
-            # Histogram of calibration factors
-            ax4.hist(calibration_image[valid_mask].flatten(), bins=50, alpha=0.7, 
-                    edgecolor='black', color='orange')
-            ax4.axvline(1.0, color='red', linestyle='--', linewidth=2, label='No correction')
-            ax4.set_xlabel('Correction Factor')
-            ax4.set_ylabel('Pixel Count')
-            ax4.set_title('Correction Factor Distribution')
-            ax4.legend()
+            # Add legends
+            lines1, labels1 = ax3.get_legend_handles_labels()
+            lines2, labels2 = ax3_twin.get_legend_handles_labels()
+            ax3.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+            
+            # Vertical line profile
+            ax4.plot(image_data[:, center_x], 'b-', linewidth=2, label='Original')
+            ax4_twin = ax4.twinx()
+            ax4_twin.plot(calibration_image[:, center_x], 'r-', linewidth=2, label='Correction')
+            ax4.set_xlabel('Pixel Y')
+            ax4.set_ylabel('Original Intensity', color='b')
+            ax4_twin.set_ylabel('Correction Factor', color='r')
+            ax4.set_title(f'Vertical Profile (X = {center_x})')
             ax4.grid(True, alpha=0.3)
+            
+            # Add legends
+            lines1, labels1 = ax4.get_legend_handles_labels()
+            lines2, labels2 = ax4_twin.get_legend_handles_labels()
+            ax4.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+            
+            # Add text box with statistics
+            stats_text = f"""Calibration Statistics:
+    Mean factor: {cal_stats['mean']:.3f}
+    Std dev: {cal_stats['std']:.3f}
+    Range: {cal_stats['min']:.3f} - {cal_stats['max']:.3f}
+    Valid pixels: {calibration_info['valid_pixels']:,}"""
+            
+            # Add text box to the calibration image
+            ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes, 
+                    verticalalignment='top', bbox=dict(boxstyle='round', 
+                    facecolor='white', alpha=0.8), fontsize=9)
             
             plt.tight_layout()
             plt.show()
@@ -2397,3 +2423,354 @@ class LariatDataProcessor:
         print(f"Original image - Mean: {np.mean(original_image):.3f}, Std: {np.std(original_image):.3f}")
         print(f"Corrected image - Mean: {np.mean(corrected_image):.3f}, Std: {np.std(corrected_image):.3f}")
         print(f"Relative change in std: {(np.std(corrected_image) / np.std(original_image) - 1) * 100:.1f}%")
+
+
+
+    def save_2d_images_at_energies(self, save_energies, save_path=None, 
+                                image_format='png', image_dpi=300, image_cmap='viridis', 
+                                contrast_percentiles=(2, 98), roi_list=None, roi_labels=None,
+                                add_roi_overlays=True, add_scalebar=False, 
+                                scalebar_length_um=None, pixel_size_um=None,
+                                filename_prefix='image', include_energy_in_filename=True,
+                                save_colorbar=True, figsize=(8, 6)):
+        """
+        Save 2D images from the datacube at specified energy values.
+        
+        Parameters:
+        -----------
+        save_energies : list of float
+            List of energy values where 2D images should be saved
+        save_path : str, optional
+            Directory path to save images. If None, saves to current directory
+        image_format : str, optional
+            Format to save images ('png', 'tiff', 'pdf', 'svg', 'jpg'). Default is 'png'
+        image_dpi : int, optional
+            DPI for saved images. Default is 300 for publication quality
+        image_cmap : str, optional
+            Colormap for 2D images. Default is 'viridis'
+        contrast_percentiles : tuple, optional
+            (low, high) percentiles for image contrast adjustment. Default is (2, 98)
+        roi_list : list of tuples, optional
+            List of ROIs to overlay as (x_min, y_min, width, height). If None, no ROIs shown.
+        roi_labels : list of str, optional
+            Labels for each ROI. If None, will use "ROI 1", "ROI 2", etc.
+        add_roi_overlays : bool, optional
+            If True and roi_list provided, save additional versions with ROI overlays
+        add_scalebar : bool, optional
+            If True, add scale bar to images (requires pixel_size_um and scalebar_length_um)
+        scalebar_length_um : float, optional
+            Length of scale bar in micrometers
+        pixel_size_um : float, optional
+            Size of each pixel in micrometers (needed for scale bar)
+        filename_prefix : str, optional
+            Prefix for saved filenames. Default is 'image'
+        include_energy_in_filename : bool, optional
+            If True, include energy value in filename. Default is True
+        save_colorbar : bool, optional
+            If True, save images with colorbar. Default is True
+        figsize : tuple, optional
+            Figure size as (width, height) in inches. Default is (8, 6)
+            
+        Returns:
+        --------
+        saved_files : list
+            List of saved file paths
+        image_info : dict
+            Dictionary with information about each saved image
+        """
+        import os
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+        from matplotlib_scalebar.scalebar import ScaleBar
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        # Set up save directory
+        if save_path is None:
+            save_path = os.getcwd()
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Prepare ROI information
+        if roi_list is not None:
+            if roi_labels is None:
+                roi_labels = [f"ROI {i+1}" for i in range(len(roi_list))]
+            if len(roi_labels) != len(roi_list):
+                raise ValueError("Number of ROI labels must match number of ROIs")
+            colors = plt.cm.tab10(np.linspace(0, 1, len(roi_list)))
+        
+        saved_files = []
+        image_info = {}
+        
+        print(f"Saving 2D images at {len(save_energies)} energy points to {save_path}")
+        
+        for energy in save_energies:
+            # Get the closest energy slice
+            energy_slice = self.data.sel(energy=energy, method='nearest')
+            actual_energy = float(energy_slice.energy.values)
+            image_data = energy_slice.values
+            
+            print(f"Processing energy {actual_energy:.2f} eV (requested: {energy:.2f} eV)")
+            
+            # Calculate contrast limits
+            vmin, vmax = np.nanpercentile(image_data, contrast_percentiles)
+            
+            # Create filename
+            if include_energy_in_filename:
+                clean_energy = f"{actual_energy:.2f}".replace('.', 'p')
+                base_filename = f"{filename_prefix}_{clean_energy}eV"
+            else:
+                base_filename = f"{filename_prefix}_{len(saved_files)+1:03d}"
+            
+            # Save main image without ROIs
+            fig, ax = plt.subplots(figsize=figsize)
+            
+            im = ax.imshow(image_data, cmap=image_cmap, origin='lower', vmin=vmin, vmax=vmax)
+            ax.set_title(f'Energy: {actual_energy:.2f} eV')
+            ax.set_xlabel('Pixel X')
+            ax.set_ylabel('Pixel Y')
+            
+            # Add colorbar if requested
+            if save_colorbar:
+                cbar = plt.colorbar(im, ax=ax, label='Intensity')
+            
+            # Add scale bar if requested
+            if add_scalebar and pixel_size_um is not None and scalebar_length_um is not None:
+                scalebar = ScaleBar(pixel_size_um * 1e-6, units='m', 
+                                length_fraction=scalebar_length_um/pixel_size_um/image_data.shape[1],
+                                location='lower right', box_alpha=0.8, color='white')
+                ax.add_artist(scalebar)
+            
+            plt.tight_layout()
+            
+            # Save main image
+            main_filename = f"{base_filename}.{image_format}"
+            main_filepath = os.path.join(save_path, main_filename)
+            plt.savefig(main_filepath, dpi=image_dpi, bbox_inches='tight', 
+                    facecolor='white', edgecolor='none')
+            saved_files.append(main_filepath)
+            
+            plt.close()
+            
+            # Save image with ROI overlays if requested
+            if add_roi_overlays and roi_list is not None:
+                fig, ax = plt.subplots(figsize=figsize)
+                
+                im = ax.imshow(image_data, cmap=image_cmap, origin='lower', vmin=vmin, vmax=vmax)
+                ax.set_title(f'Energy: {actual_energy:.2f} eV (with ROIs)')
+                ax.set_xlabel('Pixel X')
+                ax.set_ylabel('Pixel Y')
+                
+                # Add ROI rectangles
+                for i, (roi, label) in enumerate(zip(roi_list, roi_labels)):
+                    x_min, y_min, width, height = roi
+                    rect = Rectangle((x_min, y_min), width, height, 
+                                edgecolor=colors[i], facecolor='none', linewidth=2)
+                    ax.add_patch(rect)
+                    # Add label
+                    ax.text(x_min + width/2, y_min + height + 2, label, 
+                        color=colors[i], fontweight='bold', ha='center',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+                
+                # Add colorbar if requested
+                if save_colorbar:
+                    cbar = plt.colorbar(im, ax=ax, label='Intensity')
+                
+                # Add scale bar if requested
+                if add_scalebar and pixel_size_um is not None and scalebar_length_um is not None:
+                    scalebar = ScaleBar(pixel_size_um * 1e-6, units='m', 
+                                    length_fraction=scalebar_length_um/pixel_size_um/image_data.shape[1],
+                                    location='lower right', box_alpha=0.8, color='white')
+                    ax.add_artist(scalebar)
+                
+                plt.tight_layout()
+                
+                # Save ROI overlay image
+                roi_filename = f"{base_filename}_with_ROIs.{image_format}"
+                roi_filepath = os.path.join(save_path, roi_filename)
+                plt.savefig(roi_filepath, dpi=image_dpi, bbox_inches='tight', 
+                        facecolor='white', edgecolor='none')
+                saved_files.append(roi_filepath)
+                
+                plt.close()
+            
+            # Store image information
+            image_info[actual_energy] = {
+                'requested_energy': energy,
+                'actual_energy': actual_energy,
+                'image_shape': image_data.shape,
+                'intensity_range': (np.nanmin(image_data), np.nanmax(image_data)),
+                'contrast_range': (vmin, vmax),
+                'main_file': main_filename,
+                'roi_file': f"{base_filename}_with_ROIs.{image_format}" if add_roi_overlays and roi_list else None
+            }
+        
+        print(f"\nSaved {len(saved_files)} images:")
+        for file_path in saved_files:
+            print(f"  - {os.path.basename(file_path)}")
+        
+        # Save summary information
+        summary_filename = f"{filename_prefix}_summary.txt"
+        summary_filepath = os.path.join(save_path, summary_filename)
+        with open(summary_filepath, 'w') as f:
+            f.write("2D Image Export Summary\n")
+            f.write("=" * 30 + "\n")
+            f.write(f"Total images saved: {len(saved_files)}\n")
+            f.write(f"Image format: {image_format.upper()}\n")
+            f.write(f"Image DPI: {image_dpi}\n")
+            f.write(f"Colormap: {image_cmap}\n")
+            f.write(f"Contrast percentiles: {contrast_percentiles}\n")
+            f.write(f"Figure size: {figsize}\n")
+            if roi_list:
+                f.write(f"ROI overlays: {add_roi_overlays}\n")
+                f.write(f"Number of ROIs: {len(roi_list)}\n")
+            if add_scalebar:
+                f.write(f"Scale bar: {scalebar_length_um} μm\n")
+                f.write(f"Pixel size: {pixel_size_um} μm\n")
+            f.write("\nEnergy Points:\n")
+            for energy, info in image_info.items():
+                f.write(f"  {energy:.2f} eV (requested: {info['requested_energy']:.2f} eV)\n")
+                f.write(f"    Files: {info['main_file']}")
+                if info['roi_file']:
+                    f.write(f", {info['roi_file']}")
+                f.write(f"\n    Intensity range: {info['intensity_range'][0]:.2e} - {info['intensity_range'][1]:.2e}\n")
+                f.write(f"    Contrast range: {info['contrast_range'][0]:.2e} - {info['contrast_range'][1]:.2e}\n")
+        
+        saved_files.append(summary_filepath)
+        print(f"  - {os.path.basename(summary_filepath)} (summary)")
+        
+        return saved_files, image_info
+
+
+    def save_energy_series_comparison(self, save_energies, save_path=None, 
+                                    image_format='png', image_dpi=300, image_cmap='viridis',
+                                    contrast_method='individual', contrast_percentiles=(2, 98),
+                                    roi_list=None, roi_labels=None, figsize=(15, 10),
+                                    filename='energy_series_comparison'):
+        """
+        Save a single figure showing multiple energy slices in a grid for easy comparison.
+        
+        Parameters:
+        -----------
+        save_energies : list of float
+            List of energy values to include in the comparison
+        save_path : str, optional
+            Directory path to save the comparison image
+        image_format : str, optional
+            Format to save image ('png', 'pdf', 'svg'). Default is 'png'
+        image_dpi : int, optional
+            DPI for saved image. Default is 300
+        image_cmap : str, optional
+            Colormap for images. Default is 'viridis'
+        contrast_method : str, optional
+            How to set contrast: 'individual' (per image) or 'global' (same for all)
+        contrast_percentiles : tuple, optional
+            Percentiles for contrast adjustment. Default is (2, 98)
+        roi_list : list of tuples, optional
+            List of ROIs to overlay
+        roi_labels : list of str, optional
+            Labels for ROIs
+        figsize : tuple, optional
+            Figure size as (width, height). Default is (15, 10)
+        filename : str, optional
+            Base filename for saved comparison
+            
+        Returns:
+        --------
+        saved_file : str
+            Path to saved comparison image
+        """
+        import os
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        if save_path is None:
+            save_path = os.getcwd()
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Calculate grid dimensions
+        n_images = len(save_energies)
+        n_cols = int(np.ceil(np.sqrt(n_images)))
+        n_rows = int(np.ceil(n_images / n_cols))
+        
+        # Prepare data for all energies
+        energy_data = []
+        actual_energies = []
+        
+        for energy in save_energies:
+            energy_slice = self.data.sel(energy=energy, method='nearest')
+            actual_energy = float(energy_slice.energy.values)
+            image_data = energy_slice.values
+            energy_data.append(image_data)
+            actual_energies.append(actual_energy)
+        
+        # Calculate contrast limits
+        if contrast_method == 'global':
+            all_data = np.concatenate([img.flatten() for img in energy_data])
+            vmin, vmax = np.nanpercentile(all_data, contrast_percentiles)
+            contrast_limits = [(vmin, vmax)] * n_images
+        else:  # individual
+            contrast_limits = []
+            for img in energy_data:
+                vmin, vmax = np.nanpercentile(img, contrast_percentiles)
+                contrast_limits.append((vmin, vmax))
+        
+        # Create comparison figure
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+        if n_images == 1:
+            axes = [axes]
+        elif n_rows == 1 or n_cols == 1:
+            axes = axes.flatten()
+        else:
+            axes = axes.flatten()
+        
+        # Prepare ROI colors if needed
+        if roi_list is not None:
+            if roi_labels is None:
+                roi_labels = [f"ROI {i+1}" for i in range(len(roi_list))]
+            colors = plt.cm.tab10(np.linspace(0, 1, len(roi_list)))
+        
+        # Plot each energy slice
+        for i, (img_data, actual_energy, (vmin, vmax)) in enumerate(zip(energy_data, actual_energies, contrast_limits)):
+            ax = axes[i]
+            
+            im = ax.imshow(img_data, cmap=image_cmap, origin='lower', vmin=vmin, vmax=vmax)
+            ax.set_title(f'{actual_energy:.2f} eV', fontsize=12)
+            ax.set_xlabel('Pixel X')
+            ax.set_ylabel('Pixel Y')
+            
+            # Add ROIs if provided
+            if roi_list is not None:
+                for j, (roi, label) in enumerate(zip(roi_list, roi_labels)):
+                    x_min, y_min, width, height = roi
+                    rect = Rectangle((x_min, y_min), width, height, 
+                                edgecolor=colors[j], facecolor='none', linewidth=1.5)
+                    ax.add_patch(rect)
+                    # Add label only to first image to avoid clutter
+                    if i == 0:
+                        ax.text(x_min + width/2, y_min + height + 2, label, 
+                            color=colors[j], fontweight='bold', ha='center', fontsize=10)
+            
+            # Add individual colorbar for each subplot
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Intensity')
+        
+        # Hide unused subplots
+        for i in range(n_images, len(axes)):
+            axes[i].set_visible(False)
+        
+        plt.suptitle(f'Energy Series Comparison ({len(save_energies)} energies)', fontsize=16)
+        plt.tight_layout()
+        
+        # Save the comparison
+        comparison_filename = f"{filename}.{image_format}"
+        comparison_filepath = os.path.join(save_path, comparison_filename)
+        plt.savefig(comparison_filepath, dpi=image_dpi, bbox_inches='tight', 
+                facecolor='white', edgecolor='none')
+        plt.close()
+        
+        print(f"Energy series comparison saved to {comparison_filepath}")
+        
+        return comparison_filepath
