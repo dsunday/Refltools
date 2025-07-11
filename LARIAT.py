@@ -14,7 +14,7 @@ class LariatDataProcessor:
     A class for processing Lariat datacube files and extracting/analyzing spectra.
     """
     
-    def __init__(self, filepath=None):
+    def __init__(self, filepath=None, pixel_size_um=50.0):
         """
         Initialize the LariatDataProcessor.
         
@@ -22,13 +22,84 @@ class LariatDataProcessor:
         -----------
         filepath : str, optional
             Path to the HDF5 file to load immediately
+        pixel_size_um : float, optional
+            Size of each pixel in micrometers. Default is 50.0 um
         """
         self.data = None
         self.metadata = None
         self.filepath = filepath
+        self.pixel_size_um = pixel_size_um  # Add pixel size parameter
         
         if filepath is not None:
             self.load_data(filepath)
+    
+    def set_pixel_size(self, pixel_size_um):
+        """
+        Set or update the pixel size in micrometers.
+        
+        Parameters:
+        -----------
+        pixel_size_um : float
+            Size of each pixel in micrometers
+        """
+        self.pixel_size_um = pixel_size_um
+        print(f"Pixel size set to {pixel_size_um} μm")
+
+    def pixels_to_um(self, pixel_coords):
+        """
+        Convert pixel coordinates to micrometers.
+        
+        Parameters:
+        -----------
+        pixel_coords : array-like
+            Pixel coordinates to convert
+            
+        Returns:
+        --------
+        um_coords : array-like
+            Coordinates in micrometers
+        """
+        return np.array(pixel_coords) * self.pixel_size_um
+
+    def um_to_pixels(self, um_coords):
+        """
+        Convert micrometer coordinates to pixels.
+        
+        Parameters:
+        -----------
+        um_coords : array-like
+            Coordinates in micrometers
+            
+        Returns:
+        --------
+        pixel_coords : array-like
+            Pixel coordinates
+        """
+        return np.array(um_coords) / self.pixel_size_um
+
+    def get_extent_um(self, image_shape=None):
+        """
+        Get the extent of the image in micrometers for matplotlib plotting.
+        
+        Parameters:
+        -----------
+        image_shape : tuple, optional
+            (height, width) of the image. If None, uses self.data shape
+            
+        Returns:
+        --------
+        extent : tuple
+            (left, right, bottom, top) in micrometers for matplotlib extent
+        """
+        if image_shape is None:
+            if self.data is None:
+                raise ValueError("No data loaded and no image_shape provided")
+            image_shape = self.data.isel(energy=0).shape
+        
+        height, width = image_shape
+        # extent = [left, right, bottom, top]
+        extent = [0, width * self.pixel_size_um, 0, height * self.pixel_size_um]
+        return extent
     
     def load_data(self, filepath):
         """
@@ -121,7 +192,7 @@ class LariatDataProcessor:
             for key in obj.keys():
                 self.print_structure(name + "/" + key, obj[key])
     
-    def plot_energy_slice(self, energy_value):
+    def plot_energy_slice(self, energy_value, use_um=True):
         """
         Plot a 2D image slice of the data at a specific energy value.
         
@@ -129,6 +200,8 @@ class LariatDataProcessor:
         -----------
         energy_value : float
             The energy value to select for plotting
+        use_um : bool, optional
+            If True, display coordinates in micrometers. If False, use pixels.
         
         Returns:
         --------
@@ -142,12 +215,23 @@ class LariatDataProcessor:
         
         # Create plot
         fig, ax = plt.subplots(figsize=(8, 6))
-        im = slice_data.plot(ax=ax, cmap='viridis')
-        ax.set_title(f'Energy = {slice_data.energy.values:.2f}')
+        
+        if use_um:
+            extent = self.get_extent_um(slice_data.shape)
+            im = ax.imshow(slice_data, cmap='viridis', origin='lower', extent=extent)
+            ax.set_xlabel('X (μm)')
+            ax.set_ylabel('Y (μm)')
+        else:
+            im = ax.imshow(slice_data, cmap='viridis', origin='lower')
+            ax.set_xlabel('Pixel X')
+            ax.set_ylabel('Pixel Y')
+        
+        ax.set_title(f'Energy = {slice_data.energy.values:.2f} eV')
+        plt.colorbar(im, ax=ax, label='Intensity')
         
         return fig, ax
     
-    def plot_with_roi(self, energy_value, roi=None):
+    def plot_with_roi(self, energy_value, roi=None, use_um=True, roi_in_um=False):
         """
         Plot a 2D image slice with an optional ROI box.
         
@@ -156,39 +240,63 @@ class LariatDataProcessor:
         energy_value : float
             The energy value to select for plotting
         roi : tuple, optional
-            (x_min, y_min, width, height) defining the ROI
+            ROI definition. Format depends on roi_in_um parameter.
+        use_um : bool, optional
+            If True, display coordinates in micrometers
+        roi_in_um : bool, optional
+            If True, roi is specified in micrometers. If False, in pixels.
         
         Returns:
         --------
         fig, ax : matplotlib figure and axis objects
         """
-        fig, ax = self.plot_energy_slice(energy_value)
+        fig, ax = self.plot_energy_slice(energy_value, use_um=use_um)
         
         # Add ROI box if provided
         if roi is not None:
             x_min, y_min, width, height = roi
+            
+            # Convert ROI to display coordinates if needed
+            if roi_in_um and not use_um:
+                # ROI in um, display in pixels
+                x_min = self.um_to_pixels(x_min)
+                y_min = self.um_to_pixels(y_min)
+                width = self.um_to_pixels(width)
+                height = self.um_to_pixels(height)
+            elif not roi_in_um and use_um:
+                # ROI in pixels, display in um
+                x_min = self.pixels_to_um(x_min)
+                y_min = self.pixels_to_um(y_min)
+                width = self.pixels_to_um(width)
+                height = self.pixels_to_um(height)
+            
             rect = Rectangle((x_min, y_min), width, height, 
-                             edgecolor='red', facecolor='none', linewidth=2)
+                            edgecolor='red', facecolor='none', linewidth=2)
             ax.add_patch(rect)
             
             # Annotate the ROI
-            ax.text(x_min + width/2, y_min + height + 2, 'ROI', 
+            ax.text(x_min + width/2, y_min + height + (5 if use_um else 2), 'ROI', 
                     color='red', fontweight='bold', ha='center')
         
         return fig, ax
     
-    def extract_roi_spectrum(self, roi, plot=False, energy_slice=None):
+    def extract_roi_spectrum(self, roi, plot=False, energy_slice=None, use_um=True, roi_in_um=False):
         """
         Extract the average spectrum from a region of interest and optionally plot it.
         
         Parameters:
         -----------
         roi : tuple
-            (x_min, y_min, width, height) defining the ROI
+            ROI definition as (x_min, y_min, width, height).
+            Units depend on roi_in_um parameter.
         plot : bool, optional
             If True, plot the extracted spectrum
         energy_slice : float, optional
             If provided, also shows the 2D image at this energy with the ROI
+        use_um : bool, optional
+            If True, display image coordinates in micrometers
+        roi_in_um : bool, optional
+            If True, roi is specified in micrometers. If False, in pixels.
             
         Returns:
         --------
@@ -200,7 +308,20 @@ class LariatDataProcessor:
         if self.data is None:
             raise ValueError("No data loaded. Please load data first using load_data().")
         
-        x_min, y_min, width, height = roi
+        # Convert ROI to pixels if specified in micrometers
+        if roi_in_um:
+            x_min_um, y_min_um, width_um, height_um = roi
+            x_min = int(self.um_to_pixels(x_min_um))
+            y_min = int(self.um_to_pixels(y_min_um))
+            width = int(self.um_to_pixels(width_um))
+            height = int(self.um_to_pixels(height_um))
+            print(f"ROI in μm: ({x_min_um}, {y_min_um}, {width_um}, {height_um})")
+            print(f"ROI in pixels: ({x_min}, {y_min}, {width}, {height})")
+            roi_pixels = (x_min, y_min, width, height)
+        else:
+            roi_pixels = roi
+            x_min, y_min, width, height = roi_pixels
+        
         x_max = x_min + width
         y_max = y_min + height
         
@@ -226,21 +347,40 @@ class LariatDataProcessor:
                 
                 # Plot the 2D image with ROI
                 slice_data = self.data.sel(energy=energy_slice, method='nearest')
-                im = slice_data.plot(ax=ax1, cmap='viridis')
-                ax1.set_title(f'Energy = {slice_data.energy.values:.2f}')
+                
+                if use_um:
+                    extent = self.get_extent_um(slice_data.shape)
+                    im = ax1.imshow(slice_data, cmap='viridis', origin='lower', extent=extent)
+                    ax1.set_xlabel('X (μm)')
+                    ax1.set_ylabel('Y (μm)')
+                    
+                    # Convert ROI to display coordinates
+                    if roi_in_um:
+                        roi_display = roi  # Already in micrometers
+                    else:
+                        roi_display = (self.pixels_to_um(x_min), self.pixels_to_um(y_min),
+                                    self.pixels_to_um(width), self.pixels_to_um(height))
+                else:
+                    im = ax1.imshow(slice_data, cmap='viridis', origin='lower')
+                    ax1.set_xlabel('Pixel X')
+                    ax1.set_ylabel('Pixel Y')
+                    roi_display = roi_pixels  # Use pixel coordinates
+                
+                ax1.set_title(f'Energy = {slice_data.energy.values:.2f} eV')
                 plt.colorbar(im, ax=ax1, label='Intensity')
                 
                 # Add ROI box
-                rect = Rectangle((x_min, y_min), width, height, 
+                x_roi, y_roi, w_roi, h_roi = roi_display
+                rect = Rectangle((x_roi, y_roi), w_roi, h_roi, 
                                 edgecolor='red', facecolor='none', linewidth=2)
                 ax1.add_patch(rect)
-                ax1.text(x_min + width/2, y_min + height + 2, 'ROI', 
+                ax1.text(x_roi + w_roi/2, y_roi + h_roi + (5 if use_um else 2), 'ROI', 
                         color='red', fontweight='bold', ha='center')
                 
                 # Plot spectrum in second subplot
                 ax2.plot(energy_values, intensity_values, 'o-')
                 ax2.set_title('Average Spectrum from ROI')
-                ax2.set_xlabel('Energy')
+                ax2.set_xlabel('Energy (eV)')
                 ax2.set_ylabel('Intensity')
                 ax2.grid(True)
                 
@@ -254,7 +394,7 @@ class LariatDataProcessor:
                 fig, ax = plt.subplots(figsize=(8, 5))
                 ax.plot(energy_values, intensity_values, 'o-')
                 ax.set_title('Average Spectrum from ROI')
-                ax.set_xlabel('Energy')
+                ax.set_xlabel('Energy (eV)')
                 ax.set_ylabel('Intensity')
                 ax.grid(True)
             
@@ -262,6 +402,71 @@ class LariatDataProcessor:
             plt.show()
         
         return spectrum_xr, spectrum_np
+    
+    def define_roi_um(self, x_um, y_um, width_um, height_um):
+        """
+        Helper function to define an ROI in micrometers.
+        
+        Parameters:
+        -----------
+        x_um, y_um : float
+            Bottom-left corner coordinates in micrometers
+        width_um, height_um : float
+            ROI dimensions in micrometers
+            
+        Returns:
+        --------
+        roi_um : tuple
+            ROI definition in micrometers (x_min, y_min, width, height)
+        roi_pixels : tuple
+            ROI definition in pixels (x_min, y_min, width, height)
+        """
+        roi_um = (x_um, y_um, width_um, height_um)
+        
+        # Convert to pixels for internal use
+        x_pix = int(self.um_to_pixels(x_um))
+        y_pix = int(self.um_to_pixels(y_um))
+        w_pix = int(self.um_to_pixels(width_um))
+        h_pix = int(self.um_to_pixels(height_um))
+        roi_pixels = (x_pix, y_pix, w_pix, h_pix)
+        
+        print(f"ROI defined:")
+        print(f"  In micrometers: ({x_um}, {y_um}, {width_um}, {height_um})")
+        print(f"  In pixels: ({x_pix}, {y_pix}, {w_pix}, {h_pix})")
+        
+        return roi_um, roi_pixels
+    
+    
+    def get_image_dimensions_um(self):
+        """
+        Get the total image dimensions in micrometers.
+        
+        Returns:
+        --------
+        dimensions : dict
+            Dictionary containing image dimensions in both pixels and micrometers
+        """
+        if self.data is None:
+            raise ValueError("No data loaded.")
+        
+        shape = self.data.isel(energy=0).shape
+        height_pixels, width_pixels = shape
+        
+        dimensions = {
+            'width_pixels': width_pixels,
+            'height_pixels': height_pixels,
+            'width_um': width_pixels * self.pixel_size_um,
+            'height_um': height_pixels * self.pixel_size_um,
+            'pixel_size_um': self.pixel_size_um
+        }
+        
+        print(f"Image dimensions:")
+        print(f"  Pixels: {width_pixels} × {height_pixels}")
+        print(f"  Physical size: {dimensions['width_um']:.1f} × {dimensions['height_um']:.1f} μm")
+        print(f"  Pixel size: {self.pixel_size_um} μm")
+        
+        return dimensions
+    
     
     def subtract_pre_edge(self, spectrum_np, pre_edge_range=None):
         """
