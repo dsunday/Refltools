@@ -2411,3 +2411,382 @@ class RSoXRProcessor:
         
         # Return the results
         return thickness, peak_positions, valley_positions
+    
+    def _sort_files_in_group(self, group):
+        """
+        Sort files within a group by detector type and angle (same as initial grouping)
+        
+        Parameters:
+        -----------
+        group : dict
+            Scan group dictionary
+            
+        Returns:
+        --------
+        group : dict
+            Group with sorted files and metadata
+        """
+        if not group.get('metadata'):
+            return group
+        
+        # Separate files by detector type
+        photodiode_items = []
+        cem_items = []
+        unknown_items = []
+        
+        for i, meta in enumerate(group['metadata']):
+            detector_str = str(meta['detector']).lower() if meta['detector'] is not None else ""
+            item = {
+                'filename': group['files'][i],
+                'metadata': meta,
+                'trim': group['trims'][i] if i < len(group['trims']) else (0, -1)
+            }
+            
+            if "photodiode" in detector_str:
+                photodiode_items.append(item)
+            elif "cem" in detector_str:
+                cem_items.append(item)
+            else:
+                unknown_items.append(item)
+        
+        # Sort each detector type by angle
+        for items in [photodiode_items, cem_items, unknown_items]:
+            items.sort(key=lambda x: x['metadata']['angle'] if x['metadata']['angle'] is not None else 0)
+        
+        # Combine in order: photodiode first, then cem, then unknown
+        sorted_items = photodiode_items + cem_items + unknown_items
+        
+        # Update the group with sorted information
+        group['files'] = [item['filename'] for item in sorted_items]
+        group['metadata'] = [item['metadata'] for item in sorted_items]
+        group['trims'] = [item['trim'] for item in sorted_items]
+        
+        # Recalculate overall angle range
+        overall_min_angle = float('inf')
+        overall_max_angle = float('-inf')
+        
+        for meta in group['metadata']:
+            if meta['min_angle'] is not None and meta['min_angle'] < overall_min_angle:
+                overall_min_angle = meta['min_angle']
+            if meta['max_angle'] is not None and meta['max_angle'] > overall_max_angle:
+                overall_max_angle = meta['max_angle']
+        
+        # Handle case where no valid angles were found
+        if overall_min_angle == float('inf'):
+            overall_min_angle = None
+        if overall_max_angle == float('-inf'):
+            overall_max_angle = None
+        
+        group['min_angle'] = overall_min_angle
+        group['max_angle'] = overall_max_angle
+        
+        return group
+
+    def combine_groups(self, scan_groups, group_indices, new_sample_name=None):
+        """
+        Combine multiple groups into a single group
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        group_indices : list of int
+            Indices of groups to combine (0-based)
+        new_sample_name : str, optional
+            Name for the combined group. If None, uses the first group's name
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups with combined group
+        """
+        if len(group_indices) < 2:
+            print("Error: Need at least 2 groups to combine")
+            return scan_groups
+        
+        # Validate indices
+        valid_indices = [i for i in group_indices if 0 <= i < len(scan_groups)]
+        if len(valid_indices) != len(group_indices):
+            print(f"Warning: Some indices are invalid. Using valid indices: {valid_indices}")
+            group_indices = valid_indices
+        
+        if len(group_indices) < 2:
+            print("Error: Not enough valid groups to combine")
+            return scan_groups
+        
+        # Sort indices in descending order for safe removal
+        group_indices = sorted(group_indices, reverse=True)
+        
+        # Get the groups to combine (use the first index as the base)
+        base_group = deepcopy(scan_groups[group_indices[-1]])  # Lowest index becomes base
+        
+        # Check if energies are compatible (within tolerance)
+        energy_tolerance = 0.5
+        base_energy = base_group['energy']
+        
+        for idx in group_indices[:-1]:  # Skip the base group
+            group = scan_groups[idx]
+            if abs(group['energy'] - base_energy) > energy_tolerance:
+                print(f"Warning: Energy mismatch between groups. Base: {base_energy:.1f} eV, "
+                    f"Group {idx}: {group['energy']:.1f} eV")
+        
+        # Combine all files, metadata, and trims
+        combined_files = list(base_group['files'])
+        combined_metadata = list(base_group['metadata'])
+        combined_trims = list(base_group['trims'])
+        
+        for idx in group_indices[:-1]:  # Skip the base group
+            group = scan_groups[idx]
+            combined_files.extend(group['files'])
+            combined_metadata.extend(group['metadata'])
+            combined_trims.extend(group['trims'])
+        
+        # Update the base group
+        base_group['files'] = combined_files
+        base_group['metadata'] = combined_metadata
+        base_group['trims'] = combined_trims
+        
+        # Update sample name if provided
+        if new_sample_name:
+            base_group['sample_name'] = new_sample_name
+        
+        # Sort the combined group
+        base_group = self._sort_files_in_group(base_group)
+        
+        # Remove the other groups (in reverse order to maintain indices)
+        new_scan_groups = list(scan_groups)
+        for idx in group_indices[:-1]:  # Skip the base group
+            del new_scan_groups[idx]
+        
+        # Update the base group in the list
+        base_index = group_indices[-1]
+        # Adjust base index for any groups removed before it
+        adjusted_base_index = base_index
+        for idx in group_indices[:-1]:
+            if idx < base_index:
+                adjusted_base_index -= 1
+        
+        new_scan_groups[adjusted_base_index] = base_group
+        
+        print(f"Combined {len(group_indices)} groups into group at index {adjusted_base_index}")
+        print(f"Combined group now has {len(base_group['files'])} files")
+        
+        return new_scan_groups
+
+    def remove_scan_from_group(self, scan_groups, group_index, file_index):
+        """
+        Remove a specific scan from a group
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        group_index : int
+            Index of the group to modify (0-based)
+        file_index : int
+            Index of the file within the group to remove (0-based)
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups
+        removed_info : dict
+            Information about the removed scan (filename, metadata, trim)
+        """
+        if not (0 <= group_index < len(scan_groups)):
+            print(f"Error: Invalid group index {group_index}")
+            return scan_groups, None
+        
+        group = scan_groups[group_index]
+        
+        if not (0 <= file_index < len(group['files'])):
+            print(f"Error: Invalid file index {file_index}")
+            return scan_groups, None
+        
+        # Store information about the removed scan
+        removed_info = {
+            'filename': group['files'][file_index],
+            'metadata': group['metadata'][file_index] if file_index < len(group['metadata']) else None,
+            'trim': group['trims'][file_index] if file_index < len(group['trims']) else (0, -1)
+        }
+        
+        # Remove from all lists
+        group['files'].pop(file_index)
+        if file_index < len(group['metadata']):
+            group['metadata'].pop(file_index)
+        if file_index < len(group['trims']):
+            group['trims'].pop(file_index)
+        
+        # Check if group is now empty
+        if not group['files']:
+            print(f"Warning: Group {group_index} is now empty after removing scan")
+            # Optionally remove the empty group
+            scan_groups.pop(group_index)
+            print(f"Removed empty group {group_index}")
+        else:
+            # Re-sort the group and update angle ranges
+            scan_groups[group_index] = self._sort_files_in_group(group)
+        
+        print(f"Removed {os.path.basename(removed_info['filename'])} from group {group_index}")
+        
+        return scan_groups, removed_info
+
+    def move_scan_to_new_group(self, scan_groups, group_index, file_index, new_sample_name=None):
+        """
+        Remove a scan from one group and create a new group with just that scan
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        group_index : int
+            Index of the source group (0-based)
+        file_index : int
+            Index of the file within the group to move (0-based)
+        new_sample_name : str, optional
+            Name for the new group. If None, derives from the original group
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups with new group added
+        """
+        # Remove the scan from the original group
+        updated_groups, removed_info = self.remove_scan_from_group(scan_groups, group_index, file_index)
+        
+        if removed_info is None:
+            return scan_groups
+        
+        # Create a new group with the removed scan
+        original_group = scan_groups[group_index] if group_index < len(scan_groups) else updated_groups[0]
+        
+        new_group = {
+            'sample_name': new_sample_name or f"{original_group['sample_name']}_split",
+            'energy': removed_info['metadata']['energy'] if removed_info['metadata'] else original_group['energy'],
+            'files': [removed_info['filename']],
+            'metadata': [removed_info['metadata']] if removed_info['metadata'] else [],
+            'trims': [removed_info['trim']],
+            'x': removed_info['metadata']['x'] if removed_info['metadata'] else original_group['x'],
+            'y': removed_info['metadata']['y'] if removed_info['metadata'] else original_group['y'],
+            'min_angle': removed_info['metadata']['min_angle'] if removed_info['metadata'] else None,
+            'max_angle': removed_info['metadata']['max_angle'] if removed_info['metadata'] else None
+        }
+        
+        # Add the new group to the list
+        updated_groups.append(new_group)
+        
+        print(f"Created new group '{new_group['sample_name']}' with {os.path.basename(removed_info['filename'])}")
+        
+        return updated_groups
+
+    def move_scan_to_existing_group(self, scan_groups, source_group_index, file_index, target_group_index):
+        """
+        Move a scan from one group to another existing group
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        source_group_index : int
+            Index of the source group (0-based)
+        file_index : int
+            Index of the file within the source group to move (0-based)
+        target_group_index : int
+            Index of the target group (0-based)
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups
+        """
+        if not (0 <= target_group_index < len(scan_groups)):
+            print(f"Error: Invalid target group index {target_group_index}")
+            return scan_groups
+        
+        if source_group_index == target_group_index:
+            print("Error: Source and target groups cannot be the same")
+            return scan_groups
+        
+        # Remove the scan from the source group
+        updated_groups, removed_info = self.remove_scan_from_group(scan_groups, source_group_index, file_index)
+        
+        if removed_info is None:
+            return scan_groups
+        
+        # Adjust target index if source group was removed due to being empty
+        adjusted_target_index = target_group_index
+        if len(updated_groups) < len(scan_groups) and source_group_index < target_group_index:
+            adjusted_target_index -= 1
+        
+        if not (0 <= adjusted_target_index < len(updated_groups)):
+            print(f"Error: Adjusted target group index {adjusted_target_index} is invalid")
+            return scan_groups
+        
+        # Add the scan to the target group
+        target_group = updated_groups[adjusted_target_index]
+        target_group['files'].append(removed_info['filename'])
+        if removed_info['metadata']:
+            target_group['metadata'].append(removed_info['metadata'])
+        target_group['trims'].append(removed_info['trim'])
+        
+        # Sort the target group
+        updated_groups[adjusted_target_index] = self._sort_files_in_group(target_group)
+        
+        print(f"Moved {os.path.basename(removed_info['filename'])} to group {adjusted_target_index}")
+        
+        return updated_groups
+
+    def print_group_summary(self, scan_groups, show_details=False):
+        """
+        Print a summary of the current scan groups
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        show_details : bool
+            Whether to show detailed information about each file
+        """
+        print(f"\nCurrent scan groups ({len(scan_groups)} total):")
+        print("=" * 115)
+        print(f"{'#':3} | {'Sample':12} | {'Energy (eV)':10} | {'Position (X,Y)':20} | {'Angle Range':15} | {'Files':8} | {'Detector Types'}")
+        print("-" * 115)
+        
+        for i, group in enumerate(scan_groups):
+            # Count detector types
+            detector_types = {}
+            for meta in group.get('metadata', []):
+                detector_type = meta.get('detector', 'Unknown')
+                if detector_type in detector_types:
+                    detector_types[detector_type] += 1
+                else:
+                    detector_types[detector_type] = 1
+            
+            detector_str = ", ".join([f"{dtype} ({count})" for dtype, count in detector_types.items()])
+            position_str = f"({group['x']:.2f}, {group['y']:.2f})"
+            
+            # Format angle range
+            angle_range_str = "N/A"
+            if group.get('min_angle') is not None and group.get('max_angle') is not None:
+                angle_range_str = f"{group['min_angle']:.2f} - {group['max_angle']:.2f}°"
+            
+            print(f"{i:3} | {group['sample_name']:12} | {group['energy']:10.1f} | {position_str:20} | {angle_range_str:15} | {len(group['files']):8} | {detector_str}")
+            
+            # Show detailed file information if requested
+            if show_details:
+                print(f"    Files in group {i}:")
+                for j, filename in enumerate(group['files']):
+                    base_filename = os.path.basename(filename)
+                    if j < len(group.get('metadata', [])):
+                        meta = group['metadata'][j]
+                        detector = meta.get('detector', 'Unknown')
+                        angle_range = f"{meta.get('min_angle', 'N/A'):.2f} - {meta.get('max_angle', 'N/A'):.2f}°" if meta.get('min_angle') is not None else "N/A"
+                    else:
+                        detector = 'Unknown'
+                        angle_range = 'N/A'
+                    
+                    trim_str = f"({group['trims'][j][0]}, {group['trims'][j][1]})" if j < len(group['trims']) else "(0, -1)"
+                    print(f"      {j:2}: {base_filename:25} | {detector:12} | {angle_range:15} | {trim_str}")
+                print()
+        
+        print("=" * 115)
