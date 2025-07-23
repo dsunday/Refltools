@@ -2754,6 +2754,63 @@ class RSoXRProcessor:
         
         return updated_groups
 
+    def remove_groups(self, scan_groups, group_indices):
+        """
+        Remove entire groups from the scan groups list
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        group_indices : list of int
+            Indices of groups to remove (1-based, as displayed to user)
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups with specified groups removed
+        removed_groups : list of dicts
+            List of removed groups for reference
+        """
+        if not group_indices:
+            print("Error: No group indices provided")
+            return scan_groups, []
+        
+        # Convert to 0-based indices
+        zero_based_indices = [i - 1 for i in group_indices]
+        
+        # Validate indices
+        valid_indices = [i for i in zero_based_indices if 0 <= i < len(scan_groups)]
+        if len(valid_indices) != len(zero_based_indices):
+            invalid_user_indices = [group_indices[i] for i, idx in enumerate(zero_based_indices) if idx not in valid_indices]
+            print(f"Warning: Invalid group numbers: {invalid_user_indices}. Valid range is 1-{len(scan_groups)}")
+            zero_based_indices = valid_indices
+        
+        if not zero_based_indices:
+            print("Error: No valid groups to remove")
+            return scan_groups, []
+        
+        # Sort indices in descending order for safe removal
+        zero_based_indices = sorted(zero_based_indices, reverse=True)
+        
+        # Store removed groups for reference
+        removed_groups = []
+        new_scan_groups = list(scan_groups)
+        
+        # Remove groups in reverse order to maintain index validity
+        for idx in zero_based_indices:
+            removed_group = new_scan_groups.pop(idx)
+            removed_groups.append(removed_group)
+            print(f"Removed group {idx + 1}: {removed_group['sample_name']} ({removed_group['energy']:.1f} eV)")
+        
+        # Reverse the removed_groups list to match original order
+        removed_groups.reverse()
+        
+        print(f"Successfully removed {len(removed_groups)} groups")
+        print(f"Remaining groups: {len(new_scan_groups)}")
+        
+        return new_scan_groups, removed_groups
+
     def print_group_summary(self, scan_groups, show_details=False):
         """
         Print a summary of the current scan groups
@@ -2831,6 +2888,7 @@ class RSoXRProcessor:
         print("  'details' or 'd' - Show groups with file details")
         print("  'combine X Y Z' - Combine groups X, Y, Z into one group")
         print("  'remove X Y' - Remove file Y from group X")
+        print("  'remove_group X Y Z' - Remove entire groups X, Y, Z")
         print("  'move X Y new' - Move file Y from group X to a new group")
         print("  'move X Y Z' - Move file Y from group X to existing group Z")
         print("  'rename X NAME' - Rename group X to NAME")
@@ -2852,6 +2910,7 @@ class RSoXRProcessor:
                 print("  'details' or 'd' - Show groups with file details")
                 print("  'combine X Y Z' - Combine groups X, Y, Z into one group")
                 print("  'remove X Y' - Remove file Y from group X")
+                print("  'remove_group X Y Z' - Remove entire groups X, Y, Z")
                 print("  'move X Y new' - Move file Y from group X to a new group")
                 print("  'move X Y Z' - Move file Y from group X to existing group Z")
                 print("  'rename X NAME' - Rename group X to NAME")
@@ -2898,6 +2957,29 @@ class RSoXRProcessor:
                     print("Error: Please provide valid indices")
                 except Exception as e:
                     print(f"Error removing scan: {str(e)}")
+                    
+            elif command.startswith('remove_group'):
+                try:
+                    parts = command.split()
+                    if len(parts) < 2:
+                        print("Error: remove_group command needs at least one group index")
+                        continue
+                    indices = [int(x) for x in parts[1:]]
+                    
+                    # Confirm removal
+                    print(f"Are you sure you want to remove groups {indices}? This cannot be undone.")
+                    confirm = input("Type 'yes' to confirm: ").strip().lower()
+                    if confirm == 'yes':
+                        current_groups, removed = self.remove_groups(current_groups, indices)
+                        if removed:
+                            print(f"Removed {len(removed)} groups successfully!")
+                    else:
+                        print("Group removal cancelled.")
+                        
+                except ValueError:
+                    print("Error: Please provide valid group indices")
+                except Exception as e:
+                    print(f"Error removing groups: {str(e)}")
                     
             elif command.startswith('move'):
                 try:
