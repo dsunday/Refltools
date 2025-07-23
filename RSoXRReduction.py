@@ -2491,7 +2491,7 @@ class RSoXRProcessor:
         scan_groups : list of dicts
             List of scan groups
         group_indices : list of int
-            Indices of groups to combine (0-based)
+            Indices of groups to combine (1-based, as displayed to user)
         new_sample_name : str, optional
             Name for the combined group. If None, uses the first group's name
             
@@ -2504,38 +2504,42 @@ class RSoXRProcessor:
             print("Error: Need at least 2 groups to combine")
             return scan_groups
         
-        # Validate indices
-        valid_indices = [i for i in group_indices if 0 <= i < len(scan_groups)]
-        if len(valid_indices) != len(group_indices):
-            print(f"Warning: Some indices are invalid. Using valid indices: {valid_indices}")
-            group_indices = valid_indices
+        # Convert to 0-based indices
+        zero_based_indices = [i - 1 for i in group_indices]
         
-        if len(group_indices) < 2:
+        # Validate indices
+        valid_indices = [i for i in zero_based_indices if 0 <= i < len(scan_groups)]
+        if len(valid_indices) != len(zero_based_indices):
+            invalid_user_indices = [group_indices[i] for i, idx in enumerate(zero_based_indices) if idx not in valid_indices]
+            print(f"Warning: Invalid group numbers: {invalid_user_indices}. Valid range is 1-{len(scan_groups)}")
+            zero_based_indices = valid_indices
+        
+        if len(zero_based_indices) < 2:
             print("Error: Not enough valid groups to combine")
             return scan_groups
         
         # Sort indices in descending order for safe removal
-        group_indices = sorted(group_indices, reverse=True)
+        zero_based_indices = sorted(zero_based_indices, reverse=True)
         
         # Get the groups to combine (use the first index as the base)
-        base_group = deepcopy(scan_groups[group_indices[-1]])  # Lowest index becomes base
+        base_group = deepcopy(scan_groups[zero_based_indices[-1]])  # Lowest index becomes base
         
         # Check if energies are compatible (within tolerance)
         energy_tolerance = 0.5
         base_energy = base_group['energy']
         
-        for idx in group_indices[:-1]:  # Skip the base group
+        for idx in zero_based_indices[:-1]:  # Skip the base group
             group = scan_groups[idx]
             if abs(group['energy'] - base_energy) > energy_tolerance:
                 print(f"Warning: Energy mismatch between groups. Base: {base_energy:.1f} eV, "
-                    f"Group {idx}: {group['energy']:.1f} eV")
+                    f"Group {idx+1}: {group['energy']:.1f} eV")
         
         # Combine all files, metadata, and trims
         combined_files = list(base_group['files'])
         combined_metadata = list(base_group['metadata'])
         combined_trims = list(base_group['trims'])
         
-        for idx in group_indices[:-1]:  # Skip the base group
+        for idx in zero_based_indices[:-1]:  # Skip the base group
             group = scan_groups[idx]
             combined_files.extend(group['files'])
             combined_metadata.extend(group['metadata'])
@@ -2555,20 +2559,20 @@ class RSoXRProcessor:
         
         # Remove the other groups (in reverse order to maintain indices)
         new_scan_groups = list(scan_groups)
-        for idx in group_indices[:-1]:  # Skip the base group
+        for idx in zero_based_indices[:-1]:  # Skip the base group
             del new_scan_groups[idx]
         
         # Update the base group in the list
-        base_index = group_indices[-1]
+        base_index = zero_based_indices[-1]
         # Adjust base index for any groups removed before it
         adjusted_base_index = base_index
-        for idx in group_indices[:-1]:
+        for idx in zero_based_indices[:-1]:
             if idx < base_index:
                 adjusted_base_index -= 1
         
         new_scan_groups[adjusted_base_index] = base_group
         
-        print(f"Combined {len(group_indices)} groups into group at index {adjusted_base_index}")
+        print(f"Combined {len(zero_based_indices)} groups into group {adjusted_base_index + 1}")
         print(f"Combined group now has {len(base_group['files'])} files")
         
         return new_scan_groups
@@ -2582,9 +2586,9 @@ class RSoXRProcessor:
         scan_groups : list of dicts
             List of scan groups
         group_index : int
-            Index of the group to modify (0-based)
+            Index of the group to modify (1-based, as displayed to user)
         file_index : int
-            Index of the file within the group to remove (0-based)
+            Index of the file within the group to remove (1-based, as displayed to user)
             
         Returns:
         --------
@@ -2593,39 +2597,43 @@ class RSoXRProcessor:
         removed_info : dict
             Information about the removed scan (filename, metadata, trim)
         """
-        if not (0 <= group_index < len(scan_groups)):
-            print(f"Error: Invalid group index {group_index}")
+        # Convert to 0-based indices
+        zero_based_group_index = group_index - 1
+        zero_based_file_index = file_index - 1
+        
+        if not (0 <= zero_based_group_index < len(scan_groups)):
+            print(f"Error: Invalid group number {group_index}. Valid range is 1-{len(scan_groups)}")
             return scan_groups, None
         
-        group = scan_groups[group_index]
+        group = scan_groups[zero_based_group_index]
         
-        if not (0 <= file_index < len(group['files'])):
-            print(f"Error: Invalid file index {file_index}")
+        if not (0 <= zero_based_file_index < len(group['files'])):
+            print(f"Error: Invalid file number {file_index}. Valid range is 1-{len(group['files'])}")
             return scan_groups, None
         
         # Store information about the removed scan
         removed_info = {
-            'filename': group['files'][file_index],
-            'metadata': group['metadata'][file_index] if file_index < len(group['metadata']) else None,
-            'trim': group['trims'][file_index] if file_index < len(group['trims']) else (0, -1)
+            'filename': group['files'][zero_based_file_index],
+            'metadata': group['metadata'][zero_based_file_index] if zero_based_file_index < len(group['metadata']) else None,
+            'trim': group['trims'][zero_based_file_index] if zero_based_file_index < len(group['trims']) else (0, -1)
         }
         
         # Remove from all lists
-        group['files'].pop(file_index)
-        if file_index < len(group['metadata']):
-            group['metadata'].pop(file_index)
-        if file_index < len(group['trims']):
-            group['trims'].pop(file_index)
+        group['files'].pop(zero_based_file_index)
+        if zero_based_file_index < len(group['metadata']):
+            group['metadata'].pop(zero_based_file_index)
+        if zero_based_file_index < len(group['trims']):
+            group['trims'].pop(zero_based_file_index)
         
         # Check if group is now empty
         if not group['files']:
             print(f"Warning: Group {group_index} is now empty after removing scan")
             # Optionally remove the empty group
-            scan_groups.pop(group_index)
+            scan_groups.pop(zero_based_group_index)
             print(f"Removed empty group {group_index}")
         else:
             # Re-sort the group and update angle ranges
-            scan_groups[group_index] = self._sort_files_in_group(group)
+            scan_groups[zero_based_group_index] = self._sort_files_in_group(group)
         
         print(f"Removed {os.path.basename(removed_info['filename'])} from group {group_index}")
         
@@ -2640,9 +2648,9 @@ class RSoXRProcessor:
         scan_groups : list of dicts
             List of scan groups
         group_index : int
-            Index of the source group (0-based)
+            Index of the source group (1-based, as displayed to user)
         file_index : int
-            Index of the file within the group to move (0-based)
+            Index of the file within the group to move (1-based, as displayed to user)
         new_sample_name : str, optional
             Name for the new group. If None, derives from the original group
             
@@ -2651,6 +2659,15 @@ class RSoXRProcessor:
         scan_groups : list of dicts
             Updated list of scan groups with new group added
         """
+        # Convert to 0-based for internal operations
+        zero_based_group_index = group_index - 1
+        
+        if not (0 <= zero_based_group_index < len(scan_groups)):
+            print(f"Error: Invalid group number {group_index}. Valid range is 1-{len(scan_groups)}")
+            return scan_groups
+        
+        original_group = scan_groups[zero_based_group_index]
+        
         # Remove the scan from the original group
         updated_groups, removed_info = self.remove_scan_from_group(scan_groups, group_index, file_index)
         
@@ -2658,8 +2675,6 @@ class RSoXRProcessor:
             return scan_groups
         
         # Create a new group with the removed scan
-        original_group = scan_groups[group_index] if group_index < len(scan_groups) else updated_groups[0]
-        
         new_group = {
             'sample_name': new_sample_name or f"{original_group['sample_name']}_split",
             'energy': removed_info['metadata']['energy'] if removed_info['metadata'] else original_group['energy'],
@@ -2675,7 +2690,7 @@ class RSoXRProcessor:
         # Add the new group to the list
         updated_groups.append(new_group)
         
-        print(f"Created new group '{new_group['sample_name']}' with {os.path.basename(removed_info['filename'])}")
+        print(f"Created new group '{new_group['sample_name']}' (group {len(updated_groups)}) with {os.path.basename(removed_info['filename'])}")
         
         return updated_groups
 
@@ -2688,19 +2703,22 @@ class RSoXRProcessor:
         scan_groups : list of dicts
             List of scan groups
         source_group_index : int
-            Index of the source group (0-based)
+            Index of the source group (1-based, as displayed to user)
         file_index : int
-            Index of the file within the source group to move (0-based)
+            Index of the file within the source group to move (1-based, as displayed to user)
         target_group_index : int
-            Index of the target group (0-based)
+            Index of the target group (1-based, as displayed to user)
             
         Returns:
         --------
         scan_groups : list of dicts
             Updated list of scan groups
         """
-        if not (0 <= target_group_index < len(scan_groups)):
-            print(f"Error: Invalid target group index {target_group_index}")
+        # Convert to 0-based indices
+        zero_based_target_index = target_group_index - 1
+        
+        if not (0 <= zero_based_target_index < len(scan_groups)):
+            print(f"Error: Invalid target group number {target_group_index}. Valid range is 1-{len(scan_groups)}")
             return scan_groups
         
         if source_group_index == target_group_index:
@@ -2714,12 +2732,12 @@ class RSoXRProcessor:
             return scan_groups
         
         # Adjust target index if source group was removed due to being empty
-        adjusted_target_index = target_group_index
-        if len(updated_groups) < len(scan_groups) and source_group_index < target_group_index:
+        adjusted_target_index = zero_based_target_index
+        if len(updated_groups) < len(scan_groups) and (source_group_index - 1) < zero_based_target_index:
             adjusted_target_index -= 1
         
         if not (0 <= adjusted_target_index < len(updated_groups)):
-            print(f"Error: Adjusted target group index {adjusted_target_index} is invalid")
+            print(f"Error: Target group is no longer valid after source group removal")
             return scan_groups
         
         # Add the scan to the target group
@@ -2732,7 +2750,7 @@ class RSoXRProcessor:
         # Sort the target group
         updated_groups[adjusted_target_index] = self._sort_files_in_group(target_group)
         
-        print(f"Moved {os.path.basename(removed_info['filename'])} to group {adjusted_target_index}")
+        print(f"Moved {os.path.basename(removed_info['filename'])} to group {adjusted_target_index + 1}")
         
         return updated_groups
 
@@ -2770,11 +2788,11 @@ class RSoXRProcessor:
             if group.get('min_angle') is not None and group.get('max_angle') is not None:
                 angle_range_str = f"{group['min_angle']:.2f} - {group['max_angle']:.2f}°"
             
-            print(f"{i:3} | {group['sample_name']:12} | {group['energy']:10.1f} | {position_str:20} | {angle_range_str:15} | {len(group['files']):8} | {detector_str}")
+            print(f"{i+1:3} | {group['sample_name']:12} | {group['energy']:10.1f} | {position_str:20} | {angle_range_str:15} | {len(group['files']):8} | {detector_str}")
             
             # Show detailed file information if requested
             if show_details:
-                print(f"    Files in group {i}:")
+                print(f"    Files in group {i+1}:")
                 for j, filename in enumerate(group['files']):
                     base_filename = os.path.basename(filename)
                     if j < len(group.get('metadata', [])):
@@ -2786,7 +2804,153 @@ class RSoXRProcessor:
                         angle_range = 'N/A'
                     
                     trim_str = f"({group['trims'][j][0]}, {group['trims'][j][1]})" if j < len(group['trims']) else "(0, -1)"
-                    print(f"      {j:2}: {base_filename:25} | {detector:12} | {angle_range:15} | {trim_str}")
+                    print(f"      {j+1:2}: {base_filename:25} | {detector:12} | {angle_range:15} | {trim_str}")
                 print()
         
         print("=" * 115)
+
+    def interactive_group_editor(self, scan_groups):
+        """
+        Interactive command-line interface for editing scan groups
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups to edit
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Modified list of scan groups
+        """
+        print("\n" + "="*60)
+        print("           INTERACTIVE SCAN GROUP EDITOR")
+        print("="*60)
+        print("Commands:")
+        print("  'show' or 's' - Show current groups")
+        print("  'details' or 'd' - Show groups with file details")
+        print("  'combine X Y Z' - Combine groups X, Y, Z into one group")
+        print("  'remove X Y' - Remove file Y from group X")
+        print("  'move X Y new' - Move file Y from group X to a new group")
+        print("  'move X Y Z' - Move file Y from group X to existing group Z")
+        print("  'rename X NAME' - Rename group X to NAME")
+        print("  'quit' or 'q' - Finish editing")
+        print("  'help' or 'h' - Show this help")
+        print("="*60)
+        
+        current_groups = deepcopy(scan_groups)
+        
+        while True:
+            print(f"\nCurrent state: {len(current_groups)} groups")
+            command = input("Enter command: ").strip().lower()
+            
+            if command in ['quit', 'q']:
+                break
+            elif command in ['help', 'h']:
+                print("\nCommands:")
+                print("  'show' or 's' - Show current groups")
+                print("  'details' or 'd' - Show groups with file details")
+                print("  'combine X Y Z' - Combine groups X, Y, Z into one group")
+                print("  'remove X Y' - Remove file Y from group X")
+                print("  'move X Y new' - Move file Y from group X to a new group")
+                print("  'move X Y Z' - Move file Y from group X to existing group Z")
+                print("  'rename X NAME' - Rename group X to NAME")
+                print("  'quit' or 'q' - Finish editing")
+            elif command in ['show', 's']:
+                self.print_group_summary(current_groups, show_details=False)
+            elif command in ['details', 'd']:
+                self.print_group_summary(current_groups, show_details=True)
+            elif command.startswith('combine'):
+                try:
+                    parts = command.split()
+                    if len(parts) < 3:
+                        print("Error: combine command needs at least 2 group indices")
+                        continue
+                    indices = [int(x) for x in parts[1:]]
+                    
+                    # Ask for new name
+                    new_name = input("Enter new name for combined group (or press Enter to use default): ").strip()
+                    if not new_name:
+                        new_name = None
+                    
+                    current_groups = self.combine_groups(current_groups, indices, new_name)
+                    print("Groups combined successfully!")
+                    
+                except ValueError:
+                    print("Error: Please provide valid group indices")
+                except Exception as e:
+                    print(f"Error combining groups: {str(e)}")
+                    
+            elif command.startswith('remove'):
+                try:
+                    parts = command.split()
+                    if len(parts) != 3:
+                        print("Error: remove command format: 'remove GROUP_INDEX FILE_INDEX'")
+                        continue
+                    group_idx = int(parts[1])
+                    file_idx = int(parts[2])
+                    
+                    current_groups, removed = self.remove_scan_from_group(current_groups, group_idx, file_idx)
+                    if removed:
+                        print(f"Removed scan successfully!")
+                        
+                except ValueError:
+                    print("Error: Please provide valid indices")
+                except Exception as e:
+                    print(f"Error removing scan: {str(e)}")
+                    
+            elif command.startswith('move'):
+                try:
+                    parts = command.split()
+                    if len(parts) != 4:
+                        print("Error: move command format: 'move SOURCE_GROUP FILE_INDEX TARGET' where TARGET is group index or 'new'")
+                        continue
+                        
+                    source_idx = int(parts[1])
+                    file_idx = int(parts[2])
+                    target = parts[3]
+                    
+                    if target == 'new':
+                        new_name = input("Enter name for new group (or press Enter for default): ").strip()
+                        if not new_name:
+                            new_name = None
+                        current_groups = self.move_scan_to_new_group(current_groups, source_idx, file_idx, new_name)
+                        print("Moved scan to new group successfully!")
+                    else:
+                        target_idx = int(target)
+                        current_groups = self.move_scan_to_existing_group(current_groups, source_idx, file_idx, target_idx)
+                        print("Moved scan successfully!")
+                        
+                except ValueError:
+                    print("Error: Please provide valid indices")
+                except Exception as e:
+                    print(f"Error moving scan: {str(e)}")
+                    
+            elif command.startswith('rename'):
+                try:
+                    parts = command.split(None, 2)  # Split into at most 3 parts
+                    if len(parts) < 3:
+                        print("Error: rename command format: 'rename GROUP_INDEX NEW_NAME'")
+                        continue
+                        
+                    group_idx = int(parts[1])
+                    new_name = parts[2]
+                    
+                    if 0 <= group_idx < len(current_groups):
+                        old_name = current_groups[group_idx]['sample_name']
+                        current_groups[group_idx]['sample_name'] = new_name
+                        print(f"Renamed group {group_idx} from '{old_name}' to '{new_name}'")
+                    else:
+                        print(f"Error: Invalid group index {group_idx}")
+                        
+                except ValueError:
+                    print("Error: Please provide a valid group index")
+                except Exception as e:
+                    print(f"Error renaming group: {str(e)}")
+            else:
+                print(f"Unknown command: {command}. Type 'help' for available commands.")
+        
+        print("\nEditing complete!")
+        self.print_group_summary(current_groups, show_details=False)
+        
+        return current_groups
