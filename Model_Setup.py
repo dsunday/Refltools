@@ -2025,12 +2025,25 @@ def add_fit_to_database(objective, model_name, results_database, mcmc_stats=None
                 
                 # Get bounds if available
                 try:
-                    bounds = param.bounds
-                    if bounds is not None and len(bounds) == 2:
-                        bound_low, bound_high = bounds
+                    bounds = getattr(param, 'bounds', None)
+                    if bounds is not None:
+                        # Handle different bounds formats
+                        if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                            # Bounds object with lb/ub attributes
+                            bound_low, bound_high = bounds.lb, bounds.ub
+                        elif isinstance(bounds, (tuple, list)) and len(bounds) == 2:
+                            # Tuple/list format
+                            bound_low, bound_high = bounds
+                        elif hasattr(bounds, '__iter__') and len(list(bounds)) == 2:
+                            # Other iterable format
+                            bound_vals = list(bounds)
+                            bound_low, bound_high = bound_vals[0], bound_vals[1]
+                        else:
+                            bound_low, bound_high = None, None
                     else:
                         bound_low, bound_high = None, None
-                except:
+                except Exception as e:
+                    print(f"Error extracting bounds for {param_name}: {str(e)}")
                     bound_low, bound_high = None, None
                 
                 # Use MCMC stderr if available and better than optimization stderr
@@ -2340,9 +2353,10 @@ def plot_energy_vs_gof(results_database, model_names=None, figsize=(10, 6),
     return fig, ax
 
 
+
 def plot_energy_vs_sld(results_database, materials=None, model_names=None, 
                        exclude_materials=['Si', 'SiO2', 'air'], plot_type='both',
-                       figsize=(12, 8), xlim=None, ylim=None, save_path=None):
+                       figsize=(12, 8), xlim=None, ylim=None, materials_bounds=None, save_path=None):
     """
     Plot Energy vs SLD (real and/or imaginary) for materials.
     
@@ -2355,6 +2369,7 @@ def plot_energy_vs_sld(results_database, materials=None, model_names=None,
         figsize: Figure size as (width, height)
         xlim: X-axis limits as (min, max) tuple (None for auto)
         ylim: Y-axis limits as (min, max) tuple (None for auto)
+        materials_bounds: List of materials to show bounds for (None for no bounds)
         save_path: Path to save the figure (None to skip saving)
         
     Returns:
@@ -2362,6 +2377,7 @@ def plot_energy_vs_sld(results_database, materials=None, model_names=None,
     """
     import matplotlib.pyplot as plt
     import numpy as np
+    import pandas as pd
     
     # Filter by model names if specified
     if model_names is not None:
@@ -2429,14 +2445,10 @@ def plot_energy_vs_sld(results_database, materials=None, model_names=None,
     
     unique_models = filtered_db['model_name'].unique()
     
-    # Create unique combinations for each material/model pair
-    material_model_combinations = []
-    for material in materials:
-        for model in unique_models:
-            material_model_combinations.append((material, model))
-    
     # Plot each parameter type
     for ax_idx, (ax, title, params) in enumerate(zip(axes, titles, param_types)):
+        
+        # Plot data points and error bars for bounds
         combo_idx = 0
         for material in materials:
             # Filter parameters for this material
@@ -2449,12 +2461,48 @@ def plot_energy_vs_sld(results_database, materials=None, model_names=None,
                     energies = model_mat_params['energy'].values
                     values = model_mat_params['value'].values
                     
-                    # Use unique color/marker for each material/model combination
+                    # Check if we should show bounds for this material
+                    show_bounds = materials_bounds is not None and material in materials_bounds
+                    
+                    if show_bounds:
+                        # Calculate error bars from bounds
+                        lower_errors = []
+                        upper_errors = []
+                        
+                        for i, (energy, value) in enumerate(zip(energies, values)):
+                            energy_row = model_mat_params[model_mat_params['energy'] == energy].iloc[0]
+                            bound_low = energy_row['bound_low']
+                            bound_high = energy_row['bound_high']
+                            
+                            if pd.notnull(bound_low) and pd.notnull(bound_high):
+                                # Calculate asymmetric error bars
+                                lower_error = value - bound_low  # Distance from value to lower bound
+                                upper_error = bound_high - value  # Distance from value to upper bound
+                                lower_errors.append(max(0, lower_error))  # Ensure non-negative
+                                upper_errors.append(max(0, upper_error))
+                            else:
+                                lower_errors.append(0)
+                                upper_errors.append(0)
+                        
+                        # Plot with error bars showing bounds
+                        ax.errorbar(energies, values,
+                                   yerr=[lower_errors, upper_errors],
+                                   fmt='none',  # No marker for error bars
+                                   ecolor=colors[combo_idx % len(colors)],
+                                   elinewidth=2,
+                                   capsize=8,
+                                   capthick=2,
+                                   alpha=0.6,
+                                   label=f"{material} bounds" if combo_idx == 0 else "",
+                                   zorder=2)
+                    
+                    # Plot the actual data points on top
                     ax.scatter(energies, values,
                               color=colors[combo_idx % len(colors)],
                               marker=markers[combo_idx % len(markers)],
-                              s=80, alpha=0.7, edgecolors='black', linewidth=0.5,
-                              label=f"{material} ({model})" if len(unique_models) > 1 else material)
+                              s=80, alpha=0.9, edgecolors='black', linewidth=0.5,
+                              label=f"{material} ({model})" if len(unique_models) > 1 else material,
+                              zorder=3)  # Ensure points appear on top
                     combo_idx += 1
         
         ax.set_xlabel('Energy (eV)')
@@ -2481,7 +2529,7 @@ def plot_energy_vs_sld(results_database, materials=None, model_names=None,
 
 def plot_energy_vs_thickness(results_database, materials=None, model_names=None,
                             exclude_materials=['Si', 'SiO2', 'air'],
-                            figsize=(10, 6), save_path=None):
+                            figsize=(10, 6), xlim=None, ylim=None, materials_bounds=None, save_path=None):
     """
     Plot Energy vs Thickness for materials.
     
@@ -2491,6 +2539,9 @@ def plot_energy_vs_thickness(results_database, materials=None, model_names=None,
         model_names: List of model names to include (None for all)
         exclude_materials: List of materials to exclude by default
         figsize: Figure size as (width, height)
+        xlim: X-axis limits as (min, max) tuple (None for auto)
+        ylim: Y-axis limits as (min, max) tuple (None for auto)
+        materials_bounds: List of materials to show bounds for (None for no bounds)
         save_path: Path to save the figure (None to skip saving)
         
     Returns:
@@ -2498,6 +2549,7 @@ def plot_energy_vs_thickness(results_database, materials=None, model_names=None,
     """
     import matplotlib.pyplot as plt
     import numpy as np
+    import pandas as pd
     
     # Filter by model names if specified
     if model_names is not None:
@@ -2536,33 +2588,80 @@ def plot_energy_vs_thickness(results_database, materials=None, model_names=None,
     # Create figure
     fig, ax = plt.subplots(figsize=figsize)
     
-    # Color and marker cycles
-    colors = plt.cm.tab10.colors
-    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+    # Extended color and marker cycles for better differentiation
+    colors = plt.cm.tab20.colors  # 20 colors
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'X', '+', 'd', '8', 'P', 'H']
+    
     unique_models = filtered_db['model_name'].unique()
     
-    # Plot each material
-    for mat_idx, material in enumerate(materials):
+    # Plot data points and error bars for bounds
+    combo_idx = 0
+    for material in materials:
         # Filter parameters for this material
         mat_params = thickness_params[thickness_params['parameter'].str.contains(material, case=False)]
         
-        for mod_idx, model in enumerate(unique_models):
+        for model in unique_models:
             model_mat_params = mat_params[mat_params['model_name'] == model]
             
             if not model_mat_params.empty:
                 energies = model_mat_params['energy'].values
                 values = model_mat_params['value'].values
                 
+                # Check if we should show bounds for this material
+                show_bounds = materials_bounds is not None and material in materials_bounds
+                
+                if show_bounds:
+                    # Calculate error bars from bounds
+                    lower_errors = []
+                    upper_errors = []
+                    
+                    for i, (energy, value) in enumerate(zip(energies, values)):
+                        energy_row = model_mat_params[model_mat_params['energy'] == energy].iloc[0]
+                        bound_low = energy_row['bound_low']
+                        bound_high = energy_row['bound_high']
+                        
+                        if pd.notnull(bound_low) and pd.notnull(bound_high):
+                            # Calculate asymmetric error bars
+                            lower_error = value - bound_low  # Distance from value to lower bound
+                            upper_error = bound_high - value  # Distance from value to upper bound
+                            lower_errors.append(max(0, lower_error))  # Ensure non-negative
+                            upper_errors.append(max(0, upper_error))
+                        else:
+                            lower_errors.append(0)
+                            upper_errors.append(0)
+                    
+                    # Plot with error bars showing bounds
+                    ax.errorbar(energies, values,
+                               yerr=[lower_errors, upper_errors],
+                               fmt='none',  # No marker for error bars
+                               ecolor=colors[combo_idx % len(colors)],
+                               elinewidth=2,
+                               capsize=8,
+                               capthick=2,
+                               alpha=0.6,
+                               label=f"{material} bounds" if combo_idx == 0 else "",
+                               zorder=2)
+                
+                # Plot the actual data points on top
                 ax.scatter(energies, values,
-                          color=colors[mod_idx % len(colors)],
-                          marker=markers[mat_idx % len(markers)],
-                          s=60, alpha=0.7,
-                          label=f"{material} ({model})" if len(unique_models) > 1 else material)
+                          color=colors[combo_idx % len(colors)],
+                          marker=markers[combo_idx % len(markers)],
+                          s=80, alpha=0.9, edgecolors='black', linewidth=0.5,
+                          label=f"{material} ({model})" if len(unique_models) > 1 else material,
+                          zorder=3)  # Ensure points appear on top
+                combo_idx += 1
     
     ax.set_xlabel('Energy (eV)')
     ax.set_ylabel('Thickness (Å)')
     ax.set_title('Energy vs Thickness')
     ax.grid(True, alpha=0.3)
+    
+    # Set axis limits if provided
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+        
     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
     plt.tight_layout()
@@ -2576,7 +2675,7 @@ def plot_energy_vs_thickness(results_database, materials=None, model_names=None,
 
 def plot_energy_vs_roughness(results_database, materials=None, model_names=None,
                             exclude_materials=['Si', 'SiO2', 'air'],
-                            figsize=(10, 6), xlim=None, ylim=None, save_path=None):
+                            figsize=(10, 6), xlim=None, ylim=None, materials_bounds=None, save_path=None):
     """
     Plot Energy vs Roughness for materials.
     
@@ -2588,6 +2687,7 @@ def plot_energy_vs_roughness(results_database, materials=None, model_names=None,
         figsize: Figure size as (width, height)
         xlim: X-axis limits as (min, max) tuple (None for auto)
         ylim: Y-axis limits as (min, max) tuple (None for auto)
+        materials_bounds: List of materials to show bounds for (None for no bounds)
         save_path: Path to save the figure (None to skip saving)
         
     Returns:
@@ -2595,6 +2695,7 @@ def plot_energy_vs_roughness(results_database, materials=None, model_names=None,
     """
     import matplotlib.pyplot as plt
     import numpy as np
+    import pandas as pd
     
     # Filter by model names if specified
     if model_names is not None:
@@ -2639,7 +2740,7 @@ def plot_energy_vs_roughness(results_database, materials=None, model_names=None,
     
     unique_models = filtered_db['model_name'].unique()
     
-    # Create unique combinations for each material/model pair
+    # Plot data points and error bars for bounds
     combo_idx = 0
     for material in materials:
         # Filter parameters for this material
@@ -2652,12 +2753,48 @@ def plot_energy_vs_roughness(results_database, materials=None, model_names=None,
                 energies = model_mat_params['energy'].values
                 values = model_mat_params['value'].values
                 
-                # Use unique color/marker for each material/model combination
+                # Check if we should show bounds for this material
+                show_bounds = materials_bounds is not None and material in materials_bounds
+                
+                if show_bounds:
+                    # Calculate error bars from bounds
+                    lower_errors = []
+                    upper_errors = []
+                    
+                    for i, (energy, value) in enumerate(zip(energies, values)):
+                        energy_row = model_mat_params[model_mat_params['energy'] == energy].iloc[0]
+                        bound_low = energy_row['bound_low']
+                        bound_high = energy_row['bound_high']
+                        
+                        if pd.notnull(bound_low) and pd.notnull(bound_high):
+                            # Calculate asymmetric error bars
+                            lower_error = value - bound_low  # Distance from value to lower bound
+                            upper_error = bound_high - value  # Distance from value to upper bound
+                            lower_errors.append(max(0, lower_error))  # Ensure non-negative
+                            upper_errors.append(max(0, upper_error))
+                        else:
+                            lower_errors.append(0)
+                            upper_errors.append(0)
+                    
+                    # Plot with error bars showing bounds
+                    ax.errorbar(energies, values,
+                               yerr=[lower_errors, upper_errors],
+                               fmt='none',  # No marker for error bars
+                               ecolor=colors[combo_idx % len(colors)],
+                               elinewidth=2,
+                               capsize=8,
+                               capthick=2,
+                               alpha=0.6,
+                               label=f"{material} bounds" if combo_idx == 0 else "",
+                               zorder=2)
+                
+                # Plot the actual data points on top
                 ax.scatter(energies, values,
                           color=colors[combo_idx % len(colors)],
                           marker=markers[combo_idx % len(markers)],
-                          s=80, alpha=0.7, edgecolors='black', linewidth=0.5,
-                          label=f"{material} ({model})" if len(unique_models) > 1 else material)
+                          s=80, alpha=0.9, edgecolors='black', linewidth=0.5,
+                          label=f"{material} ({model})" if len(unique_models) > 1 else material,
+                          zorder=3)  # Ensure points appear on top
                 combo_idx += 1
     
     ax.set_xlabel('Energy (eV)')
