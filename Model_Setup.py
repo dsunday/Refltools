@@ -1621,9 +1621,9 @@ def get_parameter_info(objective, parameter_pattern=None):
 
 
 
-def run_fitting_v2(objective, optimization_method='differential_evolution', 
-                   opt_workers=8, opt_popsize=50, burn_samples=5, 
-                   production_samples=5, prod_steps=1, pool=16,
+def run_fitting_v2(objective, method='differential_evolution', 
+                   workers=-1, popsize=15, steps=1000, burn=500,
+                   nthin=1, nwalkers=100,
                    results_database=None, log_mcmc_stats=True,
                    save_dir=None, save_objective=False, save_results=False,
                    structure=None, model_name=None, add_to_database=True,
@@ -1635,13 +1635,13 @@ def run_fitting_v2(objective, optimization_method='differential_evolution',
     
     Args:
         objective: The objective function to fit
-        optimization_method: Optimization method to use ('differential_evolution', 'least_squares', etc.)
-        opt_workers: Number of workers for parallel optimization
-        opt_popsize: Population size for genetic algorithms
-        burn_samples: Number of burn-in samples to discard (in thousands)
-        production_samples: Number of production samples to keep (in thousands)
-        prod_steps: Number of steps between stored samples
-        pool: Number of parallel processes for MCMC sampling
+        method: Optimization method to use ('differential_evolution', 'least_squares', etc.)
+        workers: Number of workers for parallel optimization (-1 for all cores)
+        popsize: Population size for differential evolution
+        steps: Number of steps for MCMC sampling (total steps, not in thousands)
+        burn: Number of burn-in steps to discard (handled post-sampling)
+        nthin: Thinning factor for MCMC sampling
+        nwalkers: Number of walkers for MCMC sampling
         results_database: Existing pandas DataFrame to append results to (None to create new)
         log_mcmc_stats: Whether to add MCMC statistics to the database
         save_dir: Directory to save objective and results (None to skip saving)
@@ -1656,6 +1656,7 @@ def run_fitting_v2(objective, optimization_method='differential_evolution',
     Returns:
         Tuple of (results_dict, updated_results_database, final_model_name)
     """
+    from refnx.analysis import CurveFitter
     
     # Extract model name if not provided
     if model_name is None:
@@ -1705,11 +1706,11 @@ def run_fitting_v2(objective, optimization_method='differential_evolution',
     
     # Run optimization
     if verbose:
-        print(f"Starting optimization using {optimization_method}...")
-    if optimization_method == 'differential_evolution':
-        fitter.fit(optimization_method, workers=opt_workers, popsize=opt_popsize)
+        print(f"Starting optimization using {method}...")
+    if method == 'differential_evolution':
+        fitter.fit(method, workers=workers, popsize=popsize)
     else:
-        fitter.fit(optimization_method)
+        fitter.fit(method)
     
     # Store optimization results
     results['optimized_parameters'] = objective.parameters.pvals.copy()
@@ -1719,43 +1720,41 @@ def run_fitting_v2(objective, optimization_method='differential_evolution',
         print(f"Optimization complete. Chi-squared: {results['optimized_chi_squared']:.6g}")
     
     # Run MCMC if requested
-    if burn_samples > 0 or production_samples > 0:
+    if steps > 0:
         if verbose:
-            print(f"Starting MCMC sampling...")
-            print(f"Burn-in samples: {burn_samples * 1000}")
-            print(f"Production samples: {production_samples * 1000}")
+            print(f"Starting MCMC sampling with {steps} steps...")
         
         try:
             # Run MCMC sampling
-            fitter.sample(burn_samples * 1000, 
-                         nthin=prod_steps, 
-                         ntemps=1, 
-                         workers=pool)
+            fitter.sample(steps, nthin=nthin)
             
-            # Store production samples
-            if production_samples > 0:
-                fitter.sample(production_samples * 1000, 
-                             nthin=prod_steps, 
-                             ntemps=1, 
-                             workers=pool,
-                             pool=pool)
+            # Store the chain
+            results['mcmc_samples'] = fitter.chain
+            
+            # Check what we got and handle burn-in
+            if results['mcmc_samples'] is not None and burn > 0:
+                if verbose:
+                    print(f"Chain shape: {results['mcmc_samples'].shape}")
                 
-                results['mcmc_samples'] = fitter.chain
+                # Handle burn-in removal based on chain dimensions
+                if results['mcmc_samples'].ndim == 3:  # (nwalkers, nsteps, nparams)
+                    burn_steps = min(burn, results['mcmc_samples'].shape[1])
+                    results['mcmc_samples'] = results['mcmc_samples'][:, burn_steps:, :]
+                elif results['mcmc_samples'].ndim == 2:  # (nsteps, nparams)
+                    burn_steps = min(burn, results['mcmc_samples'].shape[0])
+                    results['mcmc_samples'] = results['mcmc_samples'][burn_steps:, :]
                 
-                # Calculate MCMC statistics if requested
-                if log_mcmc_stats and results['mcmc_samples'] is not None:
-                    if verbose:
-                        print("Calculating MCMC statistics...")
-                    results['mcmc_stats'] = calculate_mcmc_statistics(results['mcmc_samples'], 
-                                                                    objective.parameters)
-                    
-                    # Print summary of key parameters
-                    if verbose:
-                        print("\nParameter summary from MCMC:")
-                        for name, stats in results['mcmc_stats'].items():
-                            if 'median' in stats and stats['median'] is not None:
-                                print(f"  {name}: {stats['median']:.6g} +{stats['percentiles'][84] - stats['median']:.6g} -{stats['median'] - stats['percentiles'][16]:.6g}")
-                            
+                if verbose:
+                    print(f"Removed {burn_steps} burn-in steps")
+                    print(f"Final chain shape: {results['mcmc_samples'].shape}")
+            
+            # Calculate MCMC statistics if requested
+            if log_mcmc_stats and results['mcmc_samples'] is not None:
+                if verbose:
+                    print("Calculating MCMC statistics...")
+                results['mcmc_stats'] = calculate_mcmc_statistics(results['mcmc_samples'], 
+                                                                objective.parameters)
+                        
         except Exception as e:
             if verbose:
                 print(f"MCMC sampling failed: {str(e)}")
@@ -1804,6 +1803,46 @@ def run_fitting_v2(objective, optimization_method='differential_evolution',
         print(f"\nFitting complete for model: {final_model_name}")
     
     return results, results_database, final_model_name
+
+
+def calculate_mcmc_statistics(chain, parameters):
+    """
+    Calculate statistics from MCMC chain.
+    """
+    import numpy as np
+    
+    stats = {}
+    
+    try:
+        # Flatten the chain if needed
+        if chain.ndim == 3:
+            flat_chain = chain.reshape(-1, chain.shape[-1])
+        else:
+            flat_chain = chain
+        
+        # Get parameter names for varying parameters only
+        param_names = [p.name for p in parameters.flattened() if p.vary]
+        
+        for i, param_name in enumerate(param_names):
+            if i < flat_chain.shape[1]:
+                samples = flat_chain[:, i]
+                
+                if len(samples) >= 3:
+                    percentiles = np.percentile(samples, [16, 50, 84])
+                else:
+                    percentiles = [samples[0], samples[0], samples[0]] if len(samples) > 0 else [0, 0, 0]
+                
+                stats[param_name] = {
+                    'mean': np.mean(samples) if len(samples) > 0 else 0,
+                    'median': np.median(samples) if len(samples) > 0 else 0,
+                    'std': np.std(samples) if len(samples) > 1 else 0,
+                    'percentiles': percentiles
+                }
+    
+    except Exception as e:
+        print(f"Error calculating MCMC statistics: {str(e)}")
+        
+    return stats
 
 
 def create_parameter_comparison_table(results_database, model_name, new_objective, new_mcmc_stats=None, energy=None):
