@@ -3,7 +3,7 @@ from copy import deepcopy
 import pandas as pd
 from datetime import datetime
 import re
-
+import os
 
 from refnx.dataset import ReflectDataset, Data1D
 from refnx.analysis import Transform, CurveFitter, Objective, Model, Parameter
@@ -2856,3 +2856,1016 @@ def plot_energy_vs_roughness(results_database, materials=None, model_names=None,
         print(f"Saved figure to {save_path}")
     
     return fig, ax
+
+
+def generate_sld_array_from_material(formula, density, energy_list, probe="x-ray"):
+    """
+    Generate an SLD array from MaterialSLD for a given energy range.
+    
+    Args:
+        formula: Chemical formula string
+        density: Material density in g/cm³
+        energy_list: List of energy values in eV
+        probe: "x-ray" or "neutron"
+    
+    Returns:
+        numpy array with columns [Energy, Real SLD, Imag SLD]
+    """
+    import numpy as np
+    from refnx.reflect import MaterialSLD
+    
+    sld_data = []
+    
+    for energy_ev in energy_list:
+        # Convert energy to wavelength (Å)
+        # For X-rays: E(eV) * wavelength(Å) = 12398 (hc constant in eV·Å)
+        wavelength = 12398.0 / energy_ev
+        
+        # Create MaterialSLD object for this energy
+        material = MaterialSLD(formula, density=density, probe=probe, wavelength=wavelength)
+        
+        # Extract SLD values using complex() method
+        sld_complex = complex(material)
+        
+        real_sld = sld_complex.real
+        imag_sld = sld_complex.imag
+        
+        sld_data.append([energy_ev, real_sld, imag_sld])
+    
+    return np.array(sld_data)
+
+def batch_fit_selected_models_v2(objectives_dict, structures_dict, energy_list=None,
+                                method='differential_evolution', workers=-1, popsize=15,
+                                steps=1000, burn=500, nthin=1, nwalkers=100,
+                                results_database=None, save_dir=None, 
+                                save_objectives=False, save_results=False,
+                                preserve_originals=True, verbose=True, 
+                                database_file=None, model_name=None):
+    """
+    Run batch fitting procedure on selected reflectometry models using run_fitting_V2.
+    Uses database approach with standardized refnx terminology.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        structures_dict (dict): Dictionary mapping energy values to Structure objects
+        energy_list (list, optional): List of energies to fit. If None, fit all available models.
+        method (str): Optimization method ('differential_evolution', 'least_squares', etc.)
+        workers (int): Number of workers for parallel optimization (-1 for all cores)
+        popsize (int): Population size for differential evolution
+        steps (int): Number of MCMC steps for sampling
+        burn (int): Number of burn-in steps to discard
+        nthin (int): Thinning factor for MCMC sampling
+        nwalkers (int): Number of walkers for MCMC sampling
+        results_database (DataFrame, optional): Existing results database to append to
+        save_dir (str, optional): Directory to save objectives and results
+        save_objectives (bool): Whether to save objective functions
+        save_results (bool): Whether to save results dictionaries
+        preserve_originals (bool): Whether to preserve original objectives in a separate dict
+        verbose (bool): Whether to print detailed output
+        database_file (str, optional): Path to save/load database CSV file
+        model_name (str, optional): Name for all models in this batch. If None, uses 'Model1'.
+        
+    Returns:
+        dict: Dictionary containing:
+            - 'fitted_objectives': Dictionary of fitted objective functions
+            - 'original_objectives': Dictionary of original objectives (if preserve_originals=True)
+            - 'results_database': Updated pandas DataFrame with all fitting results
+            - 'individual_results': Dictionary of individual fitting results per energy
+            - 'summary_stats': Summary statistics of the batch fitting
+    """
+    import copy
+    import pandas as pd
+    import numpy as np
+    import os
+    
+    # Import the required functions (assuming they're available in the current scope)
+    try:
+        from Model_Setup import run_fitting_v2, create_empty_results_database, save_database_to_file, load_database_from_file
+    except ImportError as e:
+        print(f"Warning: Could not import required functions: {e}")
+        print("Make sure Model_Setup.py is available and contains the required functions")
+        return None
+    
+    print("="*60)
+    print("BATCH FITTING WITH DATABASE APPROACH - V2")
+    print("="*60)
+    
+    # Load existing database if file is provided
+    if database_file is not None:
+        if os.path.exists(database_file):
+            results_database = load_database_from_file(database_file)
+            print(f"Loaded existing database from {database_file}")
+        else:
+            print(f"Database file {database_file} not found. Creating new database.")
+    
+    # Initialize results database if not provided
+    if results_database is None:
+        results_database = create_empty_results_database()
+        print("Created new results database")
+    
+    # Determine which energies to fit
+    if energy_list is None:
+        available_energies = sorted(list(set(objectives_dict.keys()) & set(structures_dict.keys())))
+        print(f"No energy list provided. Using all available energies: {len(available_energies)} total")
+    else:
+        # Filter to only include energies that have both objectives and structures
+        available_energies = []
+        for energy in energy_list:
+            if energy in objectives_dict and energy in structures_dict:
+                available_energies.append(energy)
+            else:
+                print(f"Warning: Energy {energy} eV not found in both objectives and structures dictionaries")
+        print(f"Filtered energy list: {len(available_energies)} energies to fit")
+    
+    if not available_energies:
+        print("ERROR: No valid energies found for fitting!")
+        return None
+    
+    # Create save directory if specified
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"Using save directory: {save_dir}")
+    else:
+        save_dir = None
+    
+    # Initialize return dictionaries
+    fitted_objectives = {}
+    original_objectives = {}
+    original_structures = {}  # Add original structures preservation
+    individual_results = {}
+    
+    # Statistics tracking
+    successful_fits = 0
+    failed_fits = 0
+    initial_chi_squared_total = 0
+    final_chi_squared_total = 0
+    
+    print(f"\\nStarting batch fitting of {len(available_energies)} models...")
+    print(f"Using method: {method}")
+    print(f"MCMC settings: {steps} steps, {burn} burn-in, {nwalkers} walkers")
+    
+    # Main fitting loop
+    for i, energy in enumerate(available_energies):
+        print(f"\\n--- Processing Energy {i+1}/{len(available_energies)}: {energy} eV ---")
+        
+        try:
+            # Get the objective and structure for this energy
+            original_objective = objectives_dict[energy]
+            structure = structures_dict[energy]
+            
+            # Preserve original if requested
+            if preserve_originals:
+                original_objectives[energy] = copy.deepcopy(original_objective)
+                original_structures[energy] = copy.deepcopy(structure)
+            
+            # Create a working copy of the objective
+            working_objective = copy.deepcopy(original_objective)
+            
+            # Use the provided model name or default to 'Model1'
+            if model_name is not None:
+                energy_model_name = model_name
+            else:
+                energy_model_name = "Model1"
+            
+            # Record initial chi-squared
+            initial_chi2 = working_objective.chisqr()
+            initial_chi_squared_total += initial_chi2
+            
+            if verbose:
+                print(f"  Initial χ²: {initial_chi2:.6g}")
+            
+            # Run fitting using run_fitting_V2
+            fit_result = run_fitting_v2(
+                objective=working_objective,
+                method=method,
+                workers=workers,
+                popsize=popsize,
+                steps=steps,
+                burn=burn,
+                nthin=nthin,
+                nwalkers=nwalkers,
+                results_database=results_database,
+                log_mcmc_stats=True,
+                save_dir=save_dir,
+                save_objective=save_objectives,
+                save_results=save_results,
+                structure=structure,
+                model_name=energy_model_name,
+                add_to_database=True,
+                verbose=verbose,
+                energy=energy
+            )
+            
+            # Handle different return formats from run_fitting_v2
+            if isinstance(fit_result, tuple):
+                if len(fit_result) == 2:
+                    results, updated_database = fit_result
+                elif len(fit_result) == 3:
+                    results, updated_database, _ = fit_result  # Ignore third value
+                else:
+                    # Unexpected number of return values
+                    print(f"Warning: run_fitting_v2 returned {len(fit_result)} values, expected 2 or 3")
+                    results = fit_result[0]
+                    updated_database = fit_result[1]
+            else:
+                # Single return value
+                results = fit_result
+                updated_database = results_database
+            
+            # Update the main database
+            results_database = updated_database
+            
+            # Store results
+            fitted_objectives[energy] = working_objective
+            individual_results[energy] = results
+            
+            # Record final chi-squared
+            final_chi2 = working_objective.chisqr()
+            final_chi_squared_total += final_chi2
+            
+            # Calculate improvement
+            if initial_chi2 > 0:
+                improvement = (initial_chi2 - final_chi2) / initial_chi2 * 100
+                print(f"  Final χ²: {final_chi2:.6g} (improvement: {improvement:.1f}%)")
+            else:
+                print(f"  Final χ²: {final_chi2:.6g}")
+            
+            successful_fits += 1
+            
+        except Exception as e:
+            print(f"  ERROR: Failed to fit energy {energy} eV: {str(e)}")
+            failed_fits += 1
+            continue
+    
+    # Calculate summary statistics
+    print(f"\\n{'='*60}")
+    print("BATCH FITTING SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total models processed: {len(available_energies)}")
+    print(f"Successful fits: {successful_fits}")
+    print(f"Failed fits: {failed_fits}")
+    
+    if successful_fits > 0:
+        print(f"\\nOverall Performance:")
+        print(f"  Total initial χ²: {initial_chi_squared_total:.6g}")
+        print(f"  Total final χ²: {final_chi_squared_total:.6g}")
+        
+        if initial_chi_squared_total > 0:
+            overall_improvement = (initial_chi_squared_total - final_chi_squared_total) / initial_chi_squared_total * 100
+            print(f"  Overall improvement: {overall_improvement:.1f}%")
+        
+        # Database statistics
+        print(f"\\nDatabase Statistics:")
+        print(f"  Total entries in database: {len(results_database)}")
+        print(f"  Unique models: {results_database['model_name'].nunique()}")
+        print(f"  Energy range: {results_database['energy'].min():.1f} - {results_database['energy'].max():.1f} eV")
+    
+    # Save database to file if specified
+    if database_file is not None:
+        save_database_to_file(results_database, database_file)
+        print(f"\\nSaved updated database to: {database_file}")
+    
+    # Prepare summary statistics
+    summary_stats = {
+        'total_models': len(available_energies),
+        'successful_fits': successful_fits,
+        'failed_fits': failed_fits,
+        'initial_chi_squared_total': initial_chi_squared_total,
+        'final_chi_squared_total': final_chi_squared_total,
+        'overall_improvement_percent': (initial_chi_squared_total - final_chi_squared_total) / initial_chi_squared_total * 100 if initial_chi_squared_total > 0 else 0,
+        'save_directory': save_dir
+    }
+    
+    # Prepare return dictionary
+    return_dict = {
+        'fitted_objectives': fitted_objectives,
+        'results_database': results_database,
+        'individual_results': individual_results,
+        'summary_stats': summary_stats
+    }
+    
+    # Add originals if preserved
+    if preserve_originals:
+        return_dict['original_objectives'] = original_objectives
+        return_dict['original_structures'] = original_structures
+    
+    print(f"\\nBatch fitting completed successfully!")
+    
+    return return_dict
+
+def update_objective(objectives_dict, energy, material, updates):
+    """
+    Update parameter values and bounds for a specific energy and material in objectives dictionary.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        energy (float): Energy value to update
+        material (str): Material name (e.g., "Resist", "PS")
+        updates (dict): Dictionary of parameter updates with the following possible keys:
+            - "thickness": new thickness value
+            - "roughness": new roughness value  
+            - "sld_real": new real SLD value
+            - "sld_imag": new imaginary SLD value
+            - "thickness_bounds": (lower, upper, vary) tuple for thickness bounds
+            - "roughness_bounds": (lower, upper, vary) tuple for roughness bounds
+            - "sld_real_bounds": (lower, upper, vary) tuple for real SLD bounds
+            - "sld_imag_bounds": (lower, upper, vary) tuple for imaginary SLD bounds
+            
+    Returns:
+        dict: Updated objectives dictionary
+        
+    Example:
+        updated_objectives = update_objective(
+            objectives_dict=my_objectives,
+            energy=270.0,
+            material="Resist",
+            updates={
+                "thickness": 180.0,
+                "roughness": 5.0,
+                "sld_real_bounds": (2.0, 8.0, True),
+                "sld_imag_bounds": (0.0, 6.0, True),
+                "thickness_bounds": (175.0, 185.0, True),
+                "roughness_bounds": (3.0, 7.0, True)
+            }
+        )
+    """
+    import copy
+    
+    # Create a working copy
+    updated_objectives = copy.deepcopy(objectives_dict)
+    
+    # Check if energy exists
+    if energy not in updated_objectives:
+        print(f"Warning: Energy {energy} not found in objectives")
+        return updated_objectives
+    
+    objective = updated_objectives[energy]
+    
+    # Track updates made
+    updates_made = []
+    
+    # Iterate through all parameters to find matches
+    for param in objective.parameters.flattened():
+        param_name = param.name.lower()
+        
+        # Check if this parameter belongs to the specified material
+        if f"{material.lower()} - " not in param_name:
+            continue
+            
+        # Determine parameter type and update accordingly
+        param_updated = False
+        
+        # Handle thickness parameters
+        if "thick" in param_name:
+            if "thickness" in updates:
+                old_value = param.value
+                param.value = updates["thickness"]
+                updates_made.append(f"thickness value: {old_value} -> {param.value}")
+                param_updated = True
+                
+            if "thickness_bounds" in updates:
+                lower, upper, vary = updates["thickness_bounds"]
+                old_bounds = getattr(param, 'bounds', None)
+                old_vary = getattr(param, 'vary', None)
+                param.bounds = (lower, upper)
+                param.vary = vary
+                updates_made.append(f"thickness bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                param_updated = True
+        
+        # Handle roughness parameters
+        elif "rough" in param_name:
+            if "roughness" in updates:
+                old_value = param.value
+                param.value = updates["roughness"]
+                updates_made.append(f"roughness value: {old_value} -> {param.value}")
+                param_updated = True
+                
+            if "roughness_bounds" in updates:
+                lower, upper, vary = updates["roughness_bounds"]
+                old_bounds = getattr(param, 'bounds', None)
+                old_vary = getattr(param, 'vary', None)
+                param.bounds = (lower, upper)
+                param.vary = vary
+                updates_made.append(f"roughness bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                param_updated = True
+        
+        # Handle real SLD parameters
+        elif "sld" in param_name and "isld" not in param_name:
+            if "sld_real" in updates:
+                old_value = param.value
+                param.value = updates["sld_real"]
+                updates_made.append(f"sld_real value: {old_value} -> {param.value}")
+                param_updated = True
+                
+            if "sld_real_bounds" in updates:
+                lower, upper, vary = updates["sld_real_bounds"]
+                old_bounds = getattr(param, 'bounds', None)
+                old_vary = getattr(param, 'vary', None)
+                param.bounds = (lower, upper)
+                param.vary = vary
+                updates_made.append(f"sld_real bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                param_updated = True
+        
+        # Handle imaginary SLD parameters
+        elif "isld" in param_name:
+            if "sld_imag" in updates:
+                old_value = param.value
+                param.value = updates["sld_imag"]
+                updates_made.append(f"sld_imag value: {old_value} -> {param.value}")
+                param_updated = True
+                
+            if "sld_imag_bounds" in updates:
+                lower, upper, vary = updates["sld_imag_bounds"]
+                old_bounds = getattr(param, 'bounds', None)
+                old_vary = getattr(param, 'vary', None)
+                param.bounds = (lower, upper)
+                param.vary = vary
+                updates_made.append(f"sld_imag bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                param_updated = True
+        
+        if param_updated:
+            print(f"Updated parameter: {param.name}")
+    
+    # Print summary
+    if updates_made:
+        print(f"\nSuccessfully updated {len(updates_made)} parameter(s) for {material} at {energy} eV:")
+        for update in updates_made:
+            print(f"  - {update}")
+    else:
+        print(f"No matching parameters found for {material} at {energy} eV")
+    
+    return updated_objectives
+
+
+def get_parameter_info(objectives_dict, energy, material=None):
+    """
+    Get current parameter values and bounds for a specific energy and optionally material.
+    
+    Args:
+        objectives_dict (dict): Dictionary mapping energy values to Objective objects
+        energy (float): Energy value to inspect
+        material (str, optional): Material name to filter by
+        
+    Returns:
+        dict: Parameter information
+    """
+    if energy not in objectives_dict:
+        print(f"Energy {energy} not found in objectives")
+        return {}
+    
+    objective = objectives_dict[energy]
+    param_info = {}
+    
+    for param in objective.parameters.flattened():
+        param_name = param.name
+        
+        # Filter by material if specified
+        if material and f"{material} - " not in param_name:
+            continue
+        
+        param_info[param_name] = {
+            'value': param.value,
+            'bounds': getattr(param, 'bounds', None),
+            'vary': getattr(param, 'vary', None)
+        }
+    
+    return param_info
+
+
+def create_interactive_fit_explorer(batch_results, figsize=(16, 12), default_material=None, fitted_only=False):
+    """
+    Create an interactive widget for exploring fit results with the exact layout specified.
+    
+    Args:
+        batch_results (dict): Output from batch_fit_selected_models_v2
+        figsize (tuple): Figure size as (width, height)
+        default_material (str): Default material to select (if None, uses first available)
+        fitted_only (bool): If True, only plot fitted data (no original data). Default is False.
+        
+    Returns:
+        ipywidgets.VBox: Interactive widget
+    """
+    import ipywidgets as widgets
+    from IPython.display import display, clear_output
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    import pandas as pd
+    import numpy as np
+    
+    # Validate batch_results
+    if not batch_results or 'results_database' not in batch_results:
+        return widgets.HTML("<b>Error: Invalid batch_results provided</b>")
+    
+    # Extract data
+    results_database = batch_results['results_database']
+    fitted_objectives = batch_results['fitted_objectives']
+    original_objectives = batch_results.get('original_objectives', {})
+    individual_results = batch_results['individual_results']
+    
+    # Get original structures from batch_results if available
+    original_structures = batch_results.get('original_structures', {})
+    
+    if results_database.empty:
+        return widgets.HTML("<b>Error: No data found in results database</b>")
+    
+    # Extract available materials and energies
+    all_parameters = results_database['parameter'].dropna().unique()
+    
+    # Extract material names (everything before the first ' - ' in parameter names)
+    materials = set()
+    for param in all_parameters:
+        if ' - ' in param:
+            material = param.split(' - ')[0].strip()
+            materials.add(material)
+    
+    materials = sorted(list(materials))
+    available_energies = sorted(results_database['energy'].dropna().unique())
+    
+    if not materials:
+        return widgets.HTML("<b>Error: No materials found in database</b>")
+    
+    # Set default material
+    if default_material and default_material in materials:
+        selected_material = default_material
+    else:
+        selected_material = materials[0]
+    
+    print(f"Available materials: {materials}")
+    print(f"Available energies: {available_energies}")
+    if fitted_only:
+        print("Mode: Fitted data only")
+    else:
+        if original_structures:
+            print(f"Original structures available for energies: {list(original_structures.keys())}")
+        else:
+            print("Warning: No original structures found - SLD comparison will show fitted only")
+    
+    # Create widgets
+    material_dropdown = widgets.Dropdown(
+        options=materials,
+        value=selected_material,
+        description='Material:',
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(width='200px')
+    )
+    
+    parameter_radio = widgets.RadioButtons(
+        options=[
+            ('SLD/iSLD', 'sld'),
+            ('Thickness', 'thick'),
+            ('Roughness', 'rough')
+        ],
+        value='sld',
+        description='Parameter:',
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(width='150px')
+    )
+    
+    energy_range_widget = widgets.FloatRangeSlider(
+        value=[min(available_energies), max(available_energies)],
+        min=min(available_energies),
+        max=max(available_energies),
+        step=1.0,
+        description='Energy range:',
+        continuous_update=False,
+        readout_format='.1f',
+        style={'description_width': 'initial'},
+        layout=widgets.Layout(width='400px')
+    )
+    
+    # Output widget for the plots
+    plot_output = widgets.Output()
+    
+    # Status display
+    status_label = widgets.HTML(value="Click on a point in the parameter plot to update comparisons")
+    
+    def get_parameter_data(material, param_type, energy_range):
+        """Extract parameter data for plotting"""
+        # Filter database
+        material_data = results_database[
+            results_database['parameter'].str.contains(f"{material} - ", case=False, na=False)
+        ]
+        
+        # Filter by parameter type
+        if param_type == 'sld':
+            # Include both sld and isld
+            param_data = material_data[
+                material_data['parameter'].str.contains('sld', case=False, na=False)
+            ]
+        else:
+            param_data = material_data[
+                material_data['parameter'].str.contains(param_type, case=False, na=False)
+            ]
+        
+        # Filter by energy range
+        param_data = param_data[
+            (param_data['energy'] >= energy_range[0]) & 
+            (param_data['energy'] <= energy_range[1])
+        ]
+        
+        return param_data
+    
+    def get_original_parameter_data(material, param_type, energy_range):
+        """Extract original parameter data if available"""
+        if fitted_only:
+            return pd.DataFrame()  # Return empty DataFrame if fitted_only is True
+            
+        original_data = []
+        
+        for energy in available_energies:
+            if energy < energy_range[0] or energy > energy_range[1]:
+                continue
+                
+            if energy in original_objectives:
+                try:
+                    orig_obj = original_objectives[energy]
+                    for param in orig_obj.parameters.flattened():
+                        param_name = param.name
+                        
+                        # Check if parameter matches material and type
+                        if f"{material} - " in param_name:
+                            if param_type == 'sld' and 'sld' in param_name.lower():
+                                original_data.append({
+                                    'energy': energy,
+                                    'parameter': param_name,
+                                    'value': param.value,
+                                    'type': 'original'
+                                })
+                            elif param_type in param_name.lower():
+                                original_data.append({
+                                    'energy': energy,
+                                    'parameter': param_name,
+                                    'value': param.value,
+                                    'type': 'original'
+                                })
+                except Exception as e:
+                    continue
+        
+        return pd.DataFrame(original_data)
+    
+    def update_plots():
+        """Update all plots based on current widget values"""
+        
+        with plot_output:
+            clear_output(wait=True)
+            
+            # Get current values
+            material = material_dropdown.value
+            param_type = parameter_radio.value
+            energy_range = energy_range_widget.value
+            
+            # Get parameter data
+            fitted_data = get_parameter_data(material, param_type, energy_range)
+            original_data = get_original_parameter_data(material, param_type, energy_range)
+            
+            if fitted_data.empty:
+                print(f"No data found for {material} - {param_type}")
+                return
+            
+            # Create the figure with custom layout - tighter spacing
+            fig = plt.figure(figsize=figsize)
+            gs = GridSpec(2, 2, figure=fig, height_ratios=[1, 1], width_ratios=[1, 1],
+                         hspace=0.25, wspace=0.25, top=0.95, bottom=0.08, left=0.08, right=0.95)
+            
+            # Top plot spans both columns (parameter vs energy)
+            ax_param = fig.add_subplot(gs[0, :])
+            
+            # Bottom plots
+            ax_refl = fig.add_subplot(gs[1, 0])
+            ax_sld = fig.add_subplot(gs[1, 1])
+            
+            # Plot parameter data - separate SLD and iSLD by marker shape
+            clickable_artists = []
+            
+            # Define markers for different parameter types
+            markers = {'sld': 'o', 'isld': 's'}  # circle for sld, square for isld
+            
+            if param_type == 'sld':
+                # For SLD type, plot both sld and isld with different markers
+                param_types_to_plot = ['sld', 'isld']
+            else:
+                # For other types, just plot the selected type
+                param_types_to_plot = [param_type]
+            
+            # First pass: Plot bounds (behind the points)
+            for sub_param_type in param_types_to_plot:
+                # Process fitted data for bounds
+                fitted_sub_data = fitted_data[
+                    fitted_data['parameter'].str.contains(sub_param_type, case=False, na=False)
+                ]
+                
+                if not fitted_sub_data.empty:
+                    # Group by energy to get one point per energy
+                    fitted_grouped = fitted_sub_data.groupby('energy').agg({
+                        'value': 'first',
+                        'parameter': 'first',
+                        'bound_low': 'first',
+                        'bound_high': 'first'
+                    }).reset_index()
+                    
+                    # Add bounds as error bars for fitted data only
+                    valid_bounds = fitted_grouped.dropna(subset=['bound_low', 'bound_high'])
+                    if not valid_bounds.empty:
+                        # Only plot error bars where bounds are meaningful (not infinite)
+                        finite_bounds = valid_bounds[
+                            (valid_bounds['bound_low'] > -1e10) & 
+                            (valid_bounds['bound_high'] < 1e10)
+                        ]
+                        
+                        if not finite_bounds.empty:
+                            lower_errs = finite_bounds['value'] - finite_bounds['bound_low']
+                            upper_errs = finite_bounds['bound_high'] - finite_bounds['value']
+                            
+                            # Choose color based on parameter type
+                            if sub_param_type == 'sld':
+                                bounds_color = 'black'
+                            elif sub_param_type == 'isld':
+                                bounds_color = 'grey'
+                            else:
+                                bounds_color = 'black'  # default for other parameters
+                            
+                            ax_param.errorbar(
+                                finite_bounds['energy'], finite_bounds['value'],
+                                yerr=[lower_errs, upper_errs],
+                                fmt='none',  # No markers, just error bars
+                                color=bounds_color,
+                                alpha=0.6,
+                                capsize=3,
+                                capthick=1,
+                                elinewidth=1,
+                                zorder=1  # Behind the points
+                            )
+            
+            # Second pass: Plot data points (on top of bounds)
+            for sub_param_type in param_types_to_plot:
+                # Process original data (red) - only if not fitted_only
+                if not fitted_only and not original_data.empty:
+                    # Filter for specific parameter type (sld or isld)
+                    orig_sub_data = original_data[
+                        original_data['parameter'].str.contains(sub_param_type, case=False, na=False)
+                    ]
+                    
+                    if not orig_sub_data.empty:
+                        # Group by energy to get one point per energy
+                        orig_grouped = orig_sub_data.groupby('energy').agg({
+                            'value': 'first',
+                            'parameter': 'first'
+                        }).reset_index()
+                        
+                        marker = markers.get(sub_param_type, 'o')
+                        label = f'Original {sub_param_type.upper()}'
+                        
+                        scatter_orig = ax_param.scatter(
+                            orig_grouped['energy'], orig_grouped['value'],
+                            c='red', s=60, alpha=0.7, picker=True, 
+                            edgecolors='black', linewidth=0.5,
+                            marker=marker, label=label,
+                            zorder=3  # On top of bounds
+                        )
+                        clickable_artists.append(('original', scatter_orig, orig_grouped))
+                
+                # Process fitted data (blue)
+                fitted_sub_data = fitted_data[
+                    fitted_data['parameter'].str.contains(sub_param_type, case=False, na=False)
+                ]
+                
+                if not fitted_sub_data.empty:
+                    # Group by energy to get one point per energy
+                    fitted_grouped = fitted_sub_data.groupby('energy').agg({
+                        'value': 'first',
+                        'parameter': 'first',
+                        'bound_low': 'first',
+                        'bound_high': 'first'
+                    }).reset_index()
+                    
+                    marker = markers.get(sub_param_type, 'o')
+                    label = f'Fitted {sub_param_type.upper()}'
+                    
+                    scatter_fit = ax_param.scatter(
+                        fitted_grouped['energy'], fitted_grouped['value'],
+                        c='blue', s=60, alpha=0.7, picker=True,
+                        edgecolors='black', linewidth=0.5,
+                        marker=marker, label=label,
+                        zorder=3  # On top of bounds
+                    )
+                    clickable_artists.append(('fitted', scatter_fit, fitted_grouped))
+            
+            # Style parameter plot
+            ax_param.set_xlabel('Energy (eV)', fontsize=12)
+            ax_param.set_ylabel(f'{param_type.upper()} Value', fontsize=12)
+            
+            # Update title based on mode
+            if fitted_only:
+                plot_title = f'Plot of parameters vs energy (fitted only)\\nMaterial: {material}'
+            else:
+                plot_title = f'Plot of parameters vs energy (with bounds)\\nMaterial: {material}'
+            
+            ax_param.set_title(plot_title, 
+                              fontsize=14, fontweight='bold', color='white', 
+                              bbox=dict(boxstyle='round,pad=0.5', facecolor='teal', alpha=0.8))
+            ax_param.grid(True, alpha=0.3)
+            
+            # Place legend inside the plot area to avoid cutoff
+            if len(clickable_artists) > 0:
+                ax_param.legend(loc='upper right', fontsize='small', framealpha=0.9)
+            
+            # Initialize bottom plots with placeholder text
+            ax_refl.text(0.5, 0.5, 'Reflectivity plot\\ncomparing original and fitted result\\n\\nClick on a point above to update', 
+                        ha='center', va='center', transform=ax_refl.transAxes,
+                        bbox=dict(boxstyle='round,pad=0.5', facecolor='teal', alpha=0.8, edgecolor='white'),
+                        color='white', fontsize=12, fontweight='bold')
+            ax_refl.set_xticks([])
+            ax_refl.set_yticks([])
+            
+            ax_sld.text(0.5, 0.5, 'SLD profile Plot\\nComparing original\\nand fitted result\\n\\nClick on a point above to update', 
+                       ha='center', va='center', transform=ax_sld.transAxes,
+                       bbox=dict(boxstyle='round,pad=0.5', facecolor='teal', alpha=0.8, edgecolor='white'),
+                       color='white', fontsize=12, fontweight='bold')
+            ax_sld.set_xticks([])
+            ax_sld.set_yticks([])
+            
+            def update_comparison_plots(energy):
+                """Update reflectivity and SLD comparison plots for selected energy"""
+                
+                # Clear the plots
+                ax_refl.clear()
+                ax_sld.clear()
+                
+                try:
+                    # Get objectives for this energy
+                    fitted_obj = fitted_objectives.get(energy)
+                    
+                    # Only get original objective if not in fitted_only mode
+                    if fitted_only:
+                        original_obj = fitted_obj  # Use fitted as "original" for comparison
+                    else:
+                        original_obj = original_objectives.get(energy, fitted_obj)
+                    
+                    if fitted_obj is None:
+                        ax_refl.text(0.5, 0.5, f'No data for {energy} eV', ha='center', va='center',
+                                   transform=ax_refl.transAxes)
+                        ax_sld.text(0.5, 0.5, f'No data for {energy} eV', ha='center', va='center',
+                                  transform=ax_sld.transAxes)
+                        return
+                    
+                    # Plot reflectivity comparison
+                    dataset = fitted_obj.data
+                    q = dataset.x
+                    r_obs = dataset.y
+                    
+                    if fitted_only:
+                        # Only plot fitted data
+                        r_fit = fitted_obj.model(q)
+                        
+                        ax_refl.semilogy(q, r_obs, 'o', markersize=3, alpha=0.6, color='gray', label='Observed')
+                        ax_refl.semilogy(q, r_fit, '-', linewidth=2, color='blue', label='Fitted')
+                    else:
+                        # Plot both original and fitted
+                        r_orig = original_obj.model(q)
+                        r_fit = fitted_obj.model(q)
+                        
+                        ax_refl.semilogy(q, r_obs, 'o', markersize=3, alpha=0.6, color='gray', label='Observed')
+                        ax_refl.semilogy(q, r_orig, '-', linewidth=2, color='red', label='Original')
+                        ax_refl.semilogy(q, r_fit, '-', linewidth=2, color='blue', label='Fitted')
+                    
+                    ax_refl.set_xlabel('Q (Å⁻¹)')
+                    ax_refl.set_ylabel('Reflectivity')
+                    ax_refl.set_title(f'Reflectivity Comparison\\n{energy} eV', fontweight='bold')
+                    ax_refl.legend(fontsize='small')
+                    ax_refl.grid(True, alpha=0.3)
+                    
+                    # Plot SLD profile comparison - handle structures parallel to fitted structures
+                    fitted_structure = None
+                    original_structure = None
+                    
+                    # Get fitted structure (same way as before)
+                    if energy in individual_results and 'structure' in individual_results[energy]:
+                        fitted_structure = individual_results[energy]['structure']
+                    
+                    # Get original structure (only if not fitted_only mode)
+                    if not fitted_only and energy in original_structures:
+                        original_structure = original_structures[energy]
+                    
+                    if fitted_structure is not None or original_structure is not None:
+                        try:
+                            # Plot original SLD profile if available and not in fitted_only mode
+                            if not fitted_only and original_structure is not None:
+                                z_orig, sld_orig = original_structure.sld_profile()
+                                
+                                if hasattr(sld_orig, 'real'):
+                                    ax_sld.plot(z_orig, sld_orig.real, 'r-', linewidth=2, label='Real SLD (Original)')
+                                    if hasattr(sld_orig, 'imag'):
+                                        ax_sld.plot(z_orig, sld_orig.imag, 'r--', linewidth=2, label='Imag SLD (Original)')
+                                else:
+                                    ax_sld.plot(z_orig, sld_orig, 'r-', linewidth=2, label='SLD (Original)')
+                            
+                            # Plot fitted SLD profile if available
+                            if fitted_structure is not None:
+                                z_fit, sld_fit = fitted_structure.sld_profile()
+                                
+                                if hasattr(sld_fit, 'real'):
+                                    ax_sld.plot(z_fit, sld_fit.real, 'b-', linewidth=2, label='Real SLD (Fitted)')
+                                    if hasattr(sld_fit, 'imag'):
+                                        ax_sld.plot(z_fit, sld_fit.imag, 'b--', linewidth=2, label='Imag SLD (Fitted)')
+                                else:
+                                    ax_sld.plot(z_fit, sld_fit, 'b-', linewidth=2, label='SLD (Fitted)')
+                            
+                            ax_sld.set_xlabel('Distance (Å)')
+                            ax_sld.set_ylabel('SLD (×10⁻⁶ Å⁻²)')
+                            ax_sld.set_title(f'SLD Profile Comparison\\n{energy} eV', fontweight='bold')
+                            ax_sld.legend(fontsize='small')
+                            ax_sld.grid(True, alpha=0.3)
+                            
+                        except Exception as e:
+                            ax_sld.text(0.5, 0.5, f'SLD Profile Error:\\n{str(e)}', 
+                                       ha='center', va='center', transform=ax_sld.transAxes)
+                    else:
+                        ax_sld.text(0.5, 0.5, 'No structures available\\nfor SLD profile comparison', 
+                                   ha='center', va='center', transform=ax_sld.transAxes)
+                    
+                    # Update status
+                    if fitted_only:
+                        fitted_chi2 = fitted_obj.chisqr()
+                        status_label.value = (f"<b>Energy:</b> {energy} eV | "
+                                            f"<b>Fitted χ²:</b> {fitted_chi2:.4g}")
+                    else:
+                        orig_chi2 = original_obj.chisqr()
+                        fitted_chi2 = fitted_obj.chisqr()
+                        improvement = (orig_chi2 - fitted_chi2) / orig_chi2 * 100 if orig_chi2 > 0 else 0
+                        
+                        status_label.value = (f"<b>Energy:</b> {energy} eV | "
+                                            f"<b>Original χ²:</b> {orig_chi2:.4g} | "
+                                            f"<b>Fitted χ²:</b> {fitted_chi2:.4g} | "
+                                            f"<b>Improvement:</b> {improvement:.1f}%")
+                    
+                except Exception as e:
+                    ax_refl.text(0.5, 0.5, f'Error: {str(e)}', ha='center', va='center',
+                               transform=ax_refl.transAxes)
+                    ax_sld.text(0.5, 0.5, f'Error: {str(e)}', ha='center', va='center',
+                              transform=ax_sld.transAxes)
+                    status_label.value = f"<b>Error:</b> {str(e)}"
+                
+                fig.canvas.draw_idle()
+            
+            def on_pick(event):
+                """Handle click events on parameter plot"""
+                try:
+                    if hasattr(event, 'ind') and len(event.ind) > 0:
+                        ind = event.ind[0]
+                        
+                        # Find which artist was clicked
+                        for plot_type, artist, data in clickable_artists:
+                            if event.artist == artist:
+                                energy = data.iloc[ind]['energy']
+                                print(f"Clicked on {plot_type} point at {energy} eV")
+                                update_comparison_plots(energy)
+                                break
+                                
+                except Exception as e:
+                    print(f"Error in click handler: {e}")
+                    status_label.value = f"<b>Error:</b> {str(e)}"
+            
+            # Connect the click event
+            fig.canvas.mpl_connect('pick_event', on_pick)
+            
+            # Tight layout with minimal padding
+            plt.subplots_adjust(top=0.95, bottom=0.08, left=0.08, right=0.95, hspace=0.25, wspace=0.25)
+            plt.show()
+    
+    # Connect widget events
+    def on_widget_change(change):
+        update_plots()
+    
+    material_dropdown.observe(on_widget_change, names='value')
+    parameter_radio.observe(on_widget_change, names='value')
+    energy_range_widget.observe(on_widget_change, names='value')
+    
+    # Create the layout with minimal spacing and no header
+    controls_box = widgets.HBox([
+        widgets.VBox([
+            widgets.HTML("<b>Box to select materials</b>", 
+                        layout=widgets.Layout(background_color='teal', color='white', 
+                                            padding='3px', margin='1px')),
+            material_dropdown
+        ], layout=widgets.Layout(width='250px')),
+        
+        widgets.VBox([
+            parameter_radio
+        ], layout=widgets.Layout(width='200px')),
+        
+        widgets.VBox([
+            energy_range_widget
+        ], layout=widgets.Layout(width='450px'))
+    ], layout=widgets.Layout(margin='0px 0px 5px 0px'))  # Minimal margin
+    
+    # Main widget layout with minimal spacing
+    main_widget = widgets.VBox([
+        controls_box,
+        plot_output,
+        status_label
+    ], layout=widgets.Layout(margin='0px', padding='0px'))
+    
+    # Initial plot
+    update_plots()
+    
+    return main_widget
