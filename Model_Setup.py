@@ -1616,3 +1616,1243 @@ def get_parameter_info(objective, parameter_pattern=None):
         return pd.DataFrame(columns=['name', 'value', 'stderr', 'vary', 
                                    'bound_low', 'bound_high', 'near_bounds', 'bound_pct'])
 
+
+
+
+
+
+def run_fitting_v2(objective, method='differential_evolution', 
+                   workers=-1, popsize=15, steps=1000, burn=500,
+                   nthin=1, nwalkers=100,
+                   results_database=None, log_mcmc_stats=True,
+                   save_dir=None, save_objective=False, save_results=False,
+                   structure=None, model_name=None, add_to_database=True,
+                   verbose=False, energy=None):
+    """
+    Run fitting procedure on a reflectometry model with optimization and MCMC sampling,
+    with option to add results to a pandas database. If the same model is run again,
+    automatically creates a comparison plot and replaces the old result if the new one is better.
+    
+    Args:
+        objective: The objective function to fit
+        method: Optimization method to use ('differential_evolution', 'least_squares', etc.)
+        workers: Number of workers for parallel optimization (-1 for all cores)
+        popsize: Population size for differential evolution
+        steps: Number of steps for MCMC sampling (total steps, not in thousands)
+        burn: Number of burn-in steps to discard (handled post-sampling)
+        nthin: Thinning factor for MCMC sampling
+        nwalkers: Number of walkers for MCMC sampling
+        results_database: Existing pandas DataFrame to append results to (None to create new)
+        log_mcmc_stats: Whether to add MCMC statistics to the database
+        save_dir: Directory to save objective and results (None to skip saving)
+        save_objective: Whether to save the objective function
+        save_results: Whether to save the results dictionary
+        structure: The structure object associated with the objective
+        model_name: Name for the model (if None, uses objective.model.name)
+        add_to_database: Whether to add results to the database (True by default)
+        verbose: Whether to print detailed output (False by default)
+        energy: Energy value in eV for this fit (None if not energy-dependent)
+        
+    Returns:
+        Tuple of (results_dict, updated_results_database, final_model_name)
+    """
+    from refnx.analysis import CurveFitter
+    
+    # Extract model name if not provided
+    if model_name is None:
+        model_name = getattr(objective.model, 'name', 'unnamed_model')
+    
+    if verbose:
+        print(f"Fitting model: {model_name}")
+    
+    # Initialize results database if none provided and we want to add to it
+    if results_database is None and add_to_database:
+        results_database = create_empty_results_database()
+    
+    # Check if this model already exists in the database
+    existing_fit = None
+    if add_to_database and results_database is not None and not results_database.empty:
+        # Check for existing fit with same model name AND energy
+        if energy is not None:
+            existing_models = results_database[
+                (results_database['model_name'] == model_name) & 
+                (results_database['energy'] == energy)
+            ]
+        else:
+            # If no energy specified, check model name only (for non-energy-dependent fits)
+            existing_models = results_database[results_database['model_name'] == model_name]
+            
+        if not existing_models.empty:
+            existing_fit = existing_models.iloc[0]['goodness_of_fit']
+            if verbose:
+                energy_str = f" at {energy} eV" if energy is not None else ""
+                print(f"Found existing fit for {model_name}{energy_str} with goodness of fit: {existing_fit:.6g}")
+    
+    # Initialize results dictionary
+    results = {
+        'objective': objective,
+        'initial_chi_squared': objective.chisqr(),
+        'optimized_parameters': None,
+        'optimized_chi_squared': None,
+        'mcmc_samples': None,
+        'mcmc_stats': None,
+        'structure': structure
+    }
+    
+    # Create fitter
+    if verbose:
+        print(f"Initializing CurveFitter with {model_name} model")
+    fitter = CurveFitter(objective)
+    
+    # Run optimization
+    if verbose:
+        print(f"Starting optimization using {method}...")
+    if method == 'differential_evolution':
+        fitter.fit(method, workers=workers, popsize=popsize)
+    else:
+        fitter.fit(method)
+    
+    # Store optimization results
+    results['optimized_parameters'] = objective.parameters.pvals.copy()
+    results['optimized_chi_squared'] = objective.chisqr()
+    
+    if verbose:
+        print(f"Optimization complete. Chi-squared: {results['optimized_chi_squared']:.6g}")
+    
+    # Run MCMC if requested
+    if steps > 0:
+        if verbose:
+            print(f"Starting MCMC sampling with {steps} steps...")
+        
+        try:
+            # Run MCMC sampling
+            fitter.sample(steps, nthin=nthin)
+            
+            # Store the chain
+            results['mcmc_samples'] = fitter.chain
+            
+            # Check what we got and handle burn-in
+            if results['mcmc_samples'] is not None and burn > 0:
+                if verbose:
+                    print(f"Chain shape: {results['mcmc_samples'].shape}")
+                
+                # Handle burn-in removal based on chain dimensions
+                if results['mcmc_samples'].ndim == 3:  # (nwalkers, nsteps, nparams)
+                    burn_steps = min(burn, results['mcmc_samples'].shape[1])
+                    results['mcmc_samples'] = results['mcmc_samples'][:, burn_steps:, :]
+                elif results['mcmc_samples'].ndim == 2:  # (nsteps, nparams)
+                    burn_steps = min(burn, results['mcmc_samples'].shape[0])
+                    results['mcmc_samples'] = results['mcmc_samples'][burn_steps:, :]
+                
+                if verbose:
+                    print(f"Removed {burn_steps} burn-in steps")
+                    print(f"Final chain shape: {results['mcmc_samples'].shape}")
+            
+            # Calculate MCMC statistics if requested
+            if log_mcmc_stats and results['mcmc_samples'] is not None:
+                if verbose:
+                    print("Calculating MCMC statistics...")
+                results['mcmc_stats'] = calculate_mcmc_statistics(results['mcmc_samples'], 
+                                                                objective.parameters)
+                        
+        except Exception as e:
+            if verbose:
+                print(f"MCMC sampling failed: {str(e)}")
+            results['mcmc_samples'] = None
+            results['mcmc_stats'] = None
+    
+    # Handle database updates and comparisons
+    final_model_name = model_name
+    if add_to_database and results_database is not None:
+        new_gof = results['optimized_chi_squared']
+        
+        if existing_fit is not None:
+            # Compare with existing fit
+            if verbose:
+                print(f"\nComparing fits:")
+                print(f"  Previous fit: {existing_fit:.6g}")
+                print(f"  New fit: {new_gof:.6g}")
+                
+                # Create parameter comparison table only
+                print("\nParameter Comparison Table:")
+                create_parameter_comparison_table(results_database, model_name, objective, results['mcmc_stats'], energy)
+            
+            # Replace if new fit is better
+            if new_gof < existing_fit:
+                if verbose:
+                    print(f"\nNew fit is better! Replacing old result in database.")
+                results_database = replace_fit_in_database(results_database, model_name, 
+                                                         objective, results['mcmc_stats'], energy)
+            else:
+                if verbose:
+                    print(f"\nPrevious fit was better. Not updating database.")
+                
+        else:
+            # First time running this model
+            if verbose:
+                print("Adding new fit to database...")
+            results_database, final_model_name = add_fit_to_database(
+                objective, model_name, results_database, results['mcmc_stats'], energy)
+    
+    # Save files if requested
+    if save_dir is not None:
+        save_fitting_files(results, save_dir, final_model_name, save_objective, 
+                          save_results, structure)
+    
+    if verbose:
+        print(f"\nFitting complete for model: {final_model_name}")
+    
+    return results, results_database, final_model_name
+
+
+def calculate_mcmc_statistics(chain, parameters):
+    """
+    Calculate statistics from MCMC chain.
+    """
+    import numpy as np
+    
+    stats = {}
+    
+    try:
+        # Flatten the chain if needed
+        if chain.ndim == 3:
+            flat_chain = chain.reshape(-1, chain.shape[-1])
+        else:
+            flat_chain = chain
+        
+        # Get parameter names for varying parameters only
+        param_names = [p.name for p in parameters.flattened() if p.vary]
+        
+        for i, param_name in enumerate(param_names):
+            if i < flat_chain.shape[1]:
+                samples = flat_chain[:, i]
+                
+                if len(samples) >= 3:
+                    percentiles = np.percentile(samples, [16, 50, 84])
+                else:
+                    percentiles = [samples[0], samples[0], samples[0]] if len(samples) > 0 else [0, 0, 0]
+                
+                stats[param_name] = {
+                    'mean': np.mean(samples) if len(samples) > 0 else 0,
+                    'median': np.median(samples) if len(samples) > 0 else 0,
+                    'std': np.std(samples) if len(samples) > 1 else 0,
+                    'percentiles': percentiles
+                }
+    
+    except Exception as e:
+        print(f"Error calculating MCMC statistics: {str(e)}")
+        
+    return stats
+
+
+def create_parameter_comparison_table(results_database, model_name, new_objective, new_mcmc_stats=None, energy=None):
+    """
+    Create a table comparing parameters between old and new fits.
+    Only includes parameters that are being fit (vary=True).
+    Compares fits with the same model name and energy.
+    """
+    # Define color codes
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    RESET = '\033[0m'
+    
+    # Get old parameters from database (only varying parameters)
+    # Filter by both model name and energy
+    if energy is not None:
+        old_params = results_database[
+            (results_database['model_name'] == model_name) & 
+            (results_database['energy'] == energy) &
+            (results_database['vary'] == True)
+        ].copy()
+    else:
+        old_params = results_database[
+            (results_database['model_name'] == model_name) & 
+            (results_database['vary'] == True)
+        ].copy()
+    
+    # Get new parameters (only varying parameters)
+    new_params = []
+    for param in new_objective.parameters.flattened():
+        if not getattr(param, 'vary', False):
+            continue  # Skip fixed parameters
+            
+        stderr = getattr(param, 'stderr', None)
+        # Use MCMC stderr if available
+        if new_mcmc_stats and param.name in new_mcmc_stats:
+            mcmc_stderr = new_mcmc_stats[param.name].get('std', None)
+            if mcmc_stderr is not None:
+                stderr = mcmc_stderr
+        
+        # Get bounds
+        try:
+            bounds = getattr(param, 'bounds', None)
+            if bounds is not None and len(bounds) == 2:
+                bound_low, bound_high = bounds
+            else:
+                bound_low, bound_high = None, None
+        except:
+            bound_low, bound_high = None, None
+        
+        new_params.append({
+            'parameter': param.name,
+            'value': param.value,
+            'stderr': stderr,
+            'vary': True,
+            'bound_low': bound_low,
+            'bound_high': bound_high
+        })
+    
+    # Create comparison DataFrame
+    comparison_data = []
+    for new_param in new_params:
+        param_name = new_param['parameter']
+        old_match = old_params[old_params['parameter'] == param_name]
+        
+        if not old_match.empty:
+            old_value = old_match.iloc[0]['value']
+            old_stderr = old_match.iloc[0]['stderr']
+            
+            # Calculate relative change
+            if old_value != 0:
+                rel_change = ((new_param['value'] - old_value) / old_value) * 100
+            else:
+                rel_change = None
+            
+            # Check if new parameter is near bounds (within 1%)
+            near_bounds = False
+            if (new_param['bound_low'] is not None and 
+                new_param['bound_high'] is not None):
+                bound_range = new_param['bound_high'] - new_param['bound_low']
+                threshold = 0.01 * bound_range  # 1% of range
+                
+                if (abs(new_param['value'] - new_param['bound_low']) < threshold or 
+                    abs(new_param['bound_high'] - new_param['value']) < threshold):
+                    near_bounds = True
+            
+            # Format the new value with color coding
+            if near_bounds:
+                new_value_str = f"{RED}{new_param['value']:.6g}{RESET}"
+                new_error_str = f"{RED}{new_param['stderr']:.6g}{RESET}" if new_param['stderr'] is not None else f"{RED}N/A{RESET}"
+            else:
+                new_value_str = f"{GREEN}{new_param['value']:.6g}{RESET}"
+                new_error_str = f"{GREEN}{new_param['stderr']:.6g}{RESET}" if new_param['stderr'] is not None else f"{GREEN}N/A{RESET}"
+            
+            comparison_data.append({
+                'Parameter': param_name,
+                'Old Value': f"{old_value:.6g}" if old_value is not None else "N/A",
+                'New Value': new_value_str,
+                'Change (%)': f"{rel_change:.2f}" if rel_change is not None else "N/A"
+            })
+    
+    # Display table
+    if comparison_data:
+        import pandas as pd
+        df = pd.DataFrame(comparison_data)
+        print("Parameter Comparison (Fitted Parameters Only):")
+        print("Legend: " + GREEN + "Green = Normal" + RESET + " | " + RED + "Red = Near bounds (±1%)" + RESET)
+        print(df.to_string(index=False))
+    else:
+        print("No varying parameters to compare.")
+
+
+def get_sld_profile(structure):
+    """
+    Get SLD profile from a structure object.
+    Returns depth and SLD arrays for both real and imaginary components.
+    """
+    try:
+        z, sld = structure.sld_profile()
+        if hasattr(sld, 'real') and hasattr(sld, 'imag'):
+            return z, sld.real, z, sld.imag
+        else:
+            # If sld is just real values
+            return z, sld, z, np.zeros_like(sld)
+    except:
+        # Fallback implementation
+        try:
+            z = np.linspace(-10, 300, 1000)
+            sld_profile = structure.sld_profile(z)
+            if hasattr(sld_profile, 'real'):
+                return z, sld_profile.real, z, sld_profile.imag
+            else:
+                return z, sld_profile, z, np.zeros_like(sld_profile)
+        except:
+            # Last resort fallback
+            z = np.linspace(0, 300, 1000)
+            return z, np.zeros_like(z), z, np.zeros_like(z)
+
+
+def replace_fit_in_database(results_database, model_name, new_objective, new_mcmc_stats=None, energy=None):
+    """
+    Replace an existing fit in the database with a new better fit.
+    
+    Args:
+        results_database: DataFrame containing existing results
+        model_name: Name of the model to replace
+        new_objective: New objective function
+        new_mcmc_stats: New MCMC statistics
+        energy: Energy value for this fit
+        
+    Returns:
+        Updated database with the old fit removed and new fit added
+    """
+    # Remove old entries with matching model name and energy
+    if energy is not None:
+        results_database = results_database[
+            ~((results_database['model_name'] == model_name) & 
+              (results_database['energy'] == energy))
+        ]
+    else:
+        # If no energy specified, remove by model name only
+        results_database = results_database[results_database['model_name'] != model_name]
+    
+    # Add new entries
+    results_database, _ = add_fit_to_database(new_objective, model_name, results_database, new_mcmc_stats, energy)
+    
+    return results_database
+
+
+def create_empty_results_database():
+    """
+    Create an empty pandas DataFrame with the standard columns for storing fitting results.
+    
+    Returns:
+        Empty pandas DataFrame with predefined columns
+    """
+    columns = [
+        'model_name', 'goodness_of_fit', 'energy',
+        'parameter', 'value', 'stderr', 'bound_low', 'bound_high', 'vary'
+    ]
+    
+    return pd.DataFrame(columns=columns)
+
+
+def add_fit_to_database(objective, model_name, results_database, mcmc_stats=None, energy=None):
+    """
+    Add the results of a single fit to the pandas database.
+    
+    Args:
+        objective: The objective function after fitting
+        model_name: Name of the model used for fitting
+        results_database: Existing DataFrame to append to
+        mcmc_stats: Optional MCMC statistics dictionary
+        energy: Energy value in eV for this fit
+        
+    Returns:
+        Tuple of (updated_database, final_model_name)
+    """
+    
+    # Extract the goodness of fit (energy from chi-squared)
+    try:
+        gof = objective.chisqr()
+    except Exception as e:
+        print(f"Error getting chisqr: {str(e)}")
+        gof = None
+    
+    # Extract all parameters from the model
+    model = objective.model
+    rows = []
+    
+    try:
+        for param in model.parameters.flattened():
+            try:
+                # Get parameter name and value
+                param_name = param.name
+                value = param.value
+                stderr = getattr(param, 'stderr', None)
+                vary = getattr(param, 'vary', False)
+                
+                # Get bounds if available
+                try:
+                    bounds = getattr(param, 'bounds', None)
+                    if bounds is not None:
+                        # Handle different bounds formats
+                        if hasattr(bounds, 'lb') and hasattr(bounds, 'ub'):
+                            # Bounds object with lb/ub attributes
+                            bound_low, bound_high = bounds.lb, bounds.ub
+                        elif isinstance(bounds, (tuple, list)) and len(bounds) == 2:
+                            # Tuple/list format
+                            bound_low, bound_high = bounds
+                        elif hasattr(bounds, '__iter__') and len(list(bounds)) == 2:
+                            # Other iterable format
+                            bound_vals = list(bounds)
+                            bound_low, bound_high = bound_vals[0], bound_vals[1]
+                        else:
+                            bound_low, bound_high = None, None
+                    else:
+                        bound_low, bound_high = None, None
+                except Exception as e:
+                    print(f"Error extracting bounds for {param_name}: {str(e)}")
+                    bound_low, bound_high = None, None
+                
+                # Use MCMC stderr if available and better than optimization stderr
+                if mcmc_stats and param_name in mcmc_stats:
+                    mcmc_stderr = mcmc_stats[param_name].get('std', None)
+                    if mcmc_stderr is not None and (stderr is None or mcmc_stderr > 0):
+                        stderr = mcmc_stderr
+                
+                # Create row for this parameter
+                row = {
+                    'model_name': model_name,
+                    'goodness_of_fit': gof,
+                    'energy': energy,
+                    'parameter': param_name,
+                    'value': value,
+                    'stderr': stderr,
+                    'bound_low': bound_low,
+                    'bound_high': bound_high,
+                    'vary': vary
+                }
+                rows.append(row)
+                
+            except Exception as e:
+                print(f"Error processing parameter '{param_name}': {str(e)}")
+                continue
+                
+    except Exception as e:
+        print(f"Error accessing flattened parameters: {str(e)}")
+    
+    # If we couldn't extract any parameters, add a minimal entry
+    if not rows:
+        rows.append({
+            'model_name': model_name,
+            'goodness_of_fit': gof,
+            'energy': energy,
+            'parameter': 'unknown',
+            'value': None,
+            'stderr': None,
+            'bound_low': None,
+            'bound_high': None,
+            'vary': None
+        })
+    
+    # Add new rows to the DataFrame
+    new_rows_df = pd.DataFrame(rows)
+    results_database = pd.concat([results_database, new_rows_df], ignore_index=True)
+    
+    return results_database, model_name
+
+
+def calculate_mcmc_statistics(chain, parameters):
+    """
+    Calculate statistics from MCMC chain.
+    
+    Args:
+        chain: MCMC chain array
+        parameters: Parameters object from the fit
+        
+    Returns:
+        Dictionary of statistics for each parameter
+    """
+    import numpy as np
+    
+    stats = {}
+    
+    try:
+        # Flatten the chain if needed (remove burn-in and walker dimensions)
+        if chain.ndim == 3:
+            # Shape is (nwalkers, nsteps, nparams)
+            flat_chain = chain.reshape(-1, chain.shape[-1])
+        else:
+            flat_chain = chain
+        
+        # Get parameter names
+        param_names = [p.name for p in parameters.flattened() if p.vary]
+        
+        for i, param_name in enumerate(param_names):
+            if i < flat_chain.shape[1]:
+                samples = flat_chain[:, i]
+                
+                stats[param_name] = {
+                    'mean': np.mean(samples),
+                    'median': np.median(samples),
+                    'std': np.std(samples),
+                    'percentiles': np.percentile(samples, [16, 50, 84])
+                }
+    
+    except Exception as e:
+        print(f"Error calculating MCMC statistics: {str(e)}")
+        
+    return stats
+
+
+def save_fitting_files(results, save_dir, model_name, save_objective, save_results, 
+                      structure):
+    """
+    Save fitting results to files.
+    
+    Args:
+        results: Results dictionary
+        save_dir: Directory to save files
+        model_name: Name of the model
+        save_objective: Whether to save objective
+        save_results: Whether to save results
+        structure: Structure object
+    """
+    
+    # Create the directory if it doesn't exist
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        print(f"Created directory: {save_dir}")
+    
+    # Save objective if requested
+    if save_objective:
+        objective_filename = os.path.join(save_dir, f"{model_name}_objective.pkl")
+        try:
+            with open(objective_filename, 'wb') as f:
+                pickle.dump(results['objective'], f)
+            print(f"Saved objective to {objective_filename}")
+        except Exception as e:
+            print(f"Error saving objective: {str(e)}")
+    
+    # Save results if requested
+    if save_results:
+        if structure is not None:
+            # Save combined results and structure
+            combined_filename = os.path.join(save_dir, f"{model_name}_results_structure.pkl")
+            try:
+                # Create a copy of results without the objective to avoid circular references
+                save_results_copy = results.copy()
+                save_results_copy['objective'] = None
+                
+                combined_data = {
+                    'results': save_results_copy,
+                    'structure': structure,
+                    'objective': results['objective'] if save_objective else None,
+                    'model_name': model_name
+                }
+                with open(combined_filename, 'wb') as f:
+                    pickle.dump(combined_data, f)
+                print(f"Saved combined results and structure to {combined_filename}")
+            except Exception as e:
+                print(f"Error saving combined data: {str(e)}")
+        
+        # Additionally, save MCMC samples as numpy array if they exist
+        if results['mcmc_samples'] is not None:
+            import numpy as np
+            mcmc_filename = os.path.join(save_dir, f"{model_name}_mcmc_samples.npy")
+            try:
+                np.save(mcmc_filename, results['mcmc_samples'])
+                print(f"Saved MCMC samples to {mcmc_filename}")
+            except Exception as e:
+                print(f"Error saving MCMC samples: {str(e)}")
+
+
+def save_database_to_file(results_database, filename):
+    """
+    Save the results database to a CSV file.
+    
+    Args:
+        results_database: pandas DataFrame containing the results
+        filename: Path to save the CSV file
+    """
+    try:
+        # Create directory if it doesn't exist
+        directory = os.path.dirname(filename)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+            print(f"Created directory: {directory}")
+        
+        results_database.to_csv(filename, index=False)
+        print(f"Saved results database to {filename}")
+    except Exception as e:
+        print(f"Error saving database to file: {str(e)}")
+
+
+def load_database_from_file(filename):
+    """
+    Load a results database from a CSV file.
+    
+    Args:
+        filename: Path to the CSV file
+        
+    Returns:
+        pandas DataFrame containing the results, or empty DataFrame if file doesn't exist
+    """
+    try:
+        if os.path.exists(filename):
+            database = pd.read_csv(filename)
+            print(f"Loaded results database from {filename}")
+            return database
+        else:
+            print(f"File {filename} not found. Creating new database.")
+            return create_empty_results_database()
+    except Exception as e:
+        print(f"Error loading database from file: {str(e)}")
+        return create_empty_results_database()
+
+
+def query_database(results_database, model_name=None, parameter=None, best_fit=False):
+    """
+    Query the results database for specific information.
+    
+    Args:
+        results_database: pandas DataFrame containing the results
+        model_name: Specific model name to filter by (None for all)
+        parameter: Specific parameter name to filter by (None for all)
+        best_fit: If True, return only the best fit (lowest goodness_of_fit)
+        
+    Returns:
+        Filtered pandas DataFrame
+    """
+    filtered_df = results_database.copy()
+    
+    # Filter by model name
+    if model_name is not None:
+        filtered_df = filtered_df[filtered_df['model_name'] == model_name]
+    
+    # Filter by parameter
+    if parameter is not None:
+        filtered_df = filtered_df[filtered_df['parameter'] == parameter]
+    
+    # Get best fit if requested
+    if best_fit and not filtered_df.empty:
+        # Find the model with the lowest goodness of fit
+        best_gof = filtered_df['goodness_of_fit'].min()
+        best_models = filtered_df[filtered_df['goodness_of_fit'] == best_gof]['model_name'].unique()
+        if len(best_models) > 0:
+            filtered_df = filtered_df[filtered_df['model_name'] == best_models[0]]
+    
+    return filtered_df
+
+
+def plot_energy_vs_gof(results_database, model_names=None, figsize=(10, 6), 
+                       xlim=None, ylim=None, save_path=None):
+    """
+    Plot Energy vs Goodness of Fit for models.
+    
+    Args:
+        results_database: pandas DataFrame containing the results
+        model_names: List of specific model names to plot (None for all models)
+        figsize: Figure size as (width, height)
+        xlim: X-axis limits as (min, max) tuple (None for auto)
+        ylim: Y-axis limits as (min, max) tuple (None for auto)
+        save_path: Path to save the figure (None to skip saving)
+        
+    Returns:
+        matplotlib figure and axes
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Filter data
+    if model_names is not None:
+        filtered_db = results_database[results_database['model_name'].isin(model_names)]
+    else:
+        filtered_db = results_database.copy()
+    
+    # Remove rows with no energy values
+    filtered_db = filtered_db.dropna(subset=['energy'])
+    
+    if filtered_db.empty:
+        print("No data with energy values found.")
+        return None, None
+    
+    # Get unique model names
+    unique_models = filtered_db['model_name'].unique()
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Extended color and marker cycles for better differentiation
+    colors = plt.cm.tab20.colors  # 20 colors instead of 10
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'X', '+', 'd', '8', 'P', 'H']
+    
+    # Plot each model with unique color/marker combination
+    for i, model in enumerate(unique_models):
+        model_data = filtered_db[filtered_db['model_name'] == model]
+        # Get unique energy-GOF pairs for this model
+        gof_data = model_data.groupby('energy')['goodness_of_fit'].first()
+        
+        ax.scatter(gof_data.index, gof_data.values, 
+                  color=colors[i % len(colors)], 
+                  marker=markers[i % len(markers)],
+                  s=80, alpha=0.7, label=model, edgecolors='black', linewidth=0.5)
+    
+    ax.set_xlabel('Energy (eV)')
+    ax.set_ylabel('Goodness of Fit (χ²)')
+    ax.set_title('Energy vs Goodness of Fit')
+    ax.grid(True, alpha=0.3)
+    
+    # Set axis limits if provided
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    
+    if len(unique_models) > 1:
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved figure to {save_path}")
+    
+    return fig, ax
+
+
+
+def plot_energy_vs_sld(results_database, materials=None, model_names=None, 
+                       exclude_materials=['Si', 'SiO2', 'air'], plot_type='both',
+                       figsize=(12, 8), xlim=None, ylim=None, materials_bounds=None, save_path=None):
+    """
+    Plot Energy vs SLD (real and/or imaginary) for materials.
+    
+    Args:
+        results_database: pandas DataFrame containing the results
+        materials: List of materials to plot (None for all except excluded)
+        model_names: List of model names to include (None for all)
+        exclude_materials: List of materials to exclude by default
+        plot_type: 'real', 'imag', or 'both' to plot real SLD, imaginary SLD, or both
+        figsize: Figure size as (width, height)
+        xlim: X-axis limits as (min, max) tuple (None for auto)
+        ylim: Y-axis limits as (min, max) tuple (None for auto)
+        materials_bounds: List of materials to show bounds for (None for no bounds)
+        save_path: Path to save the figure (None to skip saving)
+        
+    Returns:
+        matplotlib figure and axes
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    
+    # Filter by model names if specified
+    if model_names is not None:
+        filtered_db = results_database[results_database['model_name'].isin(model_names)]
+    else:
+        filtered_db = results_database.copy()
+    
+    # Remove rows with no energy values
+    filtered_db = filtered_db.dropna(subset=['energy'])
+    
+    # Filter SLD parameters
+    sld_params = filtered_db[
+        (filtered_db['parameter'].str.contains('sld', case=False)) &
+        (~filtered_db['parameter'].str.contains('isld', case=False))
+    ]
+    isld_params = filtered_db[filtered_db['parameter'].str.contains('isld', case=False)]
+    
+    # Get material names from parameters
+    def extract_material_name(param_name):
+        # Handle different parameter naming conventions
+        if ' - ' in param_name:
+            return param_name.split(' - ')[0]
+        elif '_' in param_name:
+            return param_name.split('_')[0]
+        else:
+            return param_name.split()[0] if ' ' in param_name else param_name
+    
+    # Filter materials
+    if materials is None:
+        all_materials = set()
+        for param in sld_params['parameter']:
+            mat = extract_material_name(param)
+            if mat not in exclude_materials:
+                all_materials.add(mat)
+        for param in isld_params['parameter']:
+            mat = extract_material_name(param)
+            if mat not in exclude_materials:
+                all_materials.add(mat)
+        materials = sorted(list(all_materials))
+    
+    if not materials:
+        print("No materials found after filtering.")
+        return None, None
+    
+    # Create subplots
+    if plot_type == 'both':
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize)
+        axes = [ax1, ax2]
+        titles = ['Real SLD vs Energy', 'Imaginary SLD vs Energy']
+        param_types = [sld_params, isld_params]
+    elif plot_type == 'real':
+        fig, ax = plt.subplots(figsize=figsize)
+        axes = [ax]
+        titles = ['Real SLD vs Energy']
+        param_types = [sld_params]
+    else:  # imag
+        fig, ax = plt.subplots(figsize=figsize)
+        axes = [ax]
+        titles = ['Imaginary SLD vs Energy']
+        param_types = [isld_params]
+    
+    # Extended color and marker cycles for better differentiation
+    colors = plt.cm.tab20.colors  # 20 colors
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'X', '+', 'd', '8', 'P', 'H']
+    
+    unique_models = filtered_db['model_name'].unique()
+    
+    # Plot each parameter type
+    for ax_idx, (ax, title, params) in enumerate(zip(axes, titles, param_types)):
+        
+        # Plot data points and error bars for bounds
+        combo_idx = 0
+        for material in materials:
+            # Filter parameters for this material
+            mat_params = params[params['parameter'].str.contains(material, case=False)]
+            
+            for model in unique_models:
+                model_mat_params = mat_params[mat_params['model_name'] == model]
+                
+                if not model_mat_params.empty:
+                    energies = model_mat_params['energy'].values
+                    values = model_mat_params['value'].values
+                    
+                    # Check if we should show bounds for this material
+                    show_bounds = materials_bounds is not None and material in materials_bounds
+                    
+                    if show_bounds:
+                        # Calculate error bars from bounds
+                        lower_errors = []
+                        upper_errors = []
+                        
+                        for i, (energy, value) in enumerate(zip(energies, values)):
+                            energy_row = model_mat_params[model_mat_params['energy'] == energy].iloc[0]
+                            bound_low = energy_row['bound_low']
+                            bound_high = energy_row['bound_high']
+                            
+                            if pd.notnull(bound_low) and pd.notnull(bound_high):
+                                # Calculate asymmetric error bars
+                                lower_error = value - bound_low  # Distance from value to lower bound
+                                upper_error = bound_high - value  # Distance from value to upper bound
+                                lower_errors.append(max(0, lower_error))  # Ensure non-negative
+                                upper_errors.append(max(0, upper_error))
+                            else:
+                                lower_errors.append(0)
+                                upper_errors.append(0)
+                        
+                        # Plot with error bars showing bounds
+                        ax.errorbar(energies, values,
+                                   yerr=[lower_errors, upper_errors],
+                                   fmt='none',  # No marker for error bars
+                                   ecolor=colors[combo_idx % len(colors)],
+                                   elinewidth=2,
+                                   capsize=8,
+                                   capthick=2,
+                                   alpha=0.6,
+                                   label=f"{material} bounds" if combo_idx == 0 else "",
+                                   zorder=2)
+                    
+                    # Plot the actual data points on top
+                    ax.scatter(energies, values,
+                              color=colors[combo_idx % len(colors)],
+                              marker=markers[combo_idx % len(markers)],
+                              s=80, alpha=0.9, edgecolors='black', linewidth=0.5,
+                              label=f"{material} ({model})" if len(unique_models) > 1 else material,
+                              zorder=3)  # Ensure points appear on top
+                    combo_idx += 1
+        
+        ax.set_xlabel('Energy (eV)')
+        ax.set_ylabel('SLD (Å⁻²)')
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        
+        # Set axis limits if provided
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+            
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved figure to {save_path}")
+    
+    return fig, axes if plot_type == 'both' else ax
+
+
+def plot_energy_vs_thickness(results_database, materials=None, model_names=None,
+                            exclude_materials=['Si', 'SiO2', 'air'],
+                            figsize=(10, 6), xlim=None, ylim=None, materials_bounds=None, save_path=None):
+    """
+    Plot Energy vs Thickness for materials.
+    
+    Args:
+        results_database: pandas DataFrame containing the results
+        materials: List of materials to plot (None for all except excluded)
+        model_names: List of model names to include (None for all)
+        exclude_materials: List of materials to exclude by default
+        figsize: Figure size as (width, height)
+        xlim: X-axis limits as (min, max) tuple (None for auto)
+        ylim: Y-axis limits as (min, max) tuple (None for auto)
+        materials_bounds: List of materials to show bounds for (None for no bounds)
+        save_path: Path to save the figure (None to skip saving)
+        
+    Returns:
+        matplotlib figure and axes
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    
+    # Filter by model names if specified
+    if model_names is not None:
+        filtered_db = results_database[results_database['model_name'].isin(model_names)]
+    else:
+        filtered_db = results_database.copy()
+    
+    # Remove rows with no energy values
+    filtered_db = filtered_db.dropna(subset=['energy'])
+    
+    # Filter thickness parameters
+    thickness_params = filtered_db[filtered_db['parameter'].str.contains('thick', case=False)]
+    
+    # Get material names from parameters
+    def extract_material_name(param_name):
+        if ' - ' in param_name:
+            return param_name.split(' - ')[0]
+        elif '_' in param_name:
+            return param_name.split('_')[0]
+        else:
+            return param_name.split()[0] if ' ' in param_name else param_name
+    
+    # Filter materials
+    if materials is None:
+        all_materials = set()
+        for param in thickness_params['parameter']:
+            mat = extract_material_name(param)
+            if mat not in exclude_materials:
+                all_materials.add(mat)
+        materials = sorted(list(all_materials))
+    
+    if not materials:
+        print("No materials found after filtering.")
+        return None, None
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Extended color and marker cycles for better differentiation
+    colors = plt.cm.tab20.colors  # 20 colors
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'X', '+', 'd', '8', 'P', 'H']
+    
+    unique_models = filtered_db['model_name'].unique()
+    
+    # Plot data points and error bars for bounds
+    combo_idx = 0
+    for material in materials:
+        # Filter parameters for this material
+        mat_params = thickness_params[thickness_params['parameter'].str.contains(material, case=False)]
+        
+        for model in unique_models:
+            model_mat_params = mat_params[mat_params['model_name'] == model]
+            
+            if not model_mat_params.empty:
+                energies = model_mat_params['energy'].values
+                values = model_mat_params['value'].values
+                
+                # Check if we should show bounds for this material
+                show_bounds = materials_bounds is not None and material in materials_bounds
+                
+                if show_bounds:
+                    # Calculate error bars from bounds
+                    lower_errors = []
+                    upper_errors = []
+                    
+                    for i, (energy, value) in enumerate(zip(energies, values)):
+                        energy_row = model_mat_params[model_mat_params['energy'] == energy].iloc[0]
+                        bound_low = energy_row['bound_low']
+                        bound_high = energy_row['bound_high']
+                        
+                        if pd.notnull(bound_low) and pd.notnull(bound_high):
+                            # Calculate asymmetric error bars
+                            lower_error = value - bound_low  # Distance from value to lower bound
+                            upper_error = bound_high - value  # Distance from value to upper bound
+                            lower_errors.append(max(0, lower_error))  # Ensure non-negative
+                            upper_errors.append(max(0, upper_error))
+                        else:
+                            lower_errors.append(0)
+                            upper_errors.append(0)
+                    
+                    # Plot with error bars showing bounds
+                    ax.errorbar(energies, values,
+                               yerr=[lower_errors, upper_errors],
+                               fmt='none',  # No marker for error bars
+                               ecolor=colors[combo_idx % len(colors)],
+                               elinewidth=2,
+                               capsize=8,
+                               capthick=2,
+                               alpha=0.6,
+                               label=f"{material} bounds" if combo_idx == 0 else "",
+                               zorder=2)
+                
+                # Plot the actual data points on top
+                ax.scatter(energies, values,
+                          color=colors[combo_idx % len(colors)],
+                          marker=markers[combo_idx % len(markers)],
+                          s=80, alpha=0.9, edgecolors='black', linewidth=0.5,
+                          label=f"{material} ({model})" if len(unique_models) > 1 else material,
+                          zorder=3)  # Ensure points appear on top
+                combo_idx += 1
+    
+    ax.set_xlabel('Energy (eV)')
+    ax.set_ylabel('Thickness (Å)')
+    ax.set_title('Energy vs Thickness')
+    ax.grid(True, alpha=0.3)
+    
+    # Set axis limits if provided
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+        
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved figure to {save_path}")
+    
+    return fig, ax
+
+
+def plot_energy_vs_roughness(results_database, materials=None, model_names=None,
+                            exclude_materials=['Si', 'SiO2', 'air'],
+                            figsize=(10, 6), xlim=None, ylim=None, materials_bounds=None, save_path=None):
+    """
+    Plot Energy vs Roughness for materials.
+    
+    Args:
+        results_database: pandas DataFrame containing the results
+        materials: List of materials to plot (None for all except excluded)
+        model_names: List of model names to include (None for all)
+        exclude_materials: List of materials to exclude by default
+        figsize: Figure size as (width, height)
+        xlim: X-axis limits as (min, max) tuple (None for auto)
+        ylim: Y-axis limits as (min, max) tuple (None for auto)
+        materials_bounds: List of materials to show bounds for (None for no bounds)
+        save_path: Path to save the figure (None to skip saving)
+        
+    Returns:
+        matplotlib figure and axes
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    
+    # Filter by model names if specified
+    if model_names is not None:
+        filtered_db = results_database[results_database['model_name'].isin(model_names)]
+    else:
+        filtered_db = results_database.copy()
+    
+    # Remove rows with no energy values
+    filtered_db = filtered_db.dropna(subset=['energy'])
+    
+    # Filter roughness parameters
+    roughness_params = filtered_db[filtered_db['parameter'].str.contains('rough', case=False)]
+    
+    # Get material names from parameters
+    def extract_material_name(param_name):
+        if ' - ' in param_name:
+            return param_name.split(' - ')[0]
+        elif '_' in param_name:
+            return param_name.split('_')[0]
+        else:
+            return param_name.split()[0] if ' ' in param_name else param_name
+    
+    # Filter materials
+    if materials is None:
+        all_materials = set()
+        for param in roughness_params['parameter']:
+            mat = extract_material_name(param)
+            if mat not in exclude_materials:
+                all_materials.add(mat)
+        materials = sorted(list(all_materials))
+    
+    if not materials:
+        print("No materials found after filtering.")
+        return None, None
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Extended color and marker cycles for better differentiation
+    colors = plt.cm.tab20.colors  # 20 colors
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'X', '+', 'd', '8', 'P', 'H']
+    
+    unique_models = filtered_db['model_name'].unique()
+    
+    # Plot data points and error bars for bounds
+    combo_idx = 0
+    for material in materials:
+        # Filter parameters for this material
+        mat_params = roughness_params[roughness_params['parameter'].str.contains(material, case=False)]
+        
+        for model in unique_models:
+            model_mat_params = mat_params[mat_params['model_name'] == model]
+            
+            if not model_mat_params.empty:
+                energies = model_mat_params['energy'].values
+                values = model_mat_params['value'].values
+                
+                # Check if we should show bounds for this material
+                show_bounds = materials_bounds is not None and material in materials_bounds
+                
+                if show_bounds:
+                    # Calculate error bars from bounds
+                    lower_errors = []
+                    upper_errors = []
+                    
+                    for i, (energy, value) in enumerate(zip(energies, values)):
+                        energy_row = model_mat_params[model_mat_params['energy'] == energy].iloc[0]
+                        bound_low = energy_row['bound_low']
+                        bound_high = energy_row['bound_high']
+                        
+                        if pd.notnull(bound_low) and pd.notnull(bound_high):
+                            # Calculate asymmetric error bars
+                            lower_error = value - bound_low  # Distance from value to lower bound
+                            upper_error = bound_high - value  # Distance from value to upper bound
+                            lower_errors.append(max(0, lower_error))  # Ensure non-negative
+                            upper_errors.append(max(0, upper_error))
+                        else:
+                            lower_errors.append(0)
+                            upper_errors.append(0)
+                    
+                    # Plot with error bars showing bounds
+                    ax.errorbar(energies, values,
+                               yerr=[lower_errors, upper_errors],
+                               fmt='none',  # No marker for error bars
+                               ecolor=colors[combo_idx % len(colors)],
+                               elinewidth=2,
+                               capsize=8,
+                               capthick=2,
+                               alpha=0.6,
+                               label=f"{material} bounds" if combo_idx == 0 else "",
+                               zorder=2)
+                
+                # Plot the actual data points on top
+                ax.scatter(energies, values,
+                          color=colors[combo_idx % len(colors)],
+                          marker=markers[combo_idx % len(markers)],
+                          s=80, alpha=0.9, edgecolors='black', linewidth=0.5,
+                          label=f"{material} ({model})" if len(unique_models) > 1 else material,
+                          zorder=3)  # Ensure points appear on top
+                combo_idx += 1
+    
+    ax.set_xlabel('Energy (eV)')
+    ax.set_ylabel('Roughness (Å)')
+    ax.set_title('Energy vs Roughness')
+    ax.grid(True, alpha=0.3)
+    
+    # Set axis limits if provided
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+        
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved figure to {save_path}")
+    
+    return fig, ax
