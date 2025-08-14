@@ -1035,7 +1035,7 @@ class RSoXRProcessor:
         
         return results
     
-    def auto_group_scans(self, data_directory=".", position_tolerance=0.1, energy_tolerance=0.5, auto_trim=False, save_table=True, output_dir=None, sort_by_energy=True):
+    def auto_group_scans(self, data_directory=".", position_tolerance=0.4, energy_tolerance=0.2, auto_trim=False, save_table=True, output_dir=None, sort_by_energy=True):
         """
         Automatically group scans based on position, energy, and detector type
         

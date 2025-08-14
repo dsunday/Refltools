@@ -708,6 +708,7 @@ from scipy.signal import savgol_filter
 class RSoXRTrimWidget:
     """
     Interactive widget for trimming RSoXR data groups with stitching preview
+    Enhanced to support manually edited groups
     """
     
     def __init__(self, processor, scan_groups=None, data_directory='.'):
@@ -719,9 +720,10 @@ class RSoXRTrimWidget:
         processor : RSoXRProcessor
             The initialized RSoXR processor instance
         scan_groups : list, optional
-            List of scan groups, if already available
+            List of scan groups. If provided, these groups will be used directly.
+            If None, auto-detect scan groups from data_directory.
         data_directory : str
-            Directory containing the data files (if scan_groups not provided)
+            Directory containing the data files (used only if scan_groups not provided)
         """
         self.processor = processor
         self.data_directory = data_directory
@@ -732,8 +734,11 @@ class RSoXRTrimWidget:
                 data_directory=data_directory, 
                 save_table=False
             )
+            self.groups_source = "autoscan"
         else:
+            # Use provided groups (assumed to be manually edited)
             self.scan_groups = scan_groups
+            self.groups_source = "provided"
             
         # Store the original trims for each group
         self.original_trims = {}
@@ -939,6 +944,13 @@ class RSoXRTrimWidget:
             disabled=False
         )
         
+        # Group source info (new)
+        group_source_text = "✓ Using provided scan groups (manually edited)" if self.groups_source == "provided" else "Using autoscanned groups"
+        self.group_source_info = widgets.HTML(
+            value=f"<i style='color:#666;'>{group_source_text} | Total groups: {len(self.scan_groups)}</i>",
+            layout=widgets.Layout(width='100%')
+        )
+        
         # Arrange widgets in containers
         self.group_file_container = widgets.HBox([self.group_select, self.file_select])
         
@@ -981,9 +993,10 @@ class RSoXRTrimWidget:
         # Output area
         self.output_area = widgets.Output()
         
-        # Main container with new layout
+        # Main container with new layout (added group source info)
         self.main_container = widgets.VBox([
             widgets.HTML(value="<h2>RSoXR Interactive Trimming Tool</h2>"),
+            self.group_source_info,  # New: Shows group source
             self.group_file_container,
             self.trim_display_container,
             widgets.HBox([
@@ -1433,7 +1446,8 @@ class RSoXRTrimWidget:
                         'Original Trim End': original_trim[1],
                         'Current Trim Start': current_trim[0],
                         'Current Trim End': current_trim[1],
-                        'Modified': original_trim != current_trim
+                        'Modified': original_trim != current_trim,
+                        'Groups Source': self.groups_source
                     })
             
             # Create a DataFrame
@@ -1452,6 +1466,10 @@ class RSoXRTrimWidget:
                 print(f"Trim settings saved to {output_file}")
                 
                 # Also display a summary
+                print("\nSummary of current configuration:")
+                print(f"Groups source: {self.groups_source}")
+                print(f"Total groups: {len(self.scan_groups)}")
+                
                 print("\nSummary of modified trims:")
                 modified_df = df[df['Modified']]
                 if len(modified_df) > 0:
