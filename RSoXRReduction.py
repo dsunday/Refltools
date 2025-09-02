@@ -739,10 +739,10 @@ class RSoXRProcessor:
 
     
     def process_scan_set(self, scan_group, output_filename=None, normalize=True, plot=True, 
-                convert_to_photons=False, output_dir=None, plot_prefix=None, 
-                save_metadata=True, estimate_thickness=False, min_prominence=0.1,
-                min_thickness_nm=20, max_thickness_nm=100, smooth_data=False,
-                savgol_window=None, savgol_order=2, remove_zeros=True):
+            convert_to_photons=False, output_dir=None, plot_prefix=None, 
+            save_metadata=True, estimate_thickness=False, min_prominence=0.1,
+            min_thickness_nm=20, max_thickness_nm=100, smooth_data=False,
+            savgol_window=None, savgol_order=2, remove_zeros=True):
         """
         Process a scan set and combine them
         
@@ -750,6 +750,8 @@ class RSoXRProcessor:
         -----------
         scan_group : dict
             Scan group dictionary from auto_group_scans
+            Expected to contain: 'files', 'trims', 'energy', 'sample_name'
+            Optional: 'backgrounds' - list of background values to subtract from each file
         output_filename : str, optional
             File to save the processed data
         normalize : bool
@@ -795,9 +797,21 @@ class RSoXRProcessor:
         trims = scan_group['trims']
         energy = scan_group['energy']
         
+        # Extract background values if provided (NEW)
+        backgrounds = scan_group.get('backgrounds', [0.0] * len(file_patterns))
+        
+        # Ensure backgrounds list has the same length as files
+        if len(backgrounds) < len(file_patterns):
+            print(f"Warning: Not enough background values provided. Padding with zeros.")
+            backgrounds.extend([0.0] * (len(file_patterns) - len(backgrounds)))
+        elif len(backgrounds) > len(file_patterns):
+            print(f"Warning: More background values than files. Truncating background list.")
+            backgrounds = backgrounds[:len(file_patterns)]
+        
         scans = []
         energies = []
         actual_trims = []
+        actual_backgrounds = []
         
         # Load all data files
         for i, pattern in enumerate(file_patterns):
@@ -812,8 +826,13 @@ class RSoXRProcessor:
                     # Default trim if not provided
                     actual_trims.append((0, -1))
                 
+                # Use the background value for this pattern (NEW)
+                actual_backgrounds.append(backgrounds[i])
+                
                 energies.append(energy)
                 print(f"Loaded file: {pattern}")
+                if backgrounds[i] != 0.0:
+                    print(f"  Background subtraction: -{backgrounds[i]:.3f}")
             except Exception as e:
                 print(f"Error loading file {pattern}: {str(e)}")
         
@@ -851,10 +870,11 @@ class RSoXRProcessor:
         else:
             window_size, polynomial_order = None, 2
         
-        # Process the scans
-        result = self.reduce_data(
+        # Process the scans with background subtraction (MODIFIED)
+        result = self.reduce_data_with_background(
             scans, 
             actual_trims, 
+            actual_backgrounds,  # NEW: Pass background values
             energy, 
             normalize=normalize, 
             plot=plot,
@@ -867,81 +887,38 @@ class RSoXRProcessor:
             remove_zeros=remove_zeros
         )
         
-        # Save to file if requested
-        if output_filename and result is not None:
-            # Create output directory if it doesn't exist
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
+        if result is None:
+            print("Data processing failed.")
+            return None
+        
+        # Save the data if output filename is provided
+        if output_filename is not None:
+            # Determine which data to save
+            data_to_save = result[0] if smooth_data else result
             
-            # Handle raw and smoothed data
-            if smooth_data:
-                # Unpack the tuple (smoothed_data, raw_data)
-                smoothed_data, raw_data = result
-                
-                # Generate filenames
-                base_name = os.path.splitext(output_filename)[0]
-                extension = os.path.splitext(output_filename)[1]
-                raw_filename = f"{base_name}_raw{extension}"
-                smoothed_filename = f"{base_name}_smoothed{extension}"
-                
-                # Save raw data
-                if output_dir:
-                    raw_path = os.path.join(output_dir, raw_filename)
-                else:
-                    raw_path = raw_filename
-                    
-                np.savetxt(raw_path, raw_data)
-                print(f"Saved raw data to {raw_path}")
-                
-                # Save smoothed data
-                if output_dir:
-                    smoothed_path = os.path.join(output_dir, smoothed_filename)
-                else:
-                    smoothed_path = smoothed_filename
-                    
-                np.savetxt(smoothed_path, smoothed_data)
-                print(f"Saved smoothed data to {smoothed_path}")
+            # Create output directory if it doesn't exist
+            if output_dir is not None:
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(output_dir, output_filename)
             else:
-                # Save just the raw data with the requested filename
-                if output_dir:
-                    output_path = os.path.join(output_dir, output_filename)
-                else:
-                    output_path = output_filename
-                    
-                np.savetxt(output_path, result)
-                print(f"Saved processed data to {output_path}")
+                output_path = output_filename
+            
+            # Save the processed data
+            header = f"# Processed RSoXR data\n# Sample: {scan_group['sample_name']}\n# Energy: {energy:.1f} eV\n# Columns: Angle(deg), Reflectivity"
+            
+            # Add background information to header (NEW)
+            bg_info = [f"File {i+1}: -{bg:.3f}" for i, bg in enumerate(actual_backgrounds) if bg != 0.0]
+            if bg_info:
+                header += f"\n# Background subtractions: {', '.join(bg_info)}"
+            
+            np.savetxt(output_path, data_to_save, delimiter='\t', 
+                    header=header, fmt='%.6e')
+            
+            print(f"Processed data saved to {output_path}")
             
             # Save metadata if requested
             if save_metadata:
-                metadata_data = result[0] if smooth_data else result  # Use smoothed data for metadata if available
-                self.save_reduced_data_metadata(
-                    scan_group, 
-                    metadata_data,
-                    output_dir=output_dir
-                )
-        
-        # Estimate film thickness if requested
-        thickness = None
-        if estimate_thickness and result is not None:
-            print("\nEstimating film thickness from fringe spacing...")
-            # Use smoothed data for thickness estimation if available
-            data_for_thickness = result[0] if smooth_data else result
-            
-            thickness, peaks, valleys = self.estimate_film_thickness(
-                data_for_thickness, 
-                min_prominence=min_prominence,
-                min_thickness_nm=min_thickness_nm,
-                max_thickness_nm=max_thickness_nm,
-                plot=plot,
-                output_dir=output_dir,
-                plot_prefix=plot_prefix,
-                smooth_data=True  # Always use smoothing for thickness estimation
-            )
-            
-            # Update metadata with thickness if available
-            if save_metadata and thickness is not None:
-                # Update the saved metadata file to include thickness
-                log_file_base = "reduced_data"
+                log_file_base = "processed_data"
                 if hasattr(self, 'log_file') and self.log_file:
                     log_file_base = os.path.splitext(os.path.basename(self.log_file))[0]
                     
@@ -954,21 +931,333 @@ class RSoXRProcessor:
                 else:
                     meta_path = meta_filename
                     
-                # Check if metadata file exists and update it
-                if os.path.exists(meta_path):
-                    try:
-                        import pandas as pd
-                        meta_df = pd.read_csv(meta_path)
-                        if 'Thickness (Å)' not in meta_df.columns:
-                            meta_df['Thickness (Å)'] = thickness
+                # Create metadata dictionary (ENHANCED with background info)
+                metadata = {
+                    'Sample': sample_name,
+                    'Energy (eV)': energy,
+                    'Files Processed': len(scans),
+                    'Normalization': normalize,
+                    'Photon Conversion': convert_to_photons,
+                    'Smoothing': smooth_data,
+                    'Zero Removal': remove_zeros,
+                    'Processing Date': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'Output File': os.path.basename(output_path),
+                    'Background Subtraction Applied': any(bg != 0.0 for bg in actual_backgrounds)
+                }
+                
+                # Add smoothing parameters if used
+                if smooth_data:
+                    metadata['Smoothing Window'] = window_size
+                    metadata['Smoothing Order'] = polynomial_order
+                
+                # Add background details (NEW)
+                for i, bg in enumerate(actual_backgrounds):
+                    metadata[f'Background File {i+1}'] = bg
+                
+                # Save metadata
+                try:
+                    import pandas as pd
+                    meta_df = pd.DataFrame([metadata])
+                    meta_df.to_csv(meta_path, index=False)
+                    print(f"Metadata saved to {meta_path}")
+                except Exception as e:
+                    print(f"Warning: Could not save metadata: {str(e)}")
+        
+        # Estimate thickness if requested
+        if estimate_thickness and result is not None:
+            try:
+                thickness = self.estimate_thickness(result[0] if smooth_data else result,
+                                                min_prominence=min_prominence,
+                                                min_thickness_nm=min_thickness_nm,
+                                                max_thickness_nm=max_thickness_nm)
+                if thickness is not None:
+                    print(f"Estimated thickness: {thickness:.1f} Å")
+                    
+                    # Update metadata with thickness if file was saved
+                    if save_metadata and output_filename is not None:
+                        # Update the metadata file with thickness information
+                        log_file_base = "processed_data"
+                        if hasattr(self, 'log_file') and self.log_file:
+                            log_file_base = os.path.splitext(os.path.basename(self.log_file))[0]
+                            
+                        sample_name = scan_group['sample_name']
+                        energy = scan_group['energy']
+                        meta_filename = f"{log_file_base}_{sample_name}_{energy:.1f}eV_metadata.csv"
+                        
+                        if output_dir:
+                            meta_path = os.path.join(output_dir, meta_filename)
                         else:
-                            meta_df.loc[0, 'Thickness (Å)'] = thickness
-                        meta_df.to_csv(meta_path, index=False)
-                        print(f"Updated metadata with thickness information")
-                    except Exception as e:
-                        print(f"Warning: Could not update metadata file with thickness: {str(e)}")
+                            meta_path = meta_filename
+                            
+                        # Check if metadata file exists and update it
+                        if os.path.exists(meta_path):
+                            try:
+                                import pandas as pd
+                                meta_df = pd.read_csv(meta_path)
+                                if 'Thickness (Å)' not in meta_df.columns:
+                                    meta_df['Thickness (Å)'] = thickness
+                                else:
+                                    meta_df.loc[0, 'Thickness (Å)'] = thickness
+                                meta_df.to_csv(meta_path, index=False)
+                                print(f"Updated metadata with thickness information")
+                            except Exception as e:
+                                print(f"Warning: Could not update metadata file with thickness: {str(e)}")
+            except Exception as e:
+                print(f"Warning: Thickness estimation failed: {str(e)}")
         
         return result
+    
+    
+    def reduce_data_with_background(self, scans, trims, backgrounds, energy, normalize=True, plot=True, 
+                               convert_to_photons=False, output_dir=None, plot_prefix=None,
+                               smooth_data=False, savgol_window=None, savgol_order=2, 
+                               remove_zeros=True):
+        """
+        Process and combine multiple scan files with background subtraction
+        
+        This is an enhanced version of reduce_data that includes background subtraction
+        
+        Parameters:
+        -----------
+        scans : list of numpy arrays
+            List of loaded scan data (angle, intensity)
+        trims : list of tuples
+            List of (start, end) trim indices for each scan
+        backgrounds : list of floats
+            List of background values to subtract from each scan
+        energy : float
+            Photon energy in eV
+        normalize : bool
+            Whether to normalize the final reflectivity
+        plot : bool
+            Whether to generate plots during processing
+        convert_to_photons : bool
+            Whether to convert photodiode current to photon flux
+        output_dir : str, optional
+            Directory to save plots
+        plot_prefix : str, optional
+            Prefix for plot filenames
+        smooth_data : bool
+            Whether to apply Savitzky-Golay smoothing
+        savgol_window : int, optional
+            Window size for smoothing filter
+        savgol_order : int
+            Polynomial order for smoothing filter
+        remove_zeros : bool
+            Whether to remove zero intensity points
+        
+        Returns:
+        --------
+        If smooth_data is True:
+            (smoothed_data, raw_data) : tuple of numpy arrays
+        Else:
+            processed_data : numpy array
+        """
+        if len(scans) != len(trims) or len(scans) != len(backgrounds):
+            print(f"Error: Mismatch in number of scans ({len(scans)}), trims ({len(trims)}), and backgrounds ({len(backgrounds)})")
+            return None
+        
+        # Ensure we have trim values for all scans
+        if len(trims) < len(scans):
+            print(f"Warning: Not enough trim values provided. Adding default trims for {len(scans) - len(trims)} scans.")
+            trims.extend([(0, -1)] * (len(scans) - len(trims)))
+        
+        # Process the first scan
+        refl = deepcopy(scans[0][trims[0][0]:(len(scans[0][:,0])+trims[0][1]), 0:2])
+        
+        # Apply background subtraction to first scan (NEW)
+        if backgrounds[0] != 0.0:
+            refl[:, 1] = refl[:, 1] - backgrounds[0]
+            print(f"Applied background subtraction to scan 1: -{backgrounds[0]:.3f}")
+        
+        # Remove zeros if requested
+        if remove_zeros:
+            non_zero_mask = refl[:,1] > 0
+            if not all(non_zero_mask):
+                print(f"Removing {len(refl) - np.sum(non_zero_mask)} zero data points from first scan")
+                refl = refl[non_zero_mask]
+        
+        # Convert to photon flux if requested
+        if convert_to_photons and self.calibration_data is not None:
+            # Convert current to photon flux
+            refl[:,1] = self.amp_to_photon_flux(refl[:,1], energy)
+        
+        # Store all raw scans for combined plotting
+        all_scans = [deepcopy(refl)]
+        
+        # Process additional scans
+        for i in range(1, len(scans)):
+            scan = scans[i][trims[i][0]:(len(scans[i][:,0])+trims[i][1]), 0:2]
+            
+            # Apply background subtraction (NEW)
+            if backgrounds[i] != 0.0:
+                scan[:, 1] = scan[:, 1] - backgrounds[i]
+                print(f"Applied background subtraction to scan {i+1}: -{backgrounds[i]:.3f}")
+            
+            # Remove zeros if requested
+            if remove_zeros:
+                non_zero_mask = scan[:,1] > 0
+                if not all(non_zero_mask):
+                    print(f"Removing {len(scan) - np.sum(non_zero_mask)} zero data points from scan {i+1}")
+                    scan = scan[non_zero_mask]
+            
+            # Convert to photon flux if requested
+            if convert_to_photons and self.calibration_data is not None:
+                scan[:,1] = self.amp_to_photon_flux(scan[:,1], energy)
+            
+            # Find overlap between this scan and the combined reflectivity
+            idx, val = self.find_nearest(scan[:,0], refl[-1,0])
+            
+            # Check for valid overlap - need at least one point
+            if idx <= 0 or np.isnan(val):
+                print(f"Warning: No overlap found for scan {i+1}. Appending without scaling.")
+                scale = 1.0
+            else:
+                # Calculate scaling factor using overlap region
+                overlap_angles = scan[:idx, 0]
+                overlap_intensities = scan[:idx, 1]
+                
+                # Interpolate the combined data onto the overlap angles
+                combined_interp = np.interp(overlap_angles, refl[:, 0], refl[:, 1])
+                
+                # Calculate scaling factor
+                if len(overlap_intensities) > 0 and np.mean(overlap_intensities) > 0:
+                    scale = np.mean(combined_interp) / np.mean(overlap_intensities)
+                else:
+                    scale = 1.0
+            
+            print(f"Scaling factor for scan {i+1}: {scale:.4f}")
+            
+            # Apply scaling
+            scan[:, 1] = scan[:, 1] * scale
+            
+            # Store the raw scan for plotting
+            all_scans.append(deepcopy(scan))
+            
+            # Find where to start adding new data (avoid duplication in overlap)
+            if len(refl) > 0:
+                last_angle = refl[-1, 0]
+                start_idx = np.searchsorted(scan[:, 0], last_angle)
+                new_data = scan[start_idx:, :]
+            else:
+                new_data = scan
+            
+            # Concatenate new data
+            if len(new_data) > 0:
+                refl = np.concatenate((refl, new_data))
+        
+        # Sort by angle (just in case)
+        sort_indices = np.argsort(refl[:, 0])
+        refl = refl[sort_indices]
+        
+        # Apply smoothing if requested
+        if smooth_data and savgol_window is not None:
+            from scipy.signal import savgol_filter
+            try:
+                # Store raw data before smoothing
+                raw_refl_q = deepcopy(refl)
+                
+                # Apply smoothing
+                smoothed_intensity = savgol_filter(refl[:, 1], savgol_window, savgol_order)
+                refl_q = deepcopy(refl)
+                refl_q[:, 1] = smoothed_intensity
+                
+                print(f"Applied Savitzky-Golay smoothing (window={savgol_window}, order={savgol_order})")
+            except Exception as e:
+                print(f"Warning: Smoothing failed: {str(e)}. Returning unsmoothed data.")
+                raw_refl_q = deepcopy(refl)
+                refl_q = deepcopy(refl)
+        else:
+            raw_refl_q = deepcopy(refl)
+            refl_q = deepcopy(refl)
+        
+        # Normalize if requested
+        if normalize:
+            if smooth_data:
+                refl_q[:, 1] = refl_q[:, 1] / np.max(refl_q[:, 1])
+                raw_refl_q[:, 1] = raw_refl_q[:, 1] / np.max(raw_refl_q[:, 1])
+            else:
+                refl[:, 1] = refl[:, 1] / np.max(refl[:, 1])
+            print("Applied normalization")
+        
+        # Generate plots if requested
+        if plot and plot_prefix:
+            self._plot_processed_data_with_background(all_scans, refl_q if smooth_data else refl, 
+                                                    backgrounds, energy, plot_prefix, output_dir)
+        
+        # Return processed data (smoothed and raw if smoothing was applied)
+        if smooth_data:
+            # Return both raw and smoothed data as a tuple
+            return refl_q, raw_refl_q
+        else:
+            return raw_refl_q  # Only raw data if no smoothing
+
+
+    def _plot_processed_data_with_background(self, all_scans, final_data, backgrounds, energy, 
+                                        plot_prefix, output_dir=None):
+        """
+        Generate plots showing the effect of background subtraction and data processing
+        
+        Parameters:
+        -----------
+        all_scans : list of numpy arrays
+            Individual processed scans (after background subtraction and scaling)
+        final_data : numpy array
+            Final combined and processed data
+        backgrounds : list of floats
+            Background values that were subtracted
+        energy : float
+            Photon energy in eV
+        plot_prefix : str
+            Prefix for saved plot files
+        output_dir : str, optional
+            Directory to save plots
+        """
+        import matplotlib.pyplot as plt
+        
+        try:
+            # Create figure with subplots
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Plot 1: Individual scans (after background subtraction)
+            for i, (scan, bg) in enumerate(zip(all_scans, backgrounds)):
+                label = f'Scan {i+1}'
+                if bg != 0.0:
+                    label += f' (BG: -{bg:.3f})'
+                ax1.plot(scan[:, 0], scan[:, 1], 'o-', alpha=0.7, markersize=3, label=label)
+            
+            ax1.set_xlabel('Angle (degrees)')
+            ax1.set_ylabel('Intensity')
+            ax1.set_title(f'Individual Scans (Background Corrected) - {energy:.1f} eV')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.set_yscale('log')
+            
+            # Plot 2: Final combined data
+            ax2.plot(final_data[:, 0], final_data[:, 1], 'b-', linewidth=2, label='Combined Data')
+            ax2.set_xlabel('Angle (degrees)')
+            ax2.set_ylabel('Intensity')
+            ax2.set_title(f'Final Combined Data - {energy:.1f} eV')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            ax2.set_yscale('log')
+            
+            plt.tight_layout()
+            
+            # Save plot if output directory is specified
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                plot_filename = f"{plot_prefix}_background_corrected.png"
+                plot_path = os.path.join(output_dir, plot_filename)
+                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+                print(f"Plot saved to {plot_path}")
+            
+            plt.show()
+            
+        except Exception as e:
+            print(f"Warning: Could not generate plots: {str(e)}")
+    
+    
     
     def batch_process(self, scan_sets, trims_sets, output_template, normalize=True, plot=True, 
                     convert_to_photons=False, output_dir=None):
@@ -1035,7 +1324,7 @@ class RSoXRProcessor:
         
         return results
     
-    def auto_group_scans(self, data_directory=".", position_tolerance=0.1, energy_tolerance=0.5, auto_trim=False, save_table=True, output_dir=None, sort_by_energy=True):
+    def auto_group_scans(self, data_directory=".", position_tolerance=0.4, energy_tolerance=0.2, auto_trim=False, save_table=True, output_dir=None, sort_by_energy=True):
         """
         Automatically group scans based on position, energy, and detector type
         

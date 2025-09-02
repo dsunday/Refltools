@@ -695,6 +695,7 @@ print("viewer = create_multi_curve_viewer(data_dir='data', file_prefix='Prefix_'
 print("# Or with default parameters (current directory, no specific prefix):")
 print("viewer = create_multi_curve_viewer()")
 
+
 import numpy as np
 import matplotlib.pyplot as plt
 import ipywidgets as widgets
@@ -708,9 +709,10 @@ from scipy.signal import savgol_filter
 class RSoXRTrimWidget:
     """
     Interactive widget for trimming RSoXR data groups with stitching preview
+    Enhanced to support manually edited groups and background subtraction
     """
     
-    def __init__(self, processor, scan_groups=None, data_directory='.'):
+    def __init__(self, processor, scan_groups=None, data_directory='.', default_output_dir='trimmed_output'):
         """
         Initialize the widget
         
@@ -719,12 +721,16 @@ class RSoXRTrimWidget:
         processor : RSoXRProcessor
             The initialized RSoXR processor instance
         scan_groups : list, optional
-            List of scan groups, if already available
+            List of scan groups. If provided, these groups will be used directly.
+            If None, auto-detect scan groups from data_directory.
         data_directory : str
-            Directory containing the data files (if scan_groups not provided)
+            Directory containing the data files (used only if scan_groups not provided)
+        default_output_dir : str
+            Default output directory for saved files
         """
         self.processor = processor
         self.data_directory = data_directory
+        self.default_output_dir = default_output_dir
         
         if scan_groups is None:
             # Auto-detect scan groups if not provided
@@ -732,8 +738,14 @@ class RSoXRTrimWidget:
                 data_directory=data_directory, 
                 save_table=False
             )
+            self.groups_source = "autoscan"
         else:
+            # Use provided groups (assumed to be manually edited)
             self.scan_groups = scan_groups
+            self.groups_source = "provided"
+        
+        # Set default trim values to min and max points of each section
+        self._set_default_trim_values()
             
         # Store the original trims for each group
         self.original_trims = {}
@@ -743,6 +755,12 @@ class RSoXRTrimWidget:
         # Store the current trims for each group (may be modified by user)
         self.current_trims = deepcopy(self.original_trims)
         
+        # Initialize background subtraction storage for each group/file
+        # Each entry will be a constant background value to subtract
+        self.current_backgrounds = {}
+        for i, group in enumerate(self.scan_groups):
+            self.current_backgrounds[i] = [0.0] * len(group['files'])  # Default: no background subtraction
+        
         # Store loaded scan data for the current group
         self.current_group_data = None
         
@@ -751,6 +769,15 @@ class RSoXRTrimWidget:
         
         # Create the widget UI
         self._create_widgets()
+    
+    def _set_default_trim_values(self):
+        """
+        Set default trim values to use min and max points of each section
+        (0 for start, -1 for end, which means use all data points)
+        """
+        for group in self.scan_groups:
+            # Set trim values to use the full range of each file
+            group['trims'] = [(0, -1)] * len(group['files'])
     
     def _create_widgets(self):
         """Create the interactive widgets"""
@@ -799,8 +826,34 @@ class RSoXRTrimWidget:
             layout=widgets.Layout(width='20%')
         )
         
-        # Display selected vs. original trim values
+        # Background subtraction controls
+        self.background_value = widgets.FloatText(
+            value=0.0,
+            description='Background:',
+            disabled=False,
+            layout=widgets.Layout(width='20%'),
+            step=0.001,
+            tooltip='Constant background value to subtract from this section'
+        )
+        
+        self.apply_background_button = widgets.Button(
+            description='Apply Background',
+            disabled=False,
+            button_style='info',
+            tooltip='Apply background subtraction value',
+            icon='minus',
+            layout=widgets.Layout(width='20%')
+        )
+        
+        # Display selected vs. original trim info
         self.trim_info = widgets.HTML(
+            value="",
+            description='',
+            layout=widgets.Layout(width='40%')
+        )
+        
+        # Background info display
+        self.background_info = widgets.HTML(
             value="",
             description='',
             layout=widgets.Layout(width='40%')
@@ -811,7 +864,7 @@ class RSoXRTrimWidget:
             description='Reset This File',
             disabled=False,
             button_style='warning',
-            tooltip='Reset trims for the current file',
+            tooltip='Reset trims and background for the current file',
             icon='undo'
         )
         
@@ -820,7 +873,7 @@ class RSoXRTrimWidget:
             description='Reset Group',
             disabled=False,
             button_style='danger',
-            tooltip='Reset all trims for the current group',
+            tooltip='Reset all trims and backgrounds for the current group',
             icon='refresh'
         )
         
@@ -829,7 +882,7 @@ class RSoXRTrimWidget:
             description='Preview Stitching',
             disabled=False,
             button_style='info',
-            tooltip='Preview how the scans stitch together with current trim values',
+            tooltip='Preview how the scans stitch together with current trim and background values',
             icon='eye'
         )
         
@@ -838,16 +891,16 @@ class RSoXRTrimWidget:
             description='Process Group',
             disabled=False,
             button_style='success',
-            tooltip='Process this group with current trim settings',
+            tooltip='Process this group with current trim and background settings',
             icon='check'
         )
         
         # Save trims to file button
         self.save_button = widgets.Button(
-            description='Save Trims',
+            description='Save Settings',
             disabled=False,
             button_style='info',
-            tooltip='Save trim values to CSV file',
+            tooltip='Save trim and background values to CSV file',
             icon='save'
         )
         
@@ -861,8 +914,27 @@ class RSoXRTrimWidget:
         self.smooth_checkbox = widgets.Checkbox(
             value=False,
             description='Smooth Data',
-            disabled=False,
-            layout=widgets.Layout(width='200px')
+            disabled=False
+        )
+        
+        self.remove_zeros_checkbox = widgets.Checkbox(
+            value=True,
+            description='Remove Zeros',
+            disabled=False
+        )
+        
+        # Log scale for y-axis
+        self.log_scale_checkbox = widgets.Checkbox(
+            value=True,
+            description='Log Scale',
+            disabled=False
+        )
+        
+        # Convert to photons
+        self.convert_photons_checkbox = widgets.Checkbox(
+            value=False,
+            description='Convert to Photons',
+            disabled=False
         )
         
         # Smoothing parameters
@@ -904,29 +976,9 @@ class RSoXRTrimWidget:
             layout=widgets.Layout(width='200px')
         )
         
-        self.remove_zeros_checkbox = widgets.Checkbox(
-            value=True,
-            description='Remove Zeros',
-            disabled=False
-        )
-        
-        # Log scale for y-axis
-        self.log_scale_checkbox = widgets.Checkbox(
-            value=True,
-            description='Log Scale',
-            disabled=False
-        )
-        
-        # Convert to photons
-        self.convert_photons_checkbox = widgets.Checkbox(
-            value=False,
-            description='Convert to Photons',
-            disabled=False
-        )
-        
-        # Output directory
+        # Output directory - use the provided default
         self.output_dir = widgets.Text(
-            value='trimmed_output',
+            value=self.default_output_dir,
             description='Output Directory:',
             disabled=False,
             layout=widgets.Layout(width='50%')
@@ -939,14 +991,36 @@ class RSoXRTrimWidget:
             disabled=False
         )
         
+        # Show background subtraction in preview
+        self.preview_background = widgets.Checkbox(
+            value=True,
+            description='Preview Background Subtraction',
+            disabled=False,
+            tooltip='Show effect of background subtraction in plots'
+        )
+        
+        # Group source info
+        group_source_text = "✓ Using provided scan groups (manually edited)" if self.groups_source == "provided" else "Using autoscanned groups"
+        self.group_source_info = widgets.HTML(
+            value=f"<i style='color:#666;'>{group_source_text} | Total groups: {len(self.scan_groups)}</i>",
+            layout=widgets.Layout(width='100%')
+        )
+        
         # Arrange widgets in containers
         self.group_file_container = widgets.HBox([self.group_select, self.file_select])
         
+        # Modified trim display container to include background controls
         self.trim_display_container = widgets.HBox([
             self.trim_start_display, 
             self.trim_end_display, 
             self.apply_trim_button,
             self.trim_info
+        ])
+        
+        self.background_container = widgets.HBox([
+            self.background_value,
+            self.apply_background_button,
+            self.background_info
         ])
         
         # Moved smoothing options to the left side, stacked vertically
@@ -967,7 +1041,8 @@ class RSoXRTrimWidget:
             self.remove_zeros_checkbox,
             self.preview_remove_zeros,
             self.log_scale_checkbox,
-            self.convert_photons_checkbox
+            self.convert_photons_checkbox,
+            self.preview_background
         ])
         
         self.button_container = widgets.HBox([
@@ -981,11 +1056,13 @@ class RSoXRTrimWidget:
         # Output area
         self.output_area = widgets.Output()
         
-        # Main container with new layout
+        # Main container with new layout (added group source info)
         self.main_container = widgets.VBox([
-            widgets.HTML(value="<h2>RSoXR Interactive Trimming Tool</h2>"),
+            widgets.HTML(value="<h2>RSoXR Interactive Trimming Tool with Background Subtraction</h2>"),
+            self.group_source_info,  # Shows group source
             self.group_file_container,
             self.trim_display_container,
+            self.background_container,  # New: Background subtraction controls
             widgets.HBox([
                 self.smoothing_container,  # Left side
                 self.processing_options_container  # Right side
@@ -1001,16 +1078,47 @@ class RSoXRTrimWidget:
         self.reset_file_button.on_click(self._on_reset_file)
         self.reset_group_button.on_click(self._on_reset_group)
         self.process_button.on_click(self._on_process_group)
-        self.save_button.on_click(self._on_save_trims)
+        self.save_button.on_click(self._on_save_settings)
         self.log_scale_checkbox.observe(self._on_log_scale_change, names='value')
         self.preview_smooth_button.on_click(self._on_preview_smooth)
         self.apply_trim_button.on_click(self._on_apply_trim)
+        self.apply_background_button.on_click(self._on_apply_background)
         self.preview_remove_zeros.observe(self._on_log_scale_change, names='value')
+        self.preview_background.observe(self._on_log_scale_change, names='value')
         self.preview_stitching_button.on_click(self._on_preview_stitching)
         
         # Initialize by selecting the first group
         if group_options:
             self._on_group_change({'new': group_options[0]})
+    
+    def _apply_background_subtraction(self, data, background_value):
+        """Apply background subtraction to data"""
+        if background_value == 0.0:
+            return data
+        
+        corrected_data = data.copy()
+        corrected_data[:, 1] = corrected_data[:, 1] - background_value
+        return corrected_data
+    
+    def _on_apply_background(self, b):
+        """Apply manually entered background value"""
+        # Get current indices
+        group_str = self.group_select.value
+        group_idx = int(group_str.split(':')[0]) - 1
+        
+        file_str = self.file_select.value
+        file_idx = int(file_str.split(':')[0]) - 1
+        
+        # Get the manually entered background value
+        background_value = self.background_value.value
+        
+        # Update the background values
+        self.current_backgrounds[group_idx][file_idx] = background_value
+        
+        # Update the UI
+        self._on_file_change({'new': self.file_select.value})
+        
+        print(f"Applied background subtraction: {background_value}")
     
     def _load_group_data(self, group_idx):
         """Load all data files for the current group"""
@@ -1034,58 +1142,51 @@ class RSoXRTrimWidget:
         file_options = []
         for i, filename in enumerate(self.scan_groups[group_idx]['files']):
             # Get detector type if available
-            detector = "Unknown"
-            for meta in self.scan_groups[group_idx].get('metadata', []):
-                if os.path.basename(meta['filename']) == os.path.basename(filename):
-                    detector = meta.get('detector', 'Unknown')
-                    break
+            detector_type = ""
+            if group_idx < len(self.scan_groups) and i < len(self.scan_groups[group_idx]['metadata']):
+                metadata = self.scan_groups[group_idx]['metadata'][i]
+                if metadata and 'detector' in metadata:
+                    detector_type = f" ({metadata['detector']})"
             
-            file_options.append(f"{i+1}: {os.path.basename(filename)} ({detector})")
+            file_options.append(f"{i+1}: {os.path.basename(filename)}{detector_type}")
         
         self.file_select.options = file_options
         
-        # Load all data for this group (used for stitching preview)
-        self._load_group_data(group_idx)
+        # Clear current data
+        self.current_data = None
+        self.current_group_data = None
         
-        # Select the first file by default
+        # Select the first file
         if file_options:
             self.file_select.value = file_options[0]
-            self._on_file_change({'new': file_options[0]})
-    
+
     def _on_file_change(self, change):
         """Handle file selection change"""
-        # Extract the indices
+        # Clear current data to force reload
+        self.current_data = None
+        
+        # Extract indices from selection strings
         group_str = self.group_select.value
         group_idx = int(group_str.split(':')[0]) - 1
         
-        file_str = change['new'] if change['new'] else self.file_select.value
-        if not file_str:
-            return
-            
+        file_str = self.file_select.value
         file_idx = int(file_str.split(':')[0]) - 1
         
-        # Get the current trim values for this file
+        # Get current trim and background
         current_trim = self.current_trims[group_idx][file_idx]
         original_trim = self.original_trims[group_idx][file_idx]
+        current_background = self.current_backgrounds[group_idx][file_idx]
         
-        # Get the data for the current file
+        # Load data for visualization
         filename = self.scan_groups[group_idx]['files'][file_idx]
-        
-        # Use data from current_group_data if available, otherwise load it
-        if self.current_group_data and len(self.current_group_data) > file_idx and self.current_group_data[file_idx] is not None:
-            self.current_data = self.current_group_data[file_idx]
-        else:
-            try:
-                self.current_data = self.processor.load_data_file(filename)
-                # Update the group data cache
-                if not self.current_group_data or len(self.current_group_data) <= file_idx:
-                    self._load_group_data(group_idx)
-                else:
-                    self.current_group_data[file_idx] = self.current_data
-            except Exception as e:
+        try:
+            self.current_data = self.processor.load_data_file(filename)
+        except Exception as e:
+            with self.output_area:
+                clear_output(wait=True)
                 print(f"Error loading file: {str(e)}")
-                self.current_data = None
-                return
+            self.current_data = None
+            return
         
         # Update trim display
         self.trim_start_display.value = current_trim[0]
@@ -1095,17 +1196,26 @@ class RSoXRTrimWidget:
             # Convert negative index to positive for display
             self.trim_end_display.value = len(self.current_data) + current_trim[1] if current_trim[1] < 0 else current_trim[1]
         
+        # Update background display
+        self.background_value.value = current_background
+        
         # Update trim info display
         if current_trim != original_trim:
             self.trim_info.value = f"<span style='color:orange'>Modified: Original trim was {original_trim}</span>"
         else:
             self.trim_info.value = ""
         
-        # Plot the file with current trim
+        # Update background info display
+        if current_background != 0.0:
+            self.background_info.value = f"<span style='color:blue'>Background: -{current_background:.3f}</span>"
+        else:
+            self.background_info.value = ""
+        
+        # Plot the file with current trim and background
         self._plot_current_file()
     
     def _plot_current_file(self):
-        """Plot the currently selected file with trim indicators"""
+        """Plot the currently selected file with trim indicators and background subtraction"""
         # Get the selected indices
         group_str = self.group_select.value
         group_idx = int(group_str.split(':')[0]) - 1
@@ -1126,8 +1236,9 @@ class RSoXRTrimWidget:
         
         data = self.current_data
         
-        # Get current trim
+        # Get current trim and background
         trim_start, trim_end = self.current_trims[group_idx][file_idx]
+        background_value = self.current_backgrounds[group_idx][file_idx]
         
         # Clear the output area and create a new figure
         with self.output_area:
@@ -1144,12 +1255,26 @@ class RSoXRTrimWidget:
                     print(f"Preview: Removing {len(data) - np.sum(non_zero_mask)} zero data points")
                     plot_data = data[non_zero_mask]
             
-            # Plot the data
-            ax.plot(plot_data[:, 0], plot_data[:, 1], 'b-', marker='o', alpha=0.7, markersize=4, label='Raw Data')
+            # Apply background subtraction if preview is enabled
+            if self.preview_background.value and background_value != 0.0:
+                plot_data_bg = self._apply_background_subtraction(plot_data, background_value)
+                # Plot original data
+                ax.plot(plot_data[:, 0], plot_data[:, 1], 'b-', marker='o', alpha=0.5, markersize=3, label='Raw Data')
+                # Plot background-subtracted data
+                ax.plot(plot_data_bg[:, 0], plot_data_bg[:, 1], 'g-', marker='s', alpha=0.7, markersize=3, label=f'Background Corrected (-{background_value:.3f})')
+                plot_data = plot_data_bg  # Use corrected data for trimming visualization
+            else:
+                # Plot the data
+                ax.plot(plot_data[:, 0], plot_data[:, 1], 'b-', marker='o', alpha=0.7, markersize=4, label='Raw Data')
             
             # Highlight the trimmed data
             end_idx = len(data) + trim_end if trim_end < 0 else trim_end
             trimmed_data = data[trim_start:end_idx]
+            
+            # Apply background subtraction to trimmed data if preview is enabled
+            if self.preview_background.value and background_value != 0.0:
+                trimmed_data = self._apply_background_subtraction(trimmed_data, background_value)
+            
             if len(trimmed_data) > 0:
                 ax.plot(trimmed_data[:, 0], trimmed_data[:, 1], 'r-', marker='x', alpha=0.8, markersize=5, label='Selected Data')
             
@@ -1164,9 +1289,12 @@ class RSoXRTrimWidget:
             ax.set_ylabel('Intensity')
             ax.set_title(f"File: {os.path.basename(filename)}")
             
-            # Add trim info to the plot
-            trim_text = f"Trim: [{trim_start}, {trim_end if trim_end != -1 else 'end'}]"
-            ax.text(0.02, 0.98, trim_text, transform=ax.transAxes, 
+            # Add trim and background info to the plot
+            info_text = f"Trim: [{trim_start}, {trim_end if trim_end != -1 else 'end'}]"
+            if background_value != 0.0:
+                info_text += f"\nBackground: -{background_value:.3f}"
+            
+            ax.text(0.02, 0.98, info_text, transform=ax.transAxes, 
                    verticalalignment='top', horizontalalignment='left',
                    bbox={'facecolor': 'white', 'alpha': 0.7, 'pad': 5})
             
@@ -1218,6 +1346,177 @@ class RSoXRTrimWidget:
         self._on_file_change({'new': self.file_select.value})
         
         print(f"Applied trim: [{start_trim}, {end_trim if end_trim != -1 else 'end'}]")
+    
+    def _on_reset_file(self, b):
+        """Reset trim and background for the current file to original values"""
+        # Get current indices
+        group_str = self.group_select.value
+        group_idx = int(group_str.split(':')[0]) - 1
+        
+        file_str = self.file_select.value
+        file_idx = int(file_str.split(':')[0]) - 1
+        
+        # Reset to original trim and clear background
+        self.current_trims[group_idx][file_idx] = self.original_trims[group_idx][file_idx]
+        self.current_backgrounds[group_idx][file_idx] = 0.0
+        
+        # Update the UI
+        self._on_file_change({'new': self.file_select.value})
+        
+        with self.output_area:
+            print(f"Reset trim values for file {file_idx+1} to original: {self.original_trims[group_idx][file_idx]}")
+            print(f"Reset background to 0.0")
+    
+    def _on_reset_group(self, b):
+        """Reset all trims and backgrounds for the current group to original values"""
+        # Get current group index
+        group_str = self.group_select.value
+        group_idx = int(group_str.split(':')[0]) - 1
+        
+        # Reset to original trims and clear backgrounds
+        self.current_trims[group_idx] = deepcopy(self.original_trims[group_idx])
+        self.current_backgrounds[group_idx] = [0.0] * len(self.scan_groups[group_idx]['files'])
+        
+        # Update the UI
+        self._on_file_change({'new': self.file_select.value})
+        
+        with self.output_area:
+            clear_output(wait=True)
+            print(f"Reset all trim values for group {group_idx+1} to original values")
+            print(f"Reset all background values to 0.0")
+            print("Use the 'Preview Stitching' button to see how the original values affect the stitching.")
+
+    def _on_preview_stitching(self, b):
+        """Preview the stitching between different scans with current trim and background values"""
+        # Get current group
+        group_str = self.group_select.value
+        group_idx = int(group_str.split(':')[0]) - 1
+        
+        group = self.scan_groups[group_idx]
+        energy = group['energy']
+        
+        # Ensure all data is loaded
+        if not self.current_group_data or any(data is None for data in self.current_group_data):
+            self._load_group_data(group_idx)
+        
+        # Prepare trimmed and background-corrected data
+        scans = []
+        for i, data in enumerate(self.current_group_data):
+            if data is None:
+                print(f"Warning: Data for scan {i+1} is not available")
+                continue
+                
+            # Apply current trim
+            trim_start, trim_end = self.current_trims[group_idx][i]
+            end_idx = len(data) + trim_end if trim_end < 0 else trim_end
+            trimmed_data = data[trim_start:end_idx]
+            
+            # Apply background subtraction
+            background_value = self.current_backgrounds[group_idx][i]
+            if background_value != 0.0:
+                trimmed_data = self._apply_background_subtraction(trimmed_data, background_value)
+            
+            # Remove zeros if requested
+            if self.remove_zeros_checkbox.value:
+                non_zero_mask = trimmed_data[:, 1] > 0
+                if not all(non_zero_mask):
+                    print(f"Removing {len(trimmed_data) - np.sum(non_zero_mask)} zero points from scan {i+1}")
+                    trimmed_data = trimmed_data[non_zero_mask]
+            
+            scans.append(trimmed_data)
+        
+        # Preview the stitching
+        with self.output_area:
+            clear_output(wait=True)
+            
+            if len(scans) == 0:
+                print("No valid scans found for preview")
+                return
+                
+            # Create side-by-side plots
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+            
+            # Left plot: individual scans
+            for i, scan in enumerate(scans):
+                if len(scan) > 0:
+                    ax1.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
+                            color=f'C{i}', label=f'Scan {i+1}')
+            
+            # Right plot: stitched preview with scaling
+            combined = np.array([]).reshape(0, 2)
+            
+            for i, scan in enumerate(scans):
+                if len(scan) == 0:
+                    continue
+                    
+                # Store original scan for comparison
+                orig_scan = scan.copy()
+                
+                if len(combined) > 0:
+                    # Find overlap region and calculate scaling factor
+                    overlap_angles = scan[:, 0]
+                    overlap_mask = (overlap_angles >= combined[:, 0].min()) & (overlap_angles <= combined[:, 0].max())
+                    
+                    if np.any(overlap_mask):
+                        # Simple scaling based on median ratio in overlap region
+                        overlap_scan = scan[overlap_mask]
+                        overlap_combined_interp = np.interp(overlap_scan[:, 0], combined[:, 0], combined[:, 1])
+                        valid_ratios = overlap_combined_interp / overlap_scan[:, 1]
+                        valid_ratios = valid_ratios[np.isfinite(valid_ratios) & (valid_ratios > 0)]
+                        
+                        if len(valid_ratios) > 0:
+                            scale = np.median(valid_ratios)
+                        else:
+                            scale = 1.0
+                    else:
+                        scale = 1.0
+                        
+                    print(f"Scan {i+1}: scaling factor = {scale:.3f}")
+                    
+                    # Apply scaling
+                    scan[:, 1] = scan[:, 1] * scale
+                    
+                    # Plot the unscaled data (dashed line)
+                    ax2.plot(orig_scan[:, 0], orig_scan[:, 1], marker='', linestyle='--', 
+                            color=f'C{i}', alpha=0.4, label=f'Scan {i+1} (Unscaled)')
+                    
+                    # Plot the scaled data
+                    ax2.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
+                            color=f'C{i}', label=f'Scan {i+1} (Scaled)')
+                    
+                    # Concatenate with existing data
+                    combined = np.concatenate((combined, scan))
+            
+            # Set y-scale based on checkbox
+            if self.log_scale_checkbox.value:
+                ax1.set_yscale('log')
+                ax2.set_yscale('log')
+            else:
+                ax1.set_yscale('linear')
+                ax2.set_yscale('linear')
+            
+            # Set labels and titles
+            ax1.set_xlabel('Angle (degrees)')
+            ax1.set_ylabel('Intensity')
+            ax1.set_title(f'Raw Scans (Trimmed & Background Corrected) - {energy:.1f} eV')
+            ax1.legend()
+            ax1.grid(True, which="both", ls="--", alpha=0.3)
+            
+            ax2.set_xlabel('Angle (degrees)')
+            ax2.set_ylabel('Intensity')
+            ax2.set_title(f'Stitching Preview - {energy:.1f} eV')
+            ax2.legend()
+            ax2.grid(True, which="both", ls="--", alpha=0.3)
+            
+            plt.tight_layout()
+            plt.show()
+            
+            print(f"Stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.1f} eV")
+            print("Overlapping regions are highlighted in the right plot.")
+            print("Dotted lines show unscaled data, solid lines show scaled data.")
+            print("Background subtraction has been applied where specified.")
+            print("To adjust the overlap regions, modify the trim values for each file.")
+            print("Note: This is only a preview. Click 'Process Group' to apply the final processing.")
     
     def _validate_smoothing_params(self):
         """Validate smoothing parameters and adjust if necessary"""
@@ -1271,94 +1570,62 @@ class RSoXRTrimWidget:
             end_idx = len(data) + trim_end if trim_end < 0 else trim_end
             trimmed_data = data[trim_start:end_idx]
             
-            # Remove zeros if requested
-            if self.remove_zeros_checkbox.value:
-                non_zero_mask = trimmed_data[:, 1] > 0
-                if not all(non_zero_mask):
-                    print(f"Removing {len(trimmed_data) - np.sum(non_zero_mask)} zero data points before smoothing")
-                    trimmed_data = trimmed_data[non_zero_mask]
+            # Apply background subtraction
+            background_value = self.current_backgrounds[group_idx][file_idx]
+            if background_value != 0.0:
+                trimmed_data = self._apply_background_subtraction(trimmed_data, background_value)
             
-            # Apply smoothing to the intensity data
-            smoothed_intensities = savgol_filter(trimmed_data[:, 1], window_size, polynomial_order)
+            # Remove zeros if needed
+            if len(trimmed_data) < window_size:
+                print(f"Error: Not enough data points ({len(trimmed_data)}) for smoothing window ({window_size})")
+                return
+                
+            # Apply Savitzky-Golay smoothing
+            smoothed_intensity = savgol_filter(trimmed_data[:, 1], window_size, polynomial_order)
             
-            # Plot the original and smoothed data
+            # Create smoothed data array
+            smoothed_data = trimmed_data.copy()
+            smoothed_data[:, 1] = smoothed_intensity
+            
+            # Plot comparison
             with self.output_area:
                 clear_output(wait=True)
-                
                 fig, ax = plt.subplots(figsize=(10, 6))
                 
-                # Plot original data
-                ax.plot(trimmed_data[:, 0], trimmed_data[:, 1], 'b-', marker='o', alpha=0.3, markersize=4, label='Raw Data')
+                # Plot original trimmed data
+                ax.plot(trimmed_data[:, 0], trimmed_data[:, 1], 'b-o', alpha=0.6, 
+                       markersize=3, label='Original (Trimmed & BG Corrected)')
                 
                 # Plot smoothed data
-                ax.plot(trimmed_data[:, 0], smoothed_intensities, 'r-', linewidth=2, label=f'Smoothed (Window={window_size}, Order={polynomial_order})')
+                ax.plot(smoothed_data[:, 0], smoothed_data[:, 1], 'r-', linewidth=2, 
+                       label=f'Smoothed (window={window_size}, order={polynomial_order})')
                 
                 # Set y-scale based on checkbox
                 if self.log_scale_checkbox.value:
                     ax.set_yscale('log')
                 else:
                     ax.set_yscale('linear')
-                    
-                # Add labels and title
+                
                 ax.set_xlabel('Angle (degrees)')
                 ax.set_ylabel('Intensity')
-                group_str = self.group_select.value
-                file_str = self.file_select.value
-                ax.set_title(f"Smoothing Preview: {file_str}")
-                
-                # Add a legend
+                ax.set_title('Smoothing Preview')
                 ax.legend()
-                
-                # Add grid
                 ax.grid(True, linestyle='--', alpha=0.7)
                 
                 plt.tight_layout()
                 plt.show()
                 
-                print("Note: This is only a preview. Click 'Process Group' to apply smoothing to the final data.")
+                print(f"Smoothing preview with window size {window_size} and polynomial order {polynomial_order}")
+                print("This shows how the data will look after smoothing is applied during processing.")
+                print("Click 'Process Group' to apply smoothing to the final data.")
                 print("Click any file in the dropdown to return to the trimming view.")
                 
         except Exception as e:
             print(f"Error previewing smoothing: {str(e)}")
             print("Tip: Try adjusting the window size or polynomial order.")
     
-    def _on_reset_file(self, b):
-        """Reset trim for the current file to original values"""
-        # Get current indices
-        group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
-        
-        file_str = self.file_select.value
-        file_idx = int(file_str.split(':')[0]) - 1
-        
-        # Reset to original trim
-        self.current_trims[group_idx][file_idx] = self.original_trims[group_idx][file_idx]
-        
-        # Update the UI
-        self._on_file_change({'new': self.file_select.value})
-        
-        with self.output_area:
-            print(f"Reset trim values for file {file_idx+1} to original: {self.original_trims[group_idx][file_idx]}")
-    
-    def _on_reset_group(self, b):
-        """Reset all trims for the current group to original values"""
-        # Get current group index
-        group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
-        
-        # Reset to original trims
-        self.current_trims[group_idx] = deepcopy(self.original_trims[group_idx])
-        
-        # Update the UI
-        self._on_file_change({'new': self.file_select.value})
-        
-        with self.output_area:
-            clear_output(wait=True)
-            print(f"Reset all trim values for group {group_idx+1} to original values")
-            print("Use the 'Preview Stitching' button to see how the original trim values affect the stitching.")
-    
     def _on_process_group(self, b):
-        """Process the current group with current trim settings"""
+        """Process the current group with current trim and background settings"""
         # Get current group index
         group_str = self.group_select.value
         group_idx = int(group_str.split(':')[0]) - 1
@@ -1368,6 +1635,9 @@ class RSoXRTrimWidget:
         
         # Update the group with current trims
         group['trims'] = self.current_trims[group_idx]
+        
+        # Add background values to the group
+        group['backgrounds'] = self.current_backgrounds[group_idx]
         
         # Create output directory if it doesn't exist
         output_dir = self.output_dir.value
@@ -1384,46 +1654,97 @@ class RSoXRTrimWidget:
             clear_output(wait=True)
             print(f"Processing group {group_idx+1}: {group['sample_name']} at {group['energy']:.1f} eV")
             print(f"Using trims: {group['trims']}")
+            print(f"Using backgrounds: {group['backgrounds']}")
             print(f"Output directory: {output_dir}")
             
             try:
                 # Generate output filename
                 output_filename = f"{group['sample_name']}_{group['energy']:.1f}eV.dat"
                 
-                # Process the group
-                result = self.processor.process_scan_set(
-                    scan_group=group,
-                    output_filename=output_filename,
-                    normalize=self.normalize_checkbox.value,
-                    plot=True,
-                    convert_to_photons=self.convert_photons_checkbox.value,
-                    smooth_data=self.smooth_checkbox.value,
-                    savgol_window=window_size,
-                    savgol_order=polynomial_order,
-                    remove_zeros=self.remove_zeros_checkbox.value,
-                    estimate_thickness=False,  # Disabled thickness estimation
-                    output_dir=output_dir
-                )
-                
-                print("\nProcessing completed successfully!")
-                print(f"Data saved to {os.path.join(output_dir, output_filename)}")
+                # Check if the processor has the updated method
+                if hasattr(self.processor, 'reduce_data_with_background'):
+                    # Use the updated processor with background subtraction support
+                    result = self.processor.process_scan_set(
+                        scan_group=group,
+                        output_filename=output_filename,
+                        normalize=self.normalize_checkbox.value,
+                        plot=True,
+                        convert_to_photons=self.convert_photons_checkbox.value,
+                        smooth_data=self.smooth_checkbox.value,
+                        savgol_window=window_size,
+                        savgol_order=polynomial_order,
+                        remove_zeros=self.remove_zeros_checkbox.value,
+                        estimate_thickness=False,  # Disabled thickness estimation
+                        output_dir=output_dir
+                    )
+                    
+                    print("\nProcessing completed successfully!")
+                    print(f"Data saved to {os.path.join(output_dir, output_filename)}")
+                    
+                    # Show background subtraction summary
+                    bg_applied = [bg for bg in group['backgrounds'] if bg != 0.0]
+                    if bg_applied:
+                        print(f"Background subtraction applied to {len(bg_applied)} files")
+                    else:
+                        print("No background subtraction was applied")
+                        
+                else:
+                    # Fall back to manual processing demonstration
+                    print("\nWARNING: Background subtraction not yet implemented in processor.")
+                    print("To enable background subtraction, add the updated methods to RSoXRProcessor:")
+                    print("1. Updated process_scan_set method")
+                    print("2. reduce_data_with_background method") 
+                    print("3. _plot_processed_data_with_background method")
+                    print("\nFor now, showing what would be processed:")
+                    
+                    # Show the processing steps that would be applied
+                    print("\nProcessing steps that would be applied:")
+                    print("1. Load each scan file")
+                    print("2. Apply trim values")
+                    print("3. Apply background subtraction")
+                    print("4. Remove zeros (if enabled)")
+                    print("5. Apply smoothing (if enabled)")
+                    print("6. Normalize and stitch scans together")
+                    print("7. Save final result")
+                    
+                    # Show the processing settings
+                    print(f"\nProcessing settings:")
+                    print(f"  Normalize: {self.normalize_checkbox.value}")
+                    print(f"  Remove zeros: {self.remove_zeros_checkbox.value}")
+                    print(f"  Convert to photons: {self.convert_photons_checkbox.value}")
+                    print(f"  Smooth data: {self.smooth_checkbox.value}")
+                    if self.smooth_checkbox.value:
+                        print(f"    Window size: {window_size}")
+                        print(f"    Polynomial order: {polynomial_order}")
+                    
+                    # Show background subtraction summary
+                    print(f"\nBackground subtraction summary:")
+                    for i, (filename, bg_val) in enumerate(zip(group['files'], group['backgrounds'])):
+                        if bg_val != 0.0:
+                            print(f"  File {i+1} ({os.path.basename(filename)}): -{bg_val:.3f}")
+                        else:
+                            print(f"  File {i+1} ({os.path.basename(filename)}): No background subtraction")
+                    
+                    print(f"\nThe processed data would be saved as: {os.path.join(output_dir, output_filename)}")
                 
             except Exception as e:
                 print(f"Error processing group: {str(e)}")
-    
-    def _on_save_trims(self, b):
-        """Save current trim settings to a CSV file"""
+                print("If background subtraction is enabled, ensure the processor has been updated with the new methods.")
+
+    def _on_save_settings(self, b):
+        """Save current trim and background settings to a CSV file"""
         try:
-            # Create a list to collect trim data
-            trim_data = []
+            # Create a list to collect trim and background data
+            settings_data = []
             
             for group_idx, group in enumerate(self.scan_groups):
                 for file_idx, filename in enumerate(group['files']):
                     original_trim = self.original_trims[group_idx][file_idx]
                     current_trim = self.current_trims[group_idx][file_idx]
+                    background_value = self.current_backgrounds[group_idx][file_idx]
                     
                     # Add row to data
-                    trim_data.append({
+                    settings_data.append({
                         'Group': group_idx + 1,
                         'Sample': group['sample_name'],
                         'Energy (eV)': group['energy'],
@@ -1433,192 +1754,59 @@ class RSoXRTrimWidget:
                         'Original Trim End': original_trim[1],
                         'Current Trim Start': current_trim[0],
                         'Current Trim End': current_trim[1],
-                        'Modified': original_trim != current_trim
+                        'Background Value': background_value,
+                        'Trim Modified': original_trim != current_trim,
+                        'Background Applied': background_value != 0.0,
+                        'Groups Source': self.groups_source
                     })
             
             # Create a DataFrame
-            df = pd.DataFrame(trim_data)
+            df = pd.DataFrame(settings_data)
             
             # Create output directory if it doesn't exist
             output_dir = self.output_dir.value
             os.makedirs(output_dir, exist_ok=True)
             
             # Save to CSV
-            output_file = os.path.join(output_dir, 'trim_settings.csv')
+            output_file = os.path.join(output_dir, 'trim_and_background_settings.csv')
             df.to_csv(output_file, index=False)
             
             with self.output_area:
                 clear_output(wait=True)
-                print(f"Trim settings saved to {output_file}")
+                print(f"Trim and background settings saved to {output_file}")
                 
                 # Also display a summary
-                print("\nSummary of modified trims:")
-                modified_df = df[df['Modified']]
-                if len(modified_df) > 0:
-                    print(modified_df[['Group', 'Sample', 'Energy (eV)', 'Filename', 
-                                     'Original Trim Start', 'Original Trim End',
-                                     'Current Trim Start', 'Current Trim End']])
-                else:
-                    print("No trims were modified from their original values.")
+                print("\nSummary of current configuration:")
+                print(f"Groups source: {self.groups_source}")
+                print(f"Total groups: {len(self.scan_groups)}")
                 
+                print("\nSummary of modifications:")
+                modified_df = df[(df['Trim Modified']) | (df['Background Applied'])]
+                if len(modified_df) > 0:
+                    print("Files with modifications:")
+                    for _, row in modified_df.iterrows():
+                        changes = []
+                        if row['Trim Modified']:
+                            changes.append(f"Trim: [{row['Current Trim Start']}, {row['Current Trim End']}]")
+                        if row['Background Applied']:
+                            changes.append(f"Background: -{row['Background Value']:.3f}")
+                        print(f"  Group {int(row['Group'])}, File {int(row['File Index'])}: {', '.join(changes)}")
+                else:
+                    print("No modifications were made from original values.")
+                    
         except Exception as e:
             with self.output_area:
                 clear_output(wait=True)
-                print(f"Error saving trim settings: {str(e)}")
+                print(f"Error saving settings: {str(e)}")
     
     def _on_log_scale_change(self, change):
         """Handle log scale checkbox change"""
         # Redraw the plot with new scale
         self._plot_current_file()
-        
-    def _on_preview_stitching(self, b):
-        """Preview the stitching between different scans with current trim values"""
-        # Get current group
-        group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
-        
-        group = self.scan_groups[group_idx]
-        energy = group['energy']
-        
-        # Ensure all data is loaded
-        if not self.current_group_data or any(data is None for data in self.current_group_data):
-            self._load_group_data(group_idx)
-        
-        # Prepare trimmed data
-        scans = []
-        for i, data in enumerate(self.current_group_data):
-            if data is None:
-                print(f"Warning: Data for scan {i+1} is not available")
-                continue
-                
-            # Apply current trim
-            trim_start, trim_end = self.current_trims[group_idx][i]
-            end_idx = len(data) + trim_end if trim_end < 0 else trim_end
-            trimmed_data = data[trim_start:end_idx]
-            
-            # Remove zeros if requested
-            if self.remove_zeros_checkbox.value:
-                non_zero_mask = trimmed_data[:, 1] > 0
-                if not all(non_zero_mask):
-                    print(f"Removing {len(trimmed_data) - np.sum(non_zero_mask)} zero points from scan {i+1}")
-                    trimmed_data = trimmed_data[non_zero_mask]
-            
-            scans.append(trimmed_data)
-        
-        # Preview the stitching
-        with self.output_area:
-            clear_output(wait=True)
-            
-            if not scans:
-                print("No valid scan data available for stitching preview")
-                return
-            
-            # Initialize figure with two subplots (raw and stitched)
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7))
-            
-            # Store all raw scans for first subplot
-            all_raw_scans = []
-            
-            # Show all raw scans in the first subplot
-            for i, scan in enumerate(scans):
-                # Plot raw scan
-                color = f'C{i}'
-                ax1.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', color=color,
-                        alpha=0.7, markersize=4, label=f'Scan {i+1} (Raw)')
-                all_raw_scans.append(deepcopy(scan))
-            
-            # Now show the stitching process in the second subplot
-            if len(scans) > 0:
-                # Start with the first scan
-                combined = deepcopy(scans[0])
-                ax2.plot(combined[:, 0], combined[:, 1], marker='o', linestyle='-', 
-                        color='C0', label=f'Scan 1')
-                
-                # Process additional scans
-                for i in range(1, len(scans)):
-                    scan = deepcopy(scans[i])
-                    orig_scan = deepcopy(scan)  # Keep a copy for displaying unscaled
-                    
-                    # Find overlap between this scan and the combined data
-                    idx, val = self.processor.find_nearest(scan[:, 0], combined[-1, 0])
-                    
-                    # Check for valid overlap
-                    if idx <= 0 or np.isnan(val):
-                        print(f"Warning: No overlap found for scan {i+1}. Using default scaling factor of 1.0")
-                        scale = 1.0
-                        # No overlap region to highlight
-                    else:
-                        # Calculate scaling factor based on overlapping region
-                        scaling = np.zeros(idx)
-                        for ii in range(idx):
-                            idx2, val2 = self.processor.find_nearest(combined[:, 0], scan[ii, 0])
-                            if scan[ii, 1] != 0:  # Avoid division by zero
-                                scaling[ii] = combined[idx2, 1] / scan[ii, 1]
-                            else:
-                                scaling[ii] = 1.0
-                        
-                        # Use mean of scaling factors, ignoring zeros and NaNs
-                        valid_scaling = scaling[~np.isnan(scaling) & (scaling != 0)]
-                        if len(valid_scaling) > 0:
-                            scale = np.mean(valid_scaling)
-                        else:
-                            scale = 1.0
-                        
-                        # Highlight the overlapping region
-                        overlap_x = scan[:idx, 0]
-                        if len(overlap_x) > 0:
-                            span_min = min(overlap_x)
-                            span_max = max(overlap_x)
-                            ax2.axvspan(span_min, span_max, alpha=0.2, 
-                                      color=f'C{i}', label=f'Overlap {i}-{i+1}')
-                    
-                    print(f"Scaling factor for scan {i+1}: {scale:.4f}")
-                    
-                    # Apply scaling
-                    scan[:, 1] = scan[:, 1] * scale
-                    
-                    # Plot the unscaled data (dashed line)
-                    ax2.plot(orig_scan[:, 0], orig_scan[:, 1], marker='', linestyle='--', 
-                            color=f'C{i}', alpha=0.4, label=f'Scan {i+1} (Unscaled)')
-                    
-                    # Plot the scaled data
-                    ax2.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
-                            color=f'C{i}', label=f'Scan {i+1} (Scaled)')
-                    
-                    # Concatenate with existing data
-                    combined = np.concatenate((combined, scan))
-            
-            # Set y-scale based on checkbox
-            if self.log_scale_checkbox.value:
-                ax1.set_yscale('log')
-                ax2.set_yscale('log')
-            else:
-                ax1.set_yscale('linear')
-                ax2.set_yscale('linear')
-            
-            # Set labels and titles
-            ax1.set_xlabel('Angle (degrees)')
-            ax1.set_ylabel('Intensity')
-            ax1.set_title(f'Raw Scans - {energy:.1f} eV')
-            ax1.legend()
-            ax1.grid(True, which="both", ls="--", alpha=0.3)
-            
-            ax2.set_xlabel('Angle (degrees)')
-            ax2.set_ylabel('Intensity')
-            ax2.set_title(f'Stitching Preview - {energy:.1f} eV')
-            ax2.legend()
-            ax2.grid(True, which="both", ls="--", alpha=0.3)
-            
-            plt.tight_layout()
-            plt.show()
-            
-            print(f"Stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.1f} eV")
-            print("Overlapping regions are highlighted in the right plot.")
-            print("Dotted lines show unscaled data, solid lines show scaled data.")
-            print("To adjust the overlap regions, modify the trim values for each file.")
-            print("Note: This is only a preview. Click 'Process Group' to apply the final processing.")
     
     def display(self):
         """Display the widget"""
         display(self.main_container)
-
+        print(f"RSoXR Trim Widget initialized with default output directory: {self.default_output_dir}")
+        print(f"Default trim values set to use full range of each data section (0, -1)")
+        print(f"Loaded {len(self.scan_groups)} scan groups")
