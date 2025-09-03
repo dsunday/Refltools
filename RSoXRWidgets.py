@@ -1073,7 +1073,6 @@ class RSoXRTrimWidget:
             self.save_button
         ])
         
-        self.open_beam_controls = self.add_open_beam_controls_to_widget()
         
         # Output area
         self.output_area = widgets.Output()
@@ -1085,7 +1084,6 @@ class RSoXRTrimWidget:
             self.group_file_container,
             self.trim_display_container,
             self.background_container,  # New: Background subtraction controls
-            self.open_beam_controls,
             widgets.HBox([
                 self.smoothing_container,  # Left side
                 self.processing_options_container  # Right side
@@ -1161,6 +1159,10 @@ class RSoXRTrimWidget:
         group_idx = int(group_str.split(':')[0]) - 1
         
         group = self.scan_groups[group_idx]
+        energy = group['energy']
+        
+        # Check if energy is within open beam range and warn if not
+        is_within_range, min_energy, max_energy, distance = self._check_open_beam_energy_range(energy)
         
         # Update file dropdown
         file_options = [f"{i+1}: {os.path.basename(f)}" for i, f in enumerate(group['files'])]
@@ -1177,12 +1179,19 @@ class RSoXRTrimWidget:
             total_files = sum(len(g['files']) for g in self.scan_groups)
             self.group_source_info.value = f"<i style='color:#666;'>{group_source_text} | Total groups: {len(self.scan_groups)} | Total files: {total_files}</i>"
         
+        # Display energy range warning if needed (BEFORE loading files and preview)
+        if not is_within_range and min_energy is not None:
+            with self.output_area:
+                clear_output(wait=True)
+                self._display_energy_range_warning(energy, min_energy, max_energy, distance)
+        
         # Load the first file to display
         if file_options:
             self._on_file_change({'new': file_options[0]})
         
         # Auto-generate stitching preview for the new group
-        self._auto_preview_stitching()
+        if getattr(self, 'auto_preview', True):
+            self._auto_preview_stitching()
 
     def _on_file_change(self, change):
         """Handle file selection change"""
@@ -1430,6 +1439,9 @@ class RSoXRTrimWidget:
             group = self.scan_groups[group_idx]
             energy = group['energy']
             
+            # Check energy range first
+            is_within_range, min_energy, max_energy, distance = self._check_open_beam_energy_range(energy)
+            
             # Ensure all data is loaded
             if not self.current_group_data or any(data is None for data in self.current_group_data):
                 self._load_group_data(group_idx)
@@ -1441,18 +1453,19 @@ class RSoXRTrimWidget:
                     print("Error: No data loaded for current group. Please select a valid group.")
                 return
             
-            # Check if open beam normalization is available and enabled
-            use_open_beam = (hasattr(self.processor, 'use_open_beam_normalization') and 
-                            self.processor.use_open_beam_normalization and
-                            hasattr(self.processor, 'open_beam_data') and 
-                            self.processor.open_beam_data is not None)
+            # Check if open beam normalization is available (simplified logic)
+            use_open_beam = (hasattr(self.processor, 'open_beam_data') and 
+                            self.processor.open_beam_data is not None and
+                            len(self.processor.open_beam_data) > 0)
             
             open_beam_intensity = None
             if use_open_beam:
                 open_beam_intensity = self.processor.get_open_beam_intensity(energy)
             
             # Prepare trimmed and background-corrected data
-            scans = []
+            raw_scans = []  # For left plot (no open beam correction)
+            scans = []      # For right plot (with open beam correction if available)
+            
             for i, data in enumerate(self.current_group_data):
                 if data is None:
                     print(f"Warning: Data for scan {i+1} is not available")
@@ -1468,23 +1481,36 @@ class RSoXRTrimWidget:
                 if background_value != 0.0:
                     trimmed_data = self._apply_background_subtraction(trimmed_data, background_value)
                 
-                # Apply open beam normalization if enabled and available
+                # Create raw scan data (without open beam correction) for left plot
+                raw_scan_data = trimmed_data.copy()
+                
+                # Apply open beam normalization if available (only for stitching preview)
                 if use_open_beam and open_beam_intensity is not None and open_beam_intensity > 0:
                     trimmed_data[:, 1] = trimmed_data[:, 1] / open_beam_intensity
                 
-                # Remove zeros if requested
+                # Remove zeros if requested (apply to both datasets)
                 if self.remove_zeros_checkbox.value:
                     non_zero_mask = trimmed_data[:, 1] > 0
+                    raw_non_zero_mask = raw_scan_data[:, 1] > 0
+                    
                     if not all(non_zero_mask):
                         print(f"Removing {len(trimmed_data) - np.sum(non_zero_mask)} zero points from scan {i+1}")
                         trimmed_data = trimmed_data[non_zero_mask]
+                    
+                    if not all(raw_non_zero_mask):
+                        raw_scan_data = raw_scan_data[raw_non_zero_mask]
                 
                 if len(trimmed_data) > 0:  # Only add non-empty scans
                     scans.append(trimmed_data)
+                    raw_scans.append(raw_scan_data)
             
             # Preview the stitching
             with self.output_area:
                 clear_output(wait=True)
+                
+                # Display energy warning if applicable
+                if not is_within_range and min_energy is not None:
+                    self._display_energy_range_warning(energy, min_energy, max_energy, distance)
                 
                 if len(scans) == 0:
                     print("Error: No valid scan data available for stitching preview.")
@@ -1492,28 +1518,22 @@ class RSoXRTrimWidget:
                 
                 print(f"Generating stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.1f} eV")
                 
-                # Print open beam information
-                if (hasattr(self.processor, 'open_beam_data') and 
-                    self.processor.open_beam_data is not None and
-                    len(self.processor.open_beam_data) > 0):
-                    
-                    if open_beam_intensity is not None:
-                        if use_open_beam:
-                            print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} (APPLIED)")
-                        else:
-                            print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} (available, not applied)")
-                    else:
-                        print(f"Open beam data available but could not interpolate intensity at {energy:.1f} eV")
+                # Print open beam information (enhanced with range warning)
+                if use_open_beam and open_beam_intensity is not None:
+                    status = "APPLIED" if is_within_range else "APPLIED (EXTRAPOLATED)"
+                    print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} ({status})")
+                    if not is_within_range:
+                        print(f"⚠️  WARNING: Using extrapolation - energy is {distance:.1f} eV outside open beam range!")
                 else:
-                    print("Open beam data not loaded")
+                    print("Open beam normalization not available")
                 
                 # Create figure with two subplots
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
                 
-                # Left plot: Raw scans (trimmed, background corrected, and optionally open beam corrected)
-                for i, scan in enumerate(scans):
-                    if len(scan) > 0:
-                        ax1.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
+                # Left plot: Raw scans (trimmed and background corrected, NO open beam correction)
+                for i, raw_scan in enumerate(raw_scans):
+                    if len(raw_scan) > 0:
+                        ax1.plot(raw_scan[:, 0], raw_scan[:, 1], marker='o', linestyle='-', 
                                 color=f'C{i}', label=f'Scan {i+1}', markersize=3)
                 
                 # Right plot: Stitching preview with scaling
@@ -1595,6 +1615,8 @@ class RSoXRTrimWidget:
                 ax2.set_xlabel('Angle (degrees)')
                 ax2.set_ylabel('Intensity' + (' / I₀' if use_open_beam else ''))
                 title_suffix = ' (Open Beam Corrected)' if use_open_beam else ''
+                if not is_within_range and use_open_beam:
+                    title_suffix += ' ⚠️ EXTRAPOLATED'
                 ax2.set_title(f'Stitching Preview{title_suffix} - {energy:.1f} eV')
                 ax2.legend()
                 ax2.grid(True, which="both", ls="--", alpha=0.3)
@@ -1604,7 +1626,10 @@ class RSoXRTrimWidget:
                 
                 print("Stitching preview complete!")
                 if use_open_beam:
-                    print("Open beam normalization has been applied to the preview data.")
+                    if is_within_range:
+                        print("Open beam normalization has been applied to the preview data.")
+                    else:
+                        print("⚠️  Open beam normalization applied using EXTRAPOLATION - results may be unreliable!")
                 print("Overlapping regions are highlighted in the right plot.")
                 print("Dotted lines show unscaled data, solid lines show scaled data.")
                 print("Background subtraction has been applied where specified.")
@@ -1617,7 +1642,7 @@ class RSoXRTrimWidget:
                 print(f"Error generating stitching preview: {str(e)}")
                 import traceback
                 traceback.print_exc()
-                
+                    
                 
     def _validate_smoothing_params(self):
         """Validate smoothing parameters and adjust if necessary"""
@@ -2016,7 +2041,7 @@ class RSoXRTrimWidget:
 
     def _load_open_beam_on_init(self, open_beam_path):
         """
-        Load open beam data during widget initialization
+        Load open beam data during widget initialization and automatically enable normalization
         
         Parameters:
         -----------
@@ -2030,24 +2055,115 @@ class RSoXRTrimWidget:
             success = self.processor.load_open_beam_file(open_beam_path)
             
             if success:
-                # Update the open beam controls UI
-                self.open_beam_file_input.value = open_beam_path
+                # Automatically enable open beam normalization
+                self.processor.set_open_beam_normalization(True)
                 
                 energy_range = f"{self.processor.open_beam_data['energy'].min():.1f} - {self.processor.open_beam_data['energy'].max():.1f} eV"
-                self.open_beam_status.value = f"<b>Open Beam Status:</b> ✓ Loaded ({len(self.processor.open_beam_data)} points, {energy_range})"
                 
-                self.use_open_beam_checkbox.disabled = False
-                
-                print(f"✓ Open beam data loaded successfully during initialization!")
+                print(f"✓ Open beam data loaded and enabled successfully!")
                 print(f"  Energy range: {energy_range}")
                 print(f"  Data points: {len(self.processor.open_beam_data)}")
+                print(f"  Open beam normalization: ENABLED")
                 
             else:
                 print(f"✗ Failed to load open beam data from: {open_beam_path}")
                 
         except Exception as e:
             print(f"Error loading open beam data during initialization: {str(e)}")
+                
+    
+    def _check_open_beam_energy_range(self, energy):
+        """
+        Check if the given energy is within the open beam data range
         
+        Parameters:
+        -----------
+        energy : float
+            Energy in eV to check
+            
+        Returns:
+        --------
+        tuple : (is_within_range, min_energy, max_energy, distance_from_range)
+            - is_within_range: bool, True if energy is within range
+            - min_energy: float, minimum energy in open beam data
+            - max_energy: float, maximum energy in open beam data  
+            - distance_from_range: float, how far outside range (0 if within range)
+        """
+        if not hasattr(self.processor, 'open_beam_data') or self.processor.open_beam_data is None:
+            return False, None, None, None
+        
+        min_energy = self.processor.open_beam_data['energy'].min()
+        max_energy = self.processor.open_beam_data['energy'].max()
+        
+        if energy < min_energy:
+            distance = min_energy - energy
+            return False, min_energy, max_energy, distance
+        elif energy > max_energy:
+            distance = energy - max_energy
+            return False, min_energy, max_energy, distance
+        else:
+            return True, min_energy, max_energy, 0.0
+
+
+
+    def _display_energy_range_warning(self, energy, min_energy, max_energy, distance):
+        """
+        Display a prominent warning about energy being outside open beam range
+        
+        Parameters:
+        -----------
+        energy : float
+            Current energy
+        min_energy : float
+            Minimum open beam energy
+        max_energy : float
+            Maximum open beam energy
+        distance : float
+            Distance outside the range
+        """
+        # Create HTML formatted warning message
+        if energy < min_energy:
+            position = "BELOW"
+            closest = f"(minimum open beam energy: {min_energy:.1f} eV)"
+        else:
+            position = "ABOVE" 
+            closest = f"(maximum open beam energy: {max_energy:.1f} eV)"
+        
+        warning_html = f"""
+        <div style="border: 3px solid red; background-color: #ffebee; padding: 15px; margin: 10px 0;">
+            <h3 style="color: red; margin: 0 0 10px 0; text-align: center;">
+                ⚠️ ENERGY OUT OF OPEN BEAM RANGE WARNING ⚠️
+            </h3>
+            <p style="color: red; font-weight: bold; font-size: 14px; margin: 5px 0; text-align: center;">
+                Current energy: <span style="font-size: 16px;">{energy:.1f} eV</span> is 
+                <span style="font-size: 16px;">{position}</span> the open beam data range!
+            </p>
+            <p style="color: red; font-weight: bold; font-size: 14px; margin: 5px 0; text-align: center;">
+                Open beam range: {min_energy:.1f} - {max_energy:.1f} eV
+            </p>
+            <p style="color: red; font-weight: bold; font-size: 14px; margin: 5px 0; text-align: center;">
+                Distance from range: <span style="font-size: 16px;">{distance:.1f} eV</span> {closest}
+            </p>
+            <p style="color: #d32f2f; font-weight: bold; font-size: 13px; margin: 10px 0 0 0; text-align: center;">
+                Open beam correction will use EXTRAPOLATION - results may be unreliable!
+            </p>
+        </div>
+        """
+        
+        # Display the warning
+        from IPython.display import display, HTML
+        display(HTML(warning_html))
+        
+        # Also print to console
+        print(f"\n{'='*80}")
+        print(f"🚨 WARNING: ENERGY {energy:.1f} eV IS {position} OPEN BEAM RANGE! 🚨")
+        print(f"Open beam range: {min_energy:.1f} - {max_energy:.1f} eV")
+        print(f"Distance from range: {distance:.1f} eV")
+        print(f"Using extrapolation - results may be unreliable!")
+        print(f"{'='*80}\n")
+
+        
+    
     def display(self):
         """Display the widget"""
         display(self.main_container)
