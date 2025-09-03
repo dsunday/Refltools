@@ -2089,304 +2089,7 @@ class RSoXRProcessor:
             print(f"Saved metadata to {meta_path}")
             return meta_path
 
-    def estimate_film_thickness(self, reflectivity_data, min_prominence=0.1, min_spacing=0.01, 
-                              max_spacing=0.3, min_thickness_nm=20, max_thickness_nm=100, 
-                              plot=True, output_dir=None, plot_prefix=None, smooth_data=True):
-        """
-        Estimate the film thickness based on the fringe spacing in Q-space
-        
-        Parameters:
-        -----------
-        reflectivity_data : numpy array
-            Reduced reflectivity data with columns [Q, R, error]
-        min_prominence : float
-            Minimum prominence for peak/valley detection
-        min_spacing : float
-            Minimum spacing between adjacent peaks/valleys in Q-space (Å⁻¹)
-            For a 100nm film, fringe spacing is ~0.031 Å⁻¹
-        max_spacing : float
-            Maximum spacing between adjacent peaks/valleys in Q-space (Å⁻¹)
-            For a 20nm film, fringe spacing is ~0.157 Å⁻¹
-        min_thickness_nm : float
-            Minimum expected film thickness in nm
-        max_thickness_nm : float
-            Maximum expected film thickness in nm
-        plot : bool
-            Whether to generate plots during processing
-        output_dir : str, optional
-            Directory to save plots if provided
-        plot_prefix : str, optional
-            Prefix for plot filenames
-        smooth_data : bool
-            Whether to apply smoothing to the data before peak detection
-            
-        Returns:
-        --------
-        thickness : float
-            Estimated film thickness in Ångstroms
-        peak_positions : array
-            Positions of detected peaks in Q-space
-        valley_positions : array
-            Positions of detected valleys in Q-space
-        """
-        import numpy as np
-        from scipy.signal import find_peaks, peak_prominences, savgol_filter
-        import matplotlib.pyplot as plt
-        import os
-        
-        # Convert thickness range to expected fringe spacing range
-        min_fringe_spacing = 2 * np.pi / (max_thickness_nm * 10)  # max thickness -> min spacing
-        max_fringe_spacing = 2 * np.pi / (min_thickness_nm * 10)  # min thickness -> max spacing
-        
-        print(f"Expected fringe spacing range: {min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹")
-        print(f"Based on thickness range: {min_thickness_nm} - {max_thickness_nm} nm")
-        
-        # Use user-specified spacing if provided
-        if min_spacing > 0:
-            min_fringe_spacing = min_spacing
-        if max_spacing > 0:
-            max_fringe_spacing = max_spacing
-        
-        # Extract Q and reflectivity
-        Q = reflectivity_data[:, 0]
-        R = reflectivity_data[:, 1]
-        
-        # Sort data by Q values (just to be safe)
-        sort_indices = np.argsort(Q)
-        Q = Q[sort_indices]
-        R = R[sort_indices]
-        
-        # Apply smoothing if requested
-        if smooth_data:
-            # Determine the best window size for Savitzky-Golay filter (must be odd)
-            window_size = max(min(25, len(Q) // 10 * 2 + 1), 5)
-            if window_size % 2 == 0:
-                window_size += 1
-                
-            # Apply Savitzky-Golay filter to reduce noise
-            try:
-                log_R_smooth = savgol_filter(np.log10(R), window_size, 2)
-            except Exception as e:
-                print(f"Warning: Smoothing failed ({str(e)}), using raw data")
-                log_R_smooth = np.log10(R)
-        else:
-            log_R_smooth = np.log10(R)
-        
-        # Find the valleys (minima) in the reflectivity
-        # For valleys, we'll find peaks in the negative of log_R
-        valley_indices, valley_props = find_peaks(-log_R_smooth, 
-                                                prominence=min_prominence,
-                                                distance=int(min_fringe_spacing / (Q[1] - Q[0])))
-        
-        if len(valley_indices) > 0:
-            valley_positions = Q[valley_indices]
-            valley_values = log_R_smooth[valley_indices]
-            valley_prominences = peak_prominences(-log_R_smooth, valley_indices)[0]
-        else:
-            valley_positions = np.array([])
-            valley_values = np.array([])
-            valley_prominences = np.array([])
-        
-        # Find the peaks (maxima) in the reflectivity
-        peak_indices, peak_props = find_peaks(log_R_smooth, 
-                                             prominence=min_prominence,
-                                             distance=int(min_fringe_spacing / (Q[1] - Q[0])))
-        
-        if len(peak_indices) > 0:
-            peak_positions = Q[peak_indices]
-            peak_values = log_R_smooth[peak_indices]
-            peak_prominences = peak_prominences(log_R_smooth, peak_indices)[0]
-        else:
-            peak_positions = np.array([])
-            peak_values = np.array([])
-            peak_prominences = np.array([])
-        
-        # Filter out peak/valley pairs that are too close or too far apart
-        valid_valley_spacings = []
-        valid_valley_positions = []
-        
-        if len(valley_positions) >= 2:
-            valley_spacings = np.diff(valley_positions)
-            
-            # Filter valid spacings
-            valid_indices = np.where((valley_spacings >= min_fringe_spacing) & 
-                                    (valley_spacings <= max_fringe_spacing))[0]
-            
-            # Get valid spacings
-            if len(valid_indices) > 0:
-                for idx in valid_indices:
-                    valid_valley_spacings.append(valley_spacings[idx])
-                    valid_valley_positions.append(valley_positions[idx:idx+2])
-        
-        # Calculate valley-based thickness
-        if valid_valley_spacings:
-            avg_valley_spacing = np.mean(valid_valley_spacings)
-            valley_thickness = 2 * np.pi / avg_valley_spacing
-        else:
-            avg_valley_spacing = None
-            valley_thickness = None
-        
-        # Similarly for peaks
-        valid_peak_spacings = []
-        valid_peak_positions = []
-        
-        if len(peak_positions) >= 2:
-            peak_spacings = np.diff(peak_positions)
-            
-            # Filter valid spacings
-            valid_indices = np.where((peak_spacings >= min_fringe_spacing) & 
-                                   (peak_spacings <= max_fringe_spacing))[0]
-            
-            # Get valid spacings
-            if len(valid_indices) > 0:
-                for idx in valid_indices:
-                    valid_peak_spacings.append(peak_spacings[idx])
-                    valid_peak_positions.append(peak_positions[idx:idx+2])
-        
-        # Calculate peak-based thickness
-        if valid_peak_spacings:
-            avg_peak_spacing = np.mean(valid_peak_spacings)
-            peak_thickness = 2 * np.pi / avg_peak_spacing
-        else:
-            avg_peak_spacing = None
-            peak_thickness = None
-        
-        # Combine the results
-        thicknesses = []
-        if valley_thickness is not None:
-            thicknesses.append(valley_thickness)
-        if peak_thickness is not None:
-            thicknesses.append(peak_thickness)
-        
-        # Calculate final thickness estimate
-        if thicknesses:
-            thickness = np.mean(thicknesses)
-            thickness_nm = thickness / 10  # Convert Å to nm
-        else:
-            thickness = None
-            thickness_nm = None
-        
-        # Print results
-        print("\nFilm Thickness Estimation Results:")
-        print("-" * 40)
-        
-        if valley_thickness is not None:
-            print(f"Valley-based estimate: {valley_thickness:.1f} Å ({valley_thickness/10:.1f} nm)")
-            print(f"  Average spacing between valleys: {avg_valley_spacing:.4f} Å⁻¹")
-            print(f"  Number of valid valley spacings: {len(valid_valley_spacings)}")
-        else:
-            print("No valid valley spacings detected for thickness estimation")
-        
-        if peak_thickness is not None:
-            print(f"Peak-based estimate: {peak_thickness:.1f} Å ({peak_thickness/10:.1f} nm)")
-            print(f"  Average spacing between peaks: {avg_peak_spacing:.4f} Å⁻¹")
-            print(f"  Number of valid peak spacings: {len(valid_peak_spacings)}")
-        else:
-            print("No valid peak spacings detected for thickness estimation")
-        
-        if thickness is not None:
-            print(f"\nFinal thickness estimate: {thickness:.1f} Å ({thickness_nm:.1f} nm)")
-        else:
-            print("\nCould not estimate thickness - insufficient valid peaks/valleys detected")
-            print(f"Try adjusting the spacing range ({min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹)")
-            print(f"Or min_prominence parameter (currently {min_prominence})")
-        
-        # Create plot if requested
-        if plot:
-            plt.figure(figsize=(12, 8))
-            
-            # Plot the reflectivity data
-            plt.plot(Q, log_R_smooth, 'b-', label='log(Reflectivity) [Smoothed]')
-            if smooth_data:
-                plt.plot(Q, np.log10(R), 'b-', alpha=0.3, label='log(Reflectivity) [Raw]')
-            
-            # Mark all detected valleys
-            if len(valley_positions) > 0:
-                plt.plot(valley_positions, valley_values, 'rv', markersize=8, alpha=0.5, label='All Valleys')
-            
-            # Mark all detected peaks
-            if len(peak_positions) > 0:
-                plt.plot(peak_positions, peak_values, 'go', markersize=8, alpha=0.5, label='All Peaks')
-            
-            # Mark valid valley pairs
-            for pos_pair in valid_valley_positions:
-                idx1 = np.where(valley_positions == pos_pair[0])[0][0]
-                idx2 = np.where(valley_positions == pos_pair[1])[0][0]
-                
-                spacing = pos_pair[1] - pos_pair[0]
-                midpoint = (pos_pair[0] + pos_pair[1]) / 2
-                
-                plt.plot(pos_pair, [valley_values[idx1], valley_values[idx2]], 'r-', linewidth=2)
-                plt.annotate(f"{spacing:.4f}", 
-                           xy=(midpoint, np.interp(midpoint, Q, log_R_smooth)),
-                           xytext=(0, -20),
-                           textcoords='offset points',
-                           ha='center',
-                           color='red',
-                           arrowprops=dict(arrowstyle='->', color='red'))
-            
-            # Mark valid peak pairs
-            for pos_pair in valid_peak_positions:
-                idx1 = np.where(peak_positions == pos_pair[0])[0][0]
-                idx2 = np.where(peak_positions == pos_pair[1])[0][0]
-                
-                spacing = pos_pair[1] - pos_pair[0]
-                midpoint = (pos_pair[0] + pos_pair[1]) / 2
-                
-                plt.plot(pos_pair, [peak_values[idx1], peak_values[idx2]], 'g-', linewidth=2)
-                plt.annotate(f"{spacing:.4f}", 
-                           xy=(midpoint, np.interp(midpoint, Q, log_R_smooth)),
-                           xytext=(0, 20),
-                           textcoords='offset points',
-                           ha='center',
-                           color='green',
-                           arrowprops=dict(arrowstyle='->', color='green'))
-            
-            # Add thickness annotation
-            if thickness is not None:
-                title = f"Film Thickness Estimation: {thickness:.1f} Å ({thickness_nm:.1f} nm)"
-                if valley_thickness is not None and peak_thickness is not None:
-                    title += f"\nPeak-based: {peak_thickness:.1f} Å, Valley-based: {valley_thickness:.1f} Å"
-            else:
-                title = "Film Thickness Estimation: Insufficient Valid Data"
-                
-            plt.title(title)
-            plt.xlabel('Q (Å⁻¹)')
-            plt.ylabel('log(Reflectivity)')
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.7)
-            
-            # Add the expected fringe spacing range as vertical lines
-            min_thickness_spacing = 2 * np.pi / (max_thickness_nm * 10)
-            max_thickness_spacing = 2 * np.pi / (min_thickness_nm * 10)
-            
-            # Add a text box with parameter settings
-            textbox_props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-            info_text = (
-                f"Parameters:\n"
-                f"Min prominence: {min_prominence}\n"
-                f"Q spacing range: {min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹\n"
-                f"Expected thickness: {min_thickness_nm} - {max_thickness_nm} nm"
-            )
-            plt.text(0.02, 0.02, info_text, transform=plt.gca().transAxes, 
-                    fontsize=9, verticalalignment='bottom', horizontalalignment='left',
-                    bbox=textbox_props)
-            
-            # Save plot if output directory is specified
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                if plot_prefix is None:
-                    plot_prefix = "thickness_estimate"
-                plot_filename = f"{plot_prefix}_thickness.png"
-                plot_path = os.path.join(output_dir, plot_filename)
-                plt.savefig(plot_path, dpi=150)
-                print(f"\nSaved thickness estimation plot to {plot_path}")
-                
-            plt.tight_layout()
-            plt.show()
-        
-        # Return the results
-        return thickness, peak_positions, valley_positions
+    
     
     def _sort_files_in_group(self, group):
         """
@@ -3012,3 +2715,219 @@ class RSoXRProcessor:
         self.print_group_summary(current_groups, show_details=False)
         
         return current_groups
+    
+    def load_open_beam_file(self, file_path):
+        """
+        Load open beam intensity data from file
+        
+        Parameters:
+        -----------
+        file_path : str
+            Path to the open beam data file
+            
+        Returns:
+        --------
+        bool
+            True if loaded successfully, False otherwise
+        """
+        try:
+            # Based on the example file, the format appears to be:
+            # Column 1: Energy (eV) 
+            # Column 2: Intensity
+            # Column 3: Error (optional)
+            # Column 4: Another parameter (optional)
+            
+            # Try loading as whitespace-delimited file first
+            try:
+                data = np.loadtxt(file_path)
+                if data.shape[1] >= 2:
+                    self.open_beam_data = pd.DataFrame({
+                        'energy': data[:, 0],
+                        'intensity': data[:, 1]
+                    })
+                    if data.shape[1] >= 3:
+                        self.open_beam_data['error'] = data[:, 2]
+                else:
+                    print(f"Error: Open beam file must have at least 2 columns (energy, intensity)")
+                    return False
+                    
+            except ValueError:
+                # If that fails, try pandas read_csv with tab separator
+                self.open_beam_data = pd.read_csv(file_path, sep='\t', header=None)
+                if self.open_beam_data.shape[1] >= 2:
+                    self.open_beam_data.columns = ['energy', 'intensity'] + [f'col{i}' for i in range(2, self.open_beam_data.shape[1])]
+                else:
+                    print(f"Error: Open beam file must have at least 2 columns (energy, intensity)")
+                    return False
+            
+            self.open_beam_file = file_path
+            
+            # Basic validation
+            if len(self.open_beam_data) == 0:
+                print(f"Error: Open beam file is empty")
+                return False
+                
+            # Sort by energy for interpolation
+            self.open_beam_data = self.open_beam_data.sort_values('energy').reset_index(drop=True)
+            
+            # Initialize open beam normalization flag
+            if not hasattr(self, 'use_open_beam_normalization'):
+                self.use_open_beam_normalization = False
+            
+            print(f"Successfully loaded open beam data from {file_path}")
+            print(f"Energy range: {self.open_beam_data['energy'].min():.1f} - {self.open_beam_data['energy'].max():.1f} eV")
+            print(f"Data points: {len(self.open_beam_data)}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error loading open beam file {file_path}: {str(e)}")
+            return False
+
+
+    def get_open_beam_intensity(self, energy):
+        """
+        Get open beam intensity at a specific energy using interpolation
+        
+        Parameters:
+        -----------
+        energy : float
+            Energy in eV
+            
+        Returns:
+        --------
+        float
+            Open beam intensity at the specified energy, or None if error
+        """
+        if not hasattr(self, 'open_beam_data') or self.open_beam_data is None:
+            print("Error: No open beam data loaded")
+            return None
+            
+        try:
+            # Create interpolation function
+            energy_values = self.open_beam_data['energy'].values
+            intensity_values = self.open_beam_data['intensity'].values
+            
+            if len(energy_values) == 1:
+                # If only one data point, use that value
+                return intensity_values[0]
+            
+            # Use linear interpolation with extrapolation for energies outside range
+            interp_func = interp1d(energy_values, intensity_values, 
+                                kind='linear', bounds_error=False, fill_value='extrapolate')
+            
+            intensity = float(interp_func(energy))
+            
+            # Check if extrapolation was used (warn user)
+            if energy < energy_values.min() or energy > energy_values.max():
+                print(f"Warning: Energy {energy:.1f} eV is outside open beam data range "
+                    f"({energy_values.min():.1f} - {energy_values.max():.1f} eV). Using extrapolation.")
+            
+            return intensity
+            
+        except Exception as e:
+            print(f"Error interpolating open beam intensity at {energy:.1f} eV: {str(e)}")
+            return None
+
+
+    def set_open_beam_normalization(self, use_open_beam=True):
+        """
+        Enable or disable open beam normalization
+        
+        Parameters:
+        -----------
+        use_open_beam : bool
+            True to use open beam normalization, False for standard normalization
+            
+        Returns:
+        --------
+        bool
+            True if setting was successful
+        """
+        if use_open_beam and (not hasattr(self, 'open_beam_data') or self.open_beam_data is None):
+            print("Warning: No open beam data loaded. Please load open beam file first.")
+            return False
+            
+        self.use_open_beam_normalization = use_open_beam
+        norm_type = "open beam" if use_open_beam else "standard"
+        print(f"Normalization set to: {norm_type}")
+        return True
+
+
+    def plot_open_beam_data(self, save_path=None):
+        """
+        Plot the loaded open beam data
+        
+        Parameters:
+        -----------
+        save_path : str, optional
+            Path to save the plot
+        """
+        if not hasattr(self, 'open_beam_data') or self.open_beam_data is None:
+            print("Error: No open beam data to plot")
+            return
+            
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.open_beam_data['energy'], self.open_beam_data['intensity'], 'bo-', markersize=4)
+        plt.xlabel('Energy (eV)')
+        plt.ylabel('Open Beam Intensity')
+        plt.title(f'Open Beam Data\n{os.path.basename(self.open_beam_file)}')
+        plt.grid(True, alpha=0.3)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Open beam plot saved to {save_path}")
+        
+        plt.show()
+
+
+    def apply_normalization(self, intensity_data, energy, normalize_type="auto"):
+        """
+        Apply normalization to intensity data (standard or open beam)
+        
+        Parameters:
+        -----------
+        intensity_data : numpy.ndarray
+            Intensity data to normalize
+        energy : float
+            Photon energy in eV
+        normalize_type : str
+            "auto" (use current setting), "standard", "open_beam", or "none"
+            
+        Returns:
+        --------
+        numpy.ndarray
+            Normalized intensity data
+        """
+        if normalize_type == "none":
+            return intensity_data
+        
+        # Determine which normalization to use
+        if normalize_type == "auto":
+            use_open_beam = getattr(self, 'use_open_beam_normalization', False)
+        elif normalize_type == "open_beam":
+            use_open_beam = True
+        elif normalize_type == "standard":
+            use_open_beam = False
+        else:
+            print(f"Warning: Unknown normalization type '{normalize_type}'. Using standard.")
+            use_open_beam = False
+        
+        if use_open_beam and hasattr(self, 'open_beam_data') and self.open_beam_data is not None:
+            # Use open beam normalization
+            open_beam_intensity = self.get_open_beam_intensity(energy)
+            
+            if open_beam_intensity is None or open_beam_intensity <= 0:
+                print(f"Warning: Invalid open beam intensity at {energy:.1f} eV. Using standard normalization.")
+                normalized_data = intensity_data / np.max(intensity_data)
+                print("Applied standard normalization (fallback)")
+            else:
+                normalized_data = intensity_data / open_beam_intensity
+                print(f"Applied open beam normalization at {energy:.1f} eV (I0 = {open_beam_intensity:.3e})")
+        else:
+            # Use standard normalization
+            normalized_data = intensity_data / np.max(intensity_data)
+            print("Applied standard normalization")
+        
+        return normalized_data
+
