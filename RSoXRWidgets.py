@@ -927,7 +927,7 @@ class RSoXRTrimWidget:
         # Processing options
         self.normalize_checkbox = widgets.Checkbox(
             value=True,
-            description='Normalize',
+            description='Normalize to Open Beam',
             disabled=False
         )
         
