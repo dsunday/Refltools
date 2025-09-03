@@ -1174,11 +1174,11 @@ class RSoXRProcessor:
         # Normalize if requested
         if normalize:
             if smooth_data:
-                refl_q[:, 1] = refl_q[:, 1] / np.max(refl_q[:, 1])
-                raw_refl_q[:, 1] = raw_refl_q[:, 1] / np.max(raw_refl_q[:, 1])
+                refl[:, 1] = self.apply_normalization(refl[:, 1], energy)
+                raw_refl_q[:, 1] = self.apply_normalization(raw_refl_q[:, 1], energy)
             else:
-                refl[:, 1] = refl[:, 1] / np.max(refl[:, 1])
-            print("Applied normalization")
+                refl[:, 1] = self.apply_normalization(refl[:, 1], energy)
+            print("Applied Energy normalization")
         
         # Generate plots if requested
         if plot and plot_prefix:
