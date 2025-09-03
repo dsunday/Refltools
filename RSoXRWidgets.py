@@ -775,6 +775,19 @@ class RSoXRTrimWidget:
         # Load open beam data if provided
         if open_beam is not None:
             self._load_open_beam_on_init(open_beam)
+            
+        # Generate initial stitching preview after everything is set up
+        if self.scan_groups and len(self.scan_groups) > 0:
+            # Small delay to ensure UI is fully rendered
+            import threading
+            def delayed_preview():
+                import time
+                time.sleep(0.1)  # Brief delay
+                self._auto_preview_stitching()
+            
+            thread = threading.Thread(target=delayed_preview)
+            thread.daemon = True
+            thread.start()
 
     
     def _set_default_trim_values(self):
@@ -1144,31 +1157,32 @@ class RSoXRTrimWidget:
     
     def _on_group_change(self, change):
         """Handle group selection change"""
-        # Extract group index from selection string (format: "1: name (energy eV)")
         group_str = change['new']
         group_idx = int(group_str.split(':')[0]) - 1
         
-        # Update file selection dropdown with files from this group
-        file_options = []
-        for i, filename in enumerate(self.scan_groups[group_idx]['files']):
-            # Get detector type if available
-            detector_type = ""
-            if group_idx < len(self.scan_groups) and i < len(self.scan_groups[group_idx]['metadata']):
-                metadata = self.scan_groups[group_idx]['metadata'][i]
-                if metadata and 'detector' in metadata:
-                    detector_type = f" ({metadata['detector']})"
-            
-            file_options.append(f"{i+1}: {os.path.basename(filename)}{detector_type}")
+        group = self.scan_groups[group_idx]
         
+        # Update file dropdown
+        file_options = [f"{i+1}: {os.path.basename(f)}" for i, f in enumerate(group['files'])]
         self.file_select.options = file_options
+        self.file_select.value = file_options[0] if file_options else ""
         
-        # Clear current data
+        # Clear current data to force reload
         self.current_data = None
         self.current_group_data = None
         
-        # Select the first file
+        # Update group source info if it exists
+        if hasattr(self, 'group_source_info'):
+            group_source_text = "✓ Using provided scan groups (manually edited)" if self.groups_source == "provided" else "Using autoscanned groups"
+            total_files = sum(len(g['files']) for g in self.scan_groups)
+            self.group_source_info.value = f"<i style='color:#666;'>{group_source_text} | Total groups: {len(self.scan_groups)} | Total files: {total_files}</i>"
+        
+        # Load the first file to display
         if file_options:
-            self.file_select.value = file_options[0]
+            self._on_file_change({'new': file_options[0]})
+        
+        # Auto-generate stitching preview for the new group
+        self._auto_preview_stitching()
 
     def _on_file_change(self, change):
         """Handle file selection change"""
@@ -1395,6 +1409,16 @@ class RSoXRTrimWidget:
             print(f"Reset all trim values for group {group_idx+1} to original values")
             print(f"Reset all background values to 0.0")
             print("Use the 'Preview Stitching' button to see how the original values affect the stitching.")
+            
+    def _auto_preview_stitching(self):
+        """Automatically show stitching preview (called on group change)"""
+        # Only auto-preview if we have valid data
+        try:
+            if hasattr(self, 'group_select') and self.group_select.value:
+                print("Auto-generating stitching preview...")
+                self._on_preview_stitching(None)  # Pass None since we don't have a button event
+        except Exception as e:
+            print(f"Auto-preview failed: {str(e)}")
 
     def _on_preview_stitching(self, b):
         """Preview the stitching between different scans with current trim and background values"""
@@ -1417,6 +1441,16 @@ class RSoXRTrimWidget:
                     print("Error: No data loaded for current group. Please select a valid group.")
                 return
             
+            # Check if open beam normalization is available and enabled
+            use_open_beam = (hasattr(self.processor, 'use_open_beam_normalization') and 
+                            self.processor.use_open_beam_normalization and
+                            hasattr(self.processor, 'open_beam_data') and 
+                            self.processor.open_beam_data is not None)
+            
+            open_beam_intensity = None
+            if use_open_beam:
+                open_beam_intensity = self.processor.get_open_beam_intensity(energy)
+            
             # Prepare trimmed and background-corrected data
             scans = []
             for i, data in enumerate(self.current_group_data):
@@ -1433,6 +1467,10 @@ class RSoXRTrimWidget:
                 background_value = self.current_backgrounds[group_idx][i]
                 if background_value != 0.0:
                     trimmed_data = self._apply_background_subtraction(trimmed_data, background_value)
+                
+                # Apply open beam normalization if enabled and available
+                if use_open_beam and open_beam_intensity is not None and open_beam_intensity > 0:
+                    trimmed_data[:, 1] = trimmed_data[:, 1] / open_beam_intensity
                 
                 # Remove zeros if requested
                 if self.remove_zeros_checkbox.value:
@@ -1454,25 +1492,25 @@ class RSoXRTrimWidget:
                 
                 print(f"Generating stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.1f} eV")
                 
-                # Check if open beam normalization is available and get the intensity
+                # Print open beam information
                 if (hasattr(self.processor, 'open_beam_data') and 
                     self.processor.open_beam_data is not None and
                     len(self.processor.open_beam_data) > 0):
                     
-                    open_beam_intensity = self.processor.get_open_beam_intensity(energy)
                     if open_beam_intensity is not None:
-                        # Check if open beam normalization is currently enabled
-                        if getattr(self.processor, 'use_open_beam_normalization', False):
-                            print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} (ENABLED)")
+                        if use_open_beam:
+                            print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} (APPLIED)")
                         else:
-                            print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} (available)")
+                            print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} (available, not applied)")
                     else:
                         print(f"Open beam data available but could not interpolate intensity at {energy:.1f} eV")
+                else:
+                    print("Open beam data not loaded")
                 
                 # Create figure with two subplots
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
                 
-                # Left plot: Raw scans (trimmed and background corrected)
+                # Left plot: Raw scans (trimmed, background corrected, and optionally open beam corrected)
                 for i, scan in enumerate(scans):
                     if len(scan) > 0:
                         ax1.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
@@ -1549,14 +1587,15 @@ class RSoXRTrimWidget:
                 
                 # Set labels and titles
                 ax1.set_xlabel('Angle (degrees)')
-                ax1.set_ylabel('Intensity')
-                ax1.set_title(f'Raw Scans (Trimmed & Background Corrected) - {energy:.1f} eV')
+                ax1.set_ylabel('Intensity')  # Raw scans always show raw intensity
+                ax1.set_title(f'Raw Scans (Trimmed & BG Corrected) - {energy:.1f} eV')
                 ax1.legend()
                 ax1.grid(True, which="both", ls="--", alpha=0.3)
                 
                 ax2.set_xlabel('Angle (degrees)')
-                ax2.set_ylabel('Intensity')
-                ax2.set_title(f'Stitching Preview - {energy:.1f} eV')
+                ax2.set_ylabel('Intensity' + (' / I₀' if use_open_beam else ''))
+                title_suffix = ' (Open Beam Corrected)' if use_open_beam else ''
+                ax2.set_title(f'Stitching Preview{title_suffix} - {energy:.1f} eV')
                 ax2.legend()
                 ax2.grid(True, which="both", ls="--", alpha=0.3)
                 
@@ -1564,6 +1603,8 @@ class RSoXRTrimWidget:
                 plt.show()
                 
                 print("Stitching preview complete!")
+                if use_open_beam:
+                    print("Open beam normalization has been applied to the preview data.")
                 print("Overlapping regions are highlighted in the right plot.")
                 print("Dotted lines show unscaled data, solid lines show scaled data.")
                 print("Background subtraction has been applied where specified.")
