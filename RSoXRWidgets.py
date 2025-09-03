@@ -712,7 +712,7 @@ class RSoXRTrimWidget:
     Enhanced to support manually edited groups and background subtraction
     """
     
-    def __init__(self, processor, scan_groups=None, data_directory='.', default_output_dir='trimmed_output'):
+    def __init__(self, processor, scan_groups=None, data_directory='.', default_output_dir='trimmed_output', open_beam=None):
         """
         Initialize the widget
         
@@ -727,6 +727,8 @@ class RSoXRTrimWidget:
             Directory containing the data files (used only if scan_groups not provided)
         default_output_dir : str
             Default output directory for saved files
+        open_beam : str, optional
+            Path to open beam file. If provided, will automatically load open beam data
         """
         self.processor = processor
         self.data_directory = data_directory
@@ -769,6 +771,11 @@ class RSoXRTrimWidget:
         
         # Create the widget UI
         self._create_widgets()
+        
+        # Load open beam data if provided
+        if open_beam is not None:
+            self._load_open_beam_on_init(open_beam)
+
     
     def _set_default_trim_values(self):
         """
@@ -1053,6 +1060,8 @@ class RSoXRTrimWidget:
             self.save_button
         ])
         
+        self.open_beam_controls = self.add_open_beam_controls_to_widget()
+        
         # Output area
         self.output_area = widgets.Output()
         
@@ -1063,6 +1072,7 @@ class RSoXRTrimWidget:
             self.group_file_container,
             self.trim_display_container,
             self.background_container,  # New: Background subtraction controls
+            self.open_beam_controls,
             widgets.HBox([
                 self.smoothing_container,  # Left side
                 self.processing_options_container  # Right side
@@ -1388,136 +1398,186 @@ class RSoXRTrimWidget:
 
     def _on_preview_stitching(self, b):
         """Preview the stitching between different scans with current trim and background values"""
-        # Get current group
-        group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
-        
-        group = self.scan_groups[group_idx]
-        energy = group['energy']
-        
-        # Ensure all data is loaded
-        if not self.current_group_data or any(data is None for data in self.current_group_data):
-            self._load_group_data(group_idx)
-        
-        # Prepare trimmed and background-corrected data
-        scans = []
-        for i, data in enumerate(self.current_group_data):
-            if data is None:
-                print(f"Warning: Data for scan {i+1} is not available")
-                continue
-                
-            # Apply current trim
-            trim_start, trim_end = self.current_trims[group_idx][i]
-            end_idx = len(data) + trim_end if trim_end < 0 else trim_end
-            trimmed_data = data[trim_start:end_idx]
+        try:
+            # Get current group
+            group_str = self.group_select.value
+            group_idx = int(group_str.split(':')[0]) - 1
             
-            # Apply background subtraction
-            background_value = self.current_backgrounds[group_idx][i]
-            if background_value != 0.0:
-                trimmed_data = self._apply_background_subtraction(trimmed_data, background_value)
+            group = self.scan_groups[group_idx]
+            energy = group['energy']
             
-            # Remove zeros if requested
-            if self.remove_zeros_checkbox.value:
-                non_zero_mask = trimmed_data[:, 1] > 0
-                if not all(non_zero_mask):
-                    print(f"Removing {len(trimmed_data) - np.sum(non_zero_mask)} zero points from scan {i+1}")
-                    trimmed_data = trimmed_data[non_zero_mask]
+            # Ensure all data is loaded
+            if not self.current_group_data or any(data is None for data in self.current_group_data):
+                self._load_group_data(group_idx)
             
-            scans.append(trimmed_data)
-        
-        # Preview the stitching
-        with self.output_area:
-            clear_output(wait=True)
-            
-            if len(scans) == 0:
-                print("No valid scans found for preview")
+            # Check if we have valid data
+            if not self.current_group_data:
+                with self.output_area:
+                    clear_output(wait=True)
+                    print("Error: No data loaded for current group. Please select a valid group.")
                 return
-                
-            # Create side-by-side plots
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
             
-            # Left plot: individual scans
-            for i, scan in enumerate(scans):
-                if len(scan) > 0:
-                    ax1.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
-                            color=f'C{i}', label=f'Scan {i+1}')
-            
-            # Right plot: stitched preview with scaling
-            combined = np.array([]).reshape(0, 2)
-            
-            for i, scan in enumerate(scans):
-                if len(scan) == 0:
+            # Prepare trimmed and background-corrected data
+            scans = []
+            for i, data in enumerate(self.current_group_data):
+                if data is None:
+                    print(f"Warning: Data for scan {i+1} is not available")
                     continue
                     
-                # Store original scan for comparison
-                orig_scan = scan.copy()
+                # Apply current trim
+                trim_start, trim_end = self.current_trims[group_idx][i]
+                end_idx = len(data) + trim_end if trim_end < 0 else trim_end
+                trimmed_data = data[trim_start:end_idx].copy()  # Make a copy to avoid modifying original
                 
-                if len(combined) > 0:
-                    # Find overlap region and calculate scaling factor
-                    overlap_angles = scan[:, 0]
-                    overlap_mask = (overlap_angles >= combined[:, 0].min()) & (overlap_angles <= combined[:, 0].max())
+                # Apply background subtraction
+                background_value = self.current_backgrounds[group_idx][i]
+                if background_value != 0.0:
+                    trimmed_data = self._apply_background_subtraction(trimmed_data, background_value)
+                
+                # Remove zeros if requested
+                if self.remove_zeros_checkbox.value:
+                    non_zero_mask = trimmed_data[:, 1] > 0
+                    if not all(non_zero_mask):
+                        print(f"Removing {len(trimmed_data) - np.sum(non_zero_mask)} zero points from scan {i+1}")
+                        trimmed_data = trimmed_data[non_zero_mask]
+                
+                if len(trimmed_data) > 0:  # Only add non-empty scans
+                    scans.append(trimmed_data)
+            
+            # Preview the stitching
+            with self.output_area:
+                clear_output(wait=True)
+                
+                if len(scans) == 0:
+                    print("Error: No valid scan data available for stitching preview.")
+                    return
+                
+                print(f"Generating stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.1f} eV")
+                
+                # Check if open beam normalization is available and get the intensity
+                if (hasattr(self.processor, 'open_beam_data') and 
+                    self.processor.open_beam_data is not None and
+                    len(self.processor.open_beam_data) > 0):
                     
-                    if np.any(overlap_mask):
-                        # Simple scaling based on median ratio in overlap region
-                        overlap_scan = scan[overlap_mask]
-                        overlap_combined_interp = np.interp(overlap_scan[:, 0], combined[:, 0], combined[:, 1])
-                        valid_ratios = overlap_combined_interp / overlap_scan[:, 1]
-                        valid_ratios = valid_ratios[np.isfinite(valid_ratios) & (valid_ratios > 0)]
-                        
-                        if len(valid_ratios) > 0:
-                            scale = np.median(valid_ratios)
+                    open_beam_intensity = self.processor.get_open_beam_intensity(energy)
+                    if open_beam_intensity is not None:
+                        # Check if open beam normalization is currently enabled
+                        if getattr(self.processor, 'use_open_beam_normalization', False):
+                            print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} (ENABLED)")
                         else:
-                            scale = 1.0
+                            print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} (available)")
                     else:
-                        scale = 1.0
+                        print(f"Open beam data available but could not interpolate intensity at {energy:.1f} eV")
+                
+                # Create figure with two subplots
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+                
+                # Left plot: Raw scans (trimmed and background corrected)
+                for i, scan in enumerate(scans):
+                    if len(scan) > 0:
+                        ax1.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
+                                color=f'C{i}', label=f'Scan {i+1}', markersize=3)
+                
+                # Right plot: Stitching preview with scaling
+                combined = np.empty((0, 2))
+                
+                for i, scan in enumerate(scans):
+                    if len(scan) == 0:
+                        continue
                         
-                    print(f"Scan {i+1}: scaling factor = {scale:.3f}")
-                    
-                    # Apply scaling
-                    scan[:, 1] = scan[:, 1] * scale
-                    
-                    # Plot the unscaled data (dashed line)
-                    ax2.plot(orig_scan[:, 0], orig_scan[:, 1], marker='', linestyle='--', 
-                            color=f'C{i}', alpha=0.4, label=f'Scan {i+1} (Unscaled)')
-                    
-                    # Plot the scaled data
-                    ax2.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
-                            color=f'C{i}', label=f'Scan {i+1} (Scaled)')
-                    
-                    # Concatenate with existing data
-                    combined = np.concatenate((combined, scan))
-            
-            # Set y-scale based on checkbox
-            if self.log_scale_checkbox.value:
-                ax1.set_yscale('log')
-                ax2.set_yscale('log')
-            else:
-                ax1.set_yscale('linear')
-                ax2.set_yscale('linear')
-            
-            # Set labels and titles
-            ax1.set_xlabel('Angle (degrees)')
-            ax1.set_ylabel('Intensity')
-            ax1.set_title(f'Raw Scans (Trimmed & Background Corrected) - {energy:.1f} eV')
-            ax1.legend()
-            ax1.grid(True, which="both", ls="--", alpha=0.3)
-            
-            ax2.set_xlabel('Angle (degrees)')
-            ax2.set_ylabel('Intensity')
-            ax2.set_title(f'Stitching Preview - {energy:.1f} eV')
-            ax2.legend()
-            ax2.grid(True, which="both", ls="--", alpha=0.3)
-            
-            plt.tight_layout()
-            plt.show()
-            
-            print(f"Stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.1f} eV")
-            print("Overlapping regions are highlighted in the right plot.")
-            print("Dotted lines show unscaled data, solid lines show scaled data.")
-            print("Background subtraction has been applied where specified.")
-            print("To adjust the overlap regions, modify the trim values for each file.")
-            print("Note: This is only a preview. Click 'Process Group' to apply the final processing.")
-    
+                    if i == 0:
+                        # First scan doesn't need scaling
+                        ax2.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
+                                color=f'C{i}', label=f'Scan {i+1}', markersize=3)
+                        combined = scan.copy()
+                    else:
+                        # Find overlapping region and calculate scaling factor
+                        prev_max_angle = combined[:, 0].max()
+                        curr_min_angle = scan[:, 0].min()
+                        
+                        # Store original data for plotting
+                        orig_scan = scan.copy()
+                        
+                        # Calculate scaling factor if there's overlap
+                        scale = 1.0
+                        if curr_min_angle <= prev_max_angle:
+                            # There's overlap - calculate scaling factor
+                            overlap_mask_combined = combined[:, 0] >= curr_min_angle
+                            overlap_mask_scan = scan[:, 0] <= prev_max_angle
+                            
+                            if np.any(overlap_mask_combined) and np.any(overlap_mask_scan):
+                                overlap_combined = combined[overlap_mask_combined]
+                                overlap_scan = scan[overlap_mask_scan]
+                                
+                                if len(overlap_combined) > 0 and len(overlap_scan) > 0:
+                                    # Use median ratio for robust scaling
+                                    ratios = []
+                                    for angle in overlap_scan[:, 0]:
+                                        # Find closest angle in combined data
+                                        idx = np.argmin(np.abs(overlap_combined[:, 0] - angle))
+                                        scan_idx = np.argmin(np.abs(overlap_scan[:, 0] - angle))
+                                        if (overlap_combined[idx, 1] > 0 and 
+                                            overlap_scan[scan_idx, 1] > 0):  # Avoid division by zero
+                                            ratios.append(overlap_combined[idx, 1] / overlap_scan[scan_idx, 1])
+                                    
+                                    if len(ratios) > 0:
+                                        scale = np.median(ratios)
+                        
+                        print(f"Scan {i+1}: scaling factor = {scale:.3f}")
+                        
+                        # Apply scaling
+                        scan[:, 1] = scan[:, 1] * scale
+                        
+                        # Plot the unscaled data (dashed line)
+                        ax2.plot(orig_scan[:, 0], orig_scan[:, 1], marker='', linestyle='--', 
+                                color=f'C{i}', alpha=0.4, label=f'Scan {i+1} (Unscaled)')
+                        
+                        # Plot the scaled data
+                        ax2.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
+                                color=f'C{i}', label=f'Scan {i+1} (Scaled)', markersize=3)
+                        
+                        # Concatenate with existing data
+                        combined = np.concatenate((combined, scan))
+                
+                # Set y-scale based on checkbox
+                if self.log_scale_checkbox.value:
+                    ax1.set_yscale('log')
+                    ax2.set_yscale('log')
+                else:
+                    ax1.set_yscale('linear')
+                    ax2.set_yscale('linear')
+                
+                # Set labels and titles
+                ax1.set_xlabel('Angle (degrees)')
+                ax1.set_ylabel('Intensity')
+                ax1.set_title(f'Raw Scans (Trimmed & Background Corrected) - {energy:.1f} eV')
+                ax1.legend()
+                ax1.grid(True, which="both", ls="--", alpha=0.3)
+                
+                ax2.set_xlabel('Angle (degrees)')
+                ax2.set_ylabel('Intensity')
+                ax2.set_title(f'Stitching Preview - {energy:.1f} eV')
+                ax2.legend()
+                ax2.grid(True, which="both", ls="--", alpha=0.3)
+                
+                plt.tight_layout()
+                plt.show()
+                
+                print("Stitching preview complete!")
+                print("Overlapping regions are highlighted in the right plot.")
+                print("Dotted lines show unscaled data, solid lines show scaled data.")
+                print("Background subtraction has been applied where specified.")
+                print("To adjust the overlap regions, modify the trim values for each file.")
+                print("Note: This is only a preview. Click 'Process Group' to apply the final processing.")
+        
+        except Exception as e:
+            with self.output_area:
+                clear_output(wait=True)
+                print(f"Error generating stitching preview: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                
+                
     def _validate_smoothing_params(self):
         """Validate smoothing parameters and adjust if necessary"""
         window = self.smoothing_window.value
@@ -1803,7 +1863,150 @@ class RSoXRTrimWidget:
         """Handle log scale checkbox change"""
         # Redraw the plot with new scale
         self._plot_current_file()
-    
+        
+    def add_open_beam_controls_to_widget(self):
+        """
+        Add open beam controls to the RSoXRTrimWidget
+        This method should be called during widget initialization
+        """
+        import ipywidgets as widgets
+        from IPython.display import clear_output
+        
+        # Open beam file selection
+        self.open_beam_file_input = widgets.Text(
+            value='',
+            placeholder='Path to open beam file',
+            description='Open Beam File:',
+            disabled=False,
+            layout=widgets.Layout(width='70%')
+        )
+        
+        # Load open beam button
+        self.load_open_beam_button = widgets.Button(
+            description='Load Open Beam',
+            disabled=False,
+            button_style='info',
+            tooltip='Load open beam intensity data',
+            icon='upload'
+        )
+        
+        # Open beam normalization checkbox
+        self.use_open_beam_checkbox = widgets.Checkbox(
+            value=False,
+            description='Use Open Beam Normalization',
+            disabled=True,  # Disabled until open beam data is loaded
+            tooltip='Use open beam intensity for normalization instead of standard normalization'
+        )
+        
+        # Open beam status display
+        self.open_beam_status = widgets.HTML(
+            value="<b>Open Beam Status:</b> No data loaded",
+            description='',
+            layout=widgets.Layout(width='100%')
+        )
+        
+        # Set up event handlers
+        self.load_open_beam_button.on_click(self._on_load_open_beam)
+        self.use_open_beam_checkbox.observe(self._on_open_beam_checkbox_change, names='value')
+        
+        # Create the open beam controls widget
+        self.open_beam_controls = widgets.VBox([
+            widgets.HTML("<h4>Open Beam Normalization</h4>"),
+            widgets.HBox([self.open_beam_file_input, self.load_open_beam_button]),
+            self.use_open_beam_checkbox,
+            self.open_beam_status
+        ])
+        
+        return self.open_beam_controls
+
+
+    def _on_load_open_beam(self, b):
+        """Handle open beam file loading in widget"""
+        file_path = self.open_beam_file_input.value.strip()
+        
+        if not file_path:
+            with self.output_area:
+                print("Please enter a path to the open beam file.")
+            return
+        
+        if not os.path.exists(file_path):
+            with self.output_area:
+                print(f"Error: File not found: {file_path}")
+            return
+        
+        with self.output_area:
+            clear_output(wait=True)
+            print(f"Loading open beam data from: {file_path}")
+            
+            # Load the open beam file
+            success = self.processor.load_open_beam_file(file_path)
+            
+            if success:
+                # Update status and enable checkbox
+                energy_range = f"{self.processor.open_beam_data['energy'].min():.1f} - {self.processor.open_beam_data['energy'].max():.1f} eV"
+                self.open_beam_status.value = f"<b>Open Beam Status:</b> ✓ Loaded ({len(self.processor.open_beam_data)} points, {energy_range})"
+                self.use_open_beam_checkbox.disabled = False
+                
+                print("Open beam data loaded successfully!")
+                print("You can now enable 'Use Open Beam Normalization' in the processing options.")
+            else:
+                self.open_beam_status.value = "<b>Open Beam Status:</b> ✗ Failed to load"
+                self.use_open_beam_checkbox.disabled = True
+                self.use_open_beam_checkbox.value = False
+
+
+    def _on_open_beam_checkbox_change(self, change):
+        """Handle open beam normalization checkbox change in widget"""
+        use_open_beam = change['new']
+        
+        # Update the processor setting
+        success = self.processor.set_open_beam_normalization(use_open_beam)
+        
+        if not success:
+            # Revert checkbox if setting failed
+            self.use_open_beam_checkbox.value = False
+        
+        with self.output_area:
+            if success:
+                norm_type = "open beam" if use_open_beam else "standard"
+                print(f"Normalization mode set to: {norm_type}")
+            else:
+                print("Failed to set open beam normalization. Please load open beam data first.")
+
+    def _load_open_beam_on_init(self, open_beam_path):
+        """
+        Load open beam data during widget initialization
+        
+        Parameters:
+        -----------
+        open_beam_path : str
+            Path to the open beam file
+        """
+        try:
+            print(f"Loading open beam data from initialization parameter: {open_beam_path}")
+            
+            # Load the open beam file using the processor
+            success = self.processor.load_open_beam_file(open_beam_path)
+            
+            if success:
+                # Update the open beam controls UI
+                self.open_beam_file_input.value = open_beam_path
+                
+                energy_range = f"{self.processor.open_beam_data['energy'].min():.1f} - {self.processor.open_beam_data['energy'].max():.1f} eV"
+                self.open_beam_status.value = f"<b>Open Beam Status:</b> ✓ Loaded ({len(self.processor.open_beam_data)} points, {energy_range})"
+                
+                self.use_open_beam_checkbox.disabled = False
+                
+                print(f"✓ Open beam data loaded successfully during initialization!")
+                print(f"  Energy range: {energy_range}")
+                print(f"  Data points: {len(self.processor.open_beam_data)}")
+                
+            else:
+                print(f"✗ Failed to load open beam data from: {open_beam_path}")
+                
+        except Exception as e:
+            print(f"Error loading open beam data during initialization: {str(e)}")
+        
     def display(self):
         """Display the widget"""
         display(self.main_container)

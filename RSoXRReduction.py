@@ -2737,27 +2737,64 @@ class RSoXRProcessor:
             # Column 3: Error (optional)
             # Column 4: Another parameter (optional)
             
-            # Try loading as whitespace-delimited file first
+            print(f"Loading open beam file: {file_path}")
+            
+            # Try loading with numpy first (handles whitespace/tab separation automatically)
             try:
-                data = np.loadtxt(file_path)
+                data = np.loadtxt(file_path, skiprows=1)
+                print(f"Loaded data shape: {data.shape}")
+                
+                if len(data.shape) == 1:
+                    print("Error: File appears to contain only one row or one column")
+                    return False
+                    
                 if data.shape[1] >= 2:
+                    # Use only the first two columns (energy, intensity)
                     self.open_beam_data = pd.DataFrame({
                         'energy': data[:, 0],
                         'intensity': data[:, 1]
                     })
+                    print(f"Using columns: Energy (col 1), Intensity (col 2)")
+                    
+                    # Optionally store additional columns for reference
                     if data.shape[1] >= 3:
                         self.open_beam_data['error'] = data[:, 2]
+                        print(f"Also loaded error column (col 3)")
+                    if data.shape[1] >= 4:
+                        self.open_beam_data['monitor'] = data[:, 3]
+                        print(f"Also loaded monitor/additional data (col 4)")
+                        
                 else:
                     print(f"Error: Open beam file must have at least 2 columns (energy, intensity)")
+                    print(f"Found {data.shape[1]} columns")
                     return False
                     
-            except ValueError:
-                # If that fails, try pandas read_csv with tab separator
-                self.open_beam_data = pd.read_csv(file_path, sep='\t', header=None)
-                if self.open_beam_data.shape[1] >= 2:
-                    self.open_beam_data.columns = ['energy', 'intensity'] + [f'col{i}' for i in range(2, self.open_beam_data.shape[1])]
+            except Exception as e:
+                print(f"numpy.loadtxt failed: {e}")
+                print("Trying pandas read_csv...")
+                
+                # If numpy fails, try pandas with various separators
+                for sep in ['\t', ' ', ',', None]:  # None means any whitespace
+                    try:
+                        print(f"Trying separator: {repr(sep)}")
+                        self.open_beam_data = pd.read_csv(file_path, sep=sep, header=None, comment='#')
+                        
+                        if self.open_beam_data.shape[1] >= 2:
+                            # Use only first two columns
+                            self.open_beam_data = self.open_beam_data.iloc[:, :2]
+                            self.open_beam_data.columns = ['energy', 'intensity']
+                            print(f"Successfully loaded with pandas using separator {repr(sep)}")
+                            break
+                        else:
+                            print(f"Not enough columns with separator {repr(sep)}")
+                            continue
+                            
+                    except Exception as e2:
+                        print(f"Pandas with separator {repr(sep)} failed: {e2}")
+                        continue
                 else:
-                    print(f"Error: Open beam file must have at least 2 columns (energy, intensity)")
+                    # If all methods fail
+                    print("All loading methods failed")
                     return False
             
             self.open_beam_file = file_path
@@ -2767,6 +2804,19 @@ class RSoXRProcessor:
                 print(f"Error: Open beam file is empty")
                 return False
                 
+            # Check for valid data
+            if self.open_beam_data['energy'].isna().any():
+                print("Warning: Some energy values are NaN, removing those rows")
+                self.open_beam_data = self.open_beam_data.dropna(subset=['energy'])
+                
+            if self.open_beam_data['intensity'].isna().any():
+                print("Warning: Some intensity values are NaN, removing those rows")
+                self.open_beam_data = self.open_beam_data.dropna(subset=['intensity'])
+            
+            if len(self.open_beam_data) == 0:
+                print("Error: No valid data remaining after removing NaN values")
+                return False
+                
             # Sort by energy for interpolation
             self.open_beam_data = self.open_beam_data.sort_values('energy').reset_index(drop=True)
             
@@ -2774,14 +2824,19 @@ class RSoXRProcessor:
             if not hasattr(self, 'use_open_beam_normalization'):
                 self.use_open_beam_normalization = False
             
-            print(f"Successfully loaded open beam data from {file_path}")
+            print(f"Successfully loaded open beam data from {os.path.basename(file_path)}")
             print(f"Energy range: {self.open_beam_data['energy'].min():.1f} - {self.open_beam_data['energy'].max():.1f} eV")
             print(f"Data points: {len(self.open_beam_data)}")
+            print(f"Sample data:")
+            print(f"  First few points: Energy={self.open_beam_data['energy'].iloc[0]:.1f} eV, Intensity={self.open_beam_data['intensity'].iloc[0]:.3e}")
+            print(f"  Last few points: Energy={self.open_beam_data['energy'].iloc[-1]:.1f} eV, Intensity={self.open_beam_data['intensity'].iloc[-1]:.3e}")
             
             return True
             
         except Exception as e:
             print(f"Error loading open beam file {file_path}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
 
 
@@ -2931,3 +2986,476 @@ class RSoXRProcessor:
         
         return normalized_data
 
+
+    def reduce_data_with_open_beam_option(self, scans, trims, backgrounds, energy, 
+                                        normalize=True, plot=False, convert_to_photons=False,
+                                        output_dir=None, plot_prefix=None,
+                                        smooth_data=False, savgol_window=None, savgol_order=2,
+                                        remove_zeros=True, use_open_beam=None):
+        """
+        Enhanced version of reduce_data_with_backgrounds that supports open beam normalization
+        
+        Parameters:
+        -----------
+        scans : list of numpy arrays
+            List of loaded scan data (angle, intensity)
+        trims : list of tuples
+            List of (start, end) trim indices for each scan
+        backgrounds : list of floats
+            List of background values to subtract from each scan
+        energy : float
+            Photon energy in eV
+        normalize : bool
+            Whether to normalize the final reflectivity
+        plot : bool
+            Whether to generate plots during processing
+        convert_to_photons : bool
+            Whether to convert photodiode current to photon flux
+        output_dir : str, optional
+            Directory to save plots
+        plot_prefix : str, optional
+            Prefix for plot filenames
+        smooth_data : bool
+            Whether to apply Savitzky-Golay smoothing
+        savgol_window : int, optional
+            Window size for smoothing filter
+        savgol_order : int
+            Polynomial order for smoothing filter
+        remove_zeros : bool
+            Whether to remove zero intensity points
+        use_open_beam : bool, optional
+            Override for open beam normalization (None = use current setting)
+            
+        Returns:
+        --------
+        If smooth_data is True:
+            (smoothed_data, raw_data) : tuple of numpy arrays
+        Else:
+            processed_data : numpy array
+        """
+        # Temporarily set open beam normalization if override provided
+        original_setting = getattr(self, 'use_open_beam_normalization', False)
+        if use_open_beam is not None:
+            self.use_open_beam_normalization = use_open_beam
+        
+        try:
+            # Use the existing reduce_data_with_backgrounds method structure
+            # but replace the normalization part
+            
+            if len(scans) != len(trims) or len(scans) != len(backgrounds):
+                print(f"Error: Mismatch in number of scans ({len(scans)}), trims ({len(trims)}), and backgrounds ({len(backgrounds)})")
+                return None
+            
+            # Ensure we have trim values for all scans
+            if len(trims) < len(scans):
+                print(f"Warning: Not enough trim values provided. Adding default trims for {len(scans) - len(trims)} scans.")
+                trims.extend([(0, -1)] * (len(scans) - len(trims)))
+            
+            # Process the first scan
+            refl = deepcopy(scans[0][trims[0][0]:(len(scans[0][:,0])+trims[0][1]), 0:2])
+            
+            # Apply background subtraction to first scan
+            if backgrounds[0] != 0.0:
+                refl[:, 1] = refl[:, 1] - backgrounds[0]
+                print(f"Applied background subtraction to scan 1: -{backgrounds[0]:.3f}")
+            
+            # Remove zeros if requested
+            if remove_zeros:
+                non_zero_mask = refl[:,1] > 0
+                if not all(non_zero_mask):
+                    print(f"Removing {len(refl) - np.sum(non_zero_mask)} zero data points from first scan")
+                    refl = refl[non_zero_mask]
+            
+            # Convert to photon flux if requested
+            if convert_to_photons and hasattr(self, 'calibration_data') and self.calibration_data is not None:
+                refl[:,1] = self.amp_to_photon_flux(refl[:,1], energy)
+            
+            # Store all raw scans for combined plotting
+            all_scans = [deepcopy(refl)]
+            
+            # Process additional scans (using existing logic from reduce_data_with_backgrounds)
+            for i in range(1, len(scans)):
+                scan = scans[i][trims[i][0]:(len(scans[i][:,0])+trims[i][1]), 0:2]
+                
+                # Apply background subtraction
+                if backgrounds[i] != 0.0:
+                    scan[:, 1] = scan[:, 1] - backgrounds[i]
+                    print(f"Applied background subtraction to scan {i+1}: -{backgrounds[i]:.3f}")
+                
+                # Remove zeros if requested
+                if remove_zeros:
+                    non_zero_mask = scan[:,1] > 0
+                    if not all(non_zero_mask):
+                        print(f"Removing {len(scan) - np.sum(non_zero_mask)} zero data points from scan {i+1}")
+                        scan = scan[non_zero_mask]
+                
+                # Convert to photon flux if requested
+                if convert_to_photons and hasattr(self, 'calibration_data') and self.calibration_data is not None:
+                    scan[:,1] = self.amp_to_photon_flux(scan[:,1], energy)
+                
+                # Find overlap and scale using existing find_nearest method
+                idx, val = self.find_nearest(scan[:,0], refl[-1,0])
+                
+                # Check for valid overlap
+                if idx <= 0 or np.isnan(val):
+                    print(f"Warning: No overlap found for scan {i+1}. Appending without scaling.")
+                    refl = np.vstack((refl, scan))
+                else:
+                    # Calculate scaling factor
+                    overlap_angle = refl[-1, 0]
+                    current_intensity = refl[-1, 1]
+                    new_intensity = scan[idx, 1]
+                    
+                    if new_intensity > 0:
+                        scale_factor = current_intensity / new_intensity
+                        scan[:, 1] *= scale_factor
+                        print(f"Scaled scan {i+1} by factor {scale_factor:.4f}")
+                    
+                    # Append the scaled scan (excluding the overlap point)
+                    if idx + 1 < len(scan):
+                        refl = np.vstack((refl, scan[idx+1:]))
+                
+                all_scans.append(deepcopy(scan))
+            
+            # Store raw data before smoothing
+            raw_refl_q = deepcopy(refl)
+            
+            # Apply smoothing if requested
+            if smooth_data and savgol_window and len(refl) > savgol_window:
+                try:
+                    from scipy.signal import savgol_filter
+                    
+                    if savgol_window % 2 == 0:
+                        savgol_window += 1  # Must be odd
+                    
+                    smoothed_intensities = savgol_filter(refl[:,1], savgol_window, savgol_order)
+                    refl_smooth = deepcopy(refl)
+                    refl_smooth[:,1] = smoothed_intensities
+                    
+                    print(f"Applied Savitzky-Golay smoothing: window={savgol_window}, order={savgol_order}")
+                    
+                except Exception as e:
+                    print(f"Warning: Smoothing failed ({str(e)}), using raw data")
+                    refl_smooth = deepcopy(refl)
+            else:
+                refl_smooth = deepcopy(refl)
+            
+            # Apply normalization using the new method
+            if normalize:
+                # Apply normalization (open beam or standard based on current setting)
+                refl_smooth[:, 1] = self.apply_normalization(refl_smooth[:, 1], energy)
+                raw_refl_q[:, 1] = self.apply_normalization(raw_refl_q[:, 1], energy)
+                
+                # Add error column (1% error assumption)
+                refl_smooth = np.column_stack((refl_smooth, refl_smooth[:, 1] * 0.01))
+                raw_refl_q = np.column_stack((raw_refl_q, raw_refl_q[:, 1] * 0.01))
+            else:
+                # Add error column without normalization
+                refl_smooth = np.column_stack((refl_smooth, refl_smooth[:, 1] * 0.01))
+                raw_refl_q = np.column_stack((raw_refl_q, raw_refl_q[:, 1] * 0.01))
+            
+            # Generate plots if requested
+            if plot and plot_prefix:
+                self._plot_processed_data_with_open_beam_info(all_scans, refl_smooth if smooth_data else raw_refl_q, 
+                                                            backgrounds, energy, plot_prefix, output_dir)
+            
+            # Return processed data
+            if smooth_data:
+                return refl_smooth, raw_refl_q
+            else:
+                return raw_refl_q
+        
+        finally:
+            # Restore original setting if override was used
+            if use_open_beam is not None:
+                self.use_open_beam_normalization = original_setting
+
+
+    def _plot_processed_data_with_open_beam_info(self, all_scans, final_data, backgrounds, energy, 
+                                            plot_prefix, output_dir=None):
+        """
+        Generate plots showing the effect of background subtraction and normalization type
+        
+        Parameters:
+        -----------
+        all_scans : list of numpy arrays
+            Individual processed scans
+        final_data : numpy array
+            Final combined and processed data
+        backgrounds : list of floats
+            Background values that were subtracted
+        energy : float
+            Photon energy in eV
+        plot_prefix : str
+            Prefix for saved plot files
+        output_dir : str, optional
+            Directory to save plots
+        """
+        try:
+            # Create figure with subplots
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Plot 1: Individual scans (after background subtraction)
+            for i, (scan, bg) in enumerate(zip(all_scans, backgrounds)):
+                label = f'Scan {i+1}'
+                if bg != 0.0:
+                    label += f' (BG: -{bg:.3f})'
+                ax1.plot(scan[:, 0], scan[:, 1], 'o-', alpha=0.7, markersize=3, label=label)
+            
+            ax1.set_xlabel('Angle (degrees)')
+            ax1.set_ylabel('Intensity')
+            ax1.set_title(f'Individual Scans (Background Corrected) - {energy:.1f} eV')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.set_yscale('log')
+            
+            # Plot 2: Final combined data
+            use_open_beam = getattr(self, 'use_open_beam_normalization', False)
+            norm_type = "Open Beam Normalized" if use_open_beam else "Standard Normalized"
+            
+            ax2.plot(final_data[:, 0], final_data[:, 1], 'b-', linewidth=2, label=f'Combined Data')
+            ax2.set_xlabel('Angle (degrees)')
+            ax2.set_ylabel('Normalized Intensity')
+            ax2.set_title(f'Final Combined Data ({norm_type}) - {energy:.1f} eV')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            ax2.set_yscale('log')
+            
+            # Add normalization info to plot
+            if use_open_beam and hasattr(self, 'open_beam_data') and self.open_beam_data is not None:
+                open_beam_intensity = self.get_open_beam_intensity(energy)
+                if open_beam_intensity:
+                    ax2.text(0.05, 0.95, f'I₀({energy:.1f} eV) = {open_beam_intensity:.3e}', 
+                            transform=ax2.transAxes, verticalalignment='top',
+                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            plt.tight_layout()
+            
+            # Save plot if output directory specified
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                plot_path = os.path.join(output_dir, f"{plot_prefix}_processing_comparison.png")
+                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+                print(f"Processing comparison plot saved to {plot_path}")
+            
+            plt.show()
+            
+        except Exception as e:
+            print(f"Error generating plots: {str(e)}")
+
+
+    def process_scan_set_with_open_beam_option(self, scan_group, output_filename="output.dat",
+                                            normalize=True, plot=False, convert_to_photons=False,
+                                            smooth_data=False, savgol_window=None, savgol_order=2,
+                                            remove_zeros=True, estimate_thickness=False,
+                                            min_prominence=0.1, min_thickness_nm=1.0, 
+                                            max_thickness_nm=100.0, output_dir=None,
+                                            plot_prefix=None, use_open_beam=None):
+        """
+        Enhanced version of process_scan_set that supports open beam normalization
+        
+        This method extends the existing process_scan_set functionality with open beam normalization.
+        
+        Parameters:
+        -----------
+        scan_group : dict
+            Dictionary containing scan information with keys:
+            - 'files': list of file paths
+            - 'trims': list of (start, end) trim indices  
+            - 'energy': photon energy in eV
+            - 'backgrounds': list of background values (optional)
+        output_filename : str
+            Output filename for processed data
+        normalize : bool
+            Whether to normalize the reflectivity
+        plot : bool
+            Whether to generate plots
+        convert_to_photons : bool
+            Whether to convert to photon flux
+        smooth_data : bool
+            Whether to apply smoothing
+        savgol_window : int, optional
+            Smoothing window size
+        savgol_order : int
+            Smoothing polynomial order
+        remove_zeros : bool
+            Whether to remove zero data points
+        estimate_thickness : bool
+            Whether to estimate thickness
+        min_prominence : float
+            Minimum peak prominence for thickness estimation
+        min_thickness_nm : float
+            Minimum thickness for estimation
+        max_thickness_nm : float
+            Maximum thickness for estimation
+        output_dir : str, optional
+            Output directory
+        plot_prefix : str, optional
+            Plot filename prefix
+        use_open_beam : bool, optional
+            Override for open beam normalization
+            
+        Returns:
+        --------
+        Processed reflectivity data (numpy array or tuple if smoothed)
+        """
+        # Extract information from the scan group
+        file_patterns = scan_group['files']
+        trims = scan_group['trims']
+        energy = scan_group['energy']
+        
+        # Extract background values if provided
+        backgrounds = scan_group.get('backgrounds', [0.0] * len(file_patterns))
+        
+        # Ensure backgrounds list has the same length as files
+        if len(backgrounds) < len(file_patterns):
+            print(f"Warning: Not enough background values provided. Padding with zeros.")
+            backgrounds.extend([0.0] * (len(file_patterns) - len(backgrounds)))
+        elif len(backgrounds) > len(file_patterns):
+            print(f"Warning: More background values than files. Truncating background list.")
+            backgrounds = backgrounds[:len(file_patterns)]
+        
+        scans = []
+        energies = []
+        actual_trims = []
+        actual_backgrounds = []
+        
+        # Load all data files
+        for i, pattern in enumerate(file_patterns):
+            try:
+                scan_data = self.load_data_file(pattern)
+                scans.append(scan_data)
+                
+                # Use the trim value for this pattern
+                if i < len(trims):
+                    actual_trims.append(trims[i])
+                else:
+                    # Default trim if not provided
+                    actual_trims.append((0, -1))
+                
+                # Use the background value for this pattern
+                actual_backgrounds.append(backgrounds[i])
+                
+                energies.append(energy)
+                print(f"Loaded file: {pattern}")
+                if backgrounds[i] != 0.0:
+                    print(f"  Background subtraction: -{backgrounds[i]:.3f}")
+            except Exception as e:
+                print(f"Error loading file {pattern}: {str(e)}")
+        
+        if not scans:
+            print("No valid scan data found.")
+            return None
+        
+        # Use the enhanced reduce_data method with open beam option
+        result = self.reduce_data_with_open_beam_option(
+            scans=scans,
+            trims=actual_trims,
+            backgrounds=actual_backgrounds,
+            energy=energy,
+            normalize=normalize,
+            plot=plot,
+            convert_to_photons=convert_to_photons,
+            output_dir=output_dir,
+            plot_prefix=plot_prefix,
+            smooth_data=smooth_data,
+            savgol_window=savgol_window,
+            savgol_order=savgol_order,
+            remove_zeros=remove_zeros,
+            use_open_beam=use_open_beam
+        )
+        
+        if result is None:
+            return None
+        
+        # Handle saving and metadata (similar to existing process_scan_set)
+        if output_dir or output_filename != "output.dat":
+            output_path = os.path.join(output_dir or '.', output_filename)
+            
+            try:
+                if smooth_data and isinstance(result, tuple):
+                    # Save smoothed data
+                    np.savetxt(output_path, result[0], delimiter='\t',
+                            header='Angle(deg)\tIntensity\tError', comments='')
+                    print(f"Saved smoothed data to {output_path}")
+                else:
+                    # Save regular data  
+                    data_to_save = result[0] if isinstance(result, tuple) else result
+                    np.savetxt(output_path, data_to_save, delimiter='\t',
+                            header='Angle(deg)\tIntensity\tError', comments='')
+                    print(f"Saved processed data to {output_path}")
+                    
+                # Save metadata including open beam info
+                self._save_metadata_with_open_beam_info(scan_group, output_path, normalize, 
+                                                    convert_to_photons, smooth_data, remove_zeros,
+                                                    savgol_window, savgol_order, actual_backgrounds)
+                                                    
+            except Exception as e:
+                print(f"Error saving data: {str(e)}")
+        
+        # Estimate thickness if requested (using existing method)
+        if estimate_thickness and hasattr(self, 'estimate_thickness'):
+            try:
+                data_for_thickness = result[0] if isinstance(result, tuple) else result
+                thickness = self.estimate_thickness(data_for_thickness,
+                                                min_prominence=min_prominence,
+                                                min_thickness_nm=min_thickness_nm,
+                                                max_thickness_nm=max_thickness_nm)
+                if thickness is not None:
+                    print(f"Estimated thickness: {thickness:.1f} Å")
+            except Exception as e:
+                print(f"Error estimating thickness: {str(e)}")
+        
+        return result
+
+
+    def _save_metadata_with_open_beam_info(self, scan_group, output_path, normalize, 
+                                        convert_to_photons, smooth_data, remove_zeros,
+                                        savgol_window, savgol_order, backgrounds):
+        """
+        Save metadata including open beam normalization information
+        """
+        try:
+            sample_name = scan_group.get('sample_name', 'Unknown')
+            energy = scan_group['energy']
+            
+            # Create metadata with open beam info
+            metadata = {
+                'Sample Name': sample_name,
+                'Energy (eV)': energy,
+                'Files Processed': len(scan_group['files']),
+                'Normalization': normalize,
+                'Normalization Type': 'Open Beam' if getattr(self, 'use_open_beam_normalization', False) else 'Standard',
+                'Photon Conversion': convert_to_photons,
+                'Smoothing': smooth_data,
+                'Zero Removal': remove_zeros,
+                'Processing Date': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'Output File': os.path.basename(output_path),
+                'Background Subtraction Applied': any(bg != 0.0 for bg in backgrounds)
+            }
+            
+            # Add open beam specific info
+            if getattr(self, 'use_open_beam_normalization', False) and hasattr(self, 'open_beam_data'):
+                open_beam_intensity = self.get_open_beam_intensity(energy)
+                metadata['Open Beam File'] = getattr(self, 'open_beam_file', 'Unknown')
+                metadata['Open Beam Intensity at Energy'] = open_beam_intensity
+                energy_range = f"{self.open_beam_data['energy'].min():.1f}-{self.open_beam_data['energy'].max():.1f}"
+                metadata['Open Beam Energy Range'] = energy_range
+            
+            # Add smoothing parameters if used
+            if smooth_data:
+                metadata['Smoothing Window'] = savgol_window
+                metadata['Smoothing Order'] = savgol_order
+            
+            # Add background details
+            for i, bg in enumerate(backgrounds):
+                metadata[f'Background File {i+1}'] = bg
+            
+            # Save metadata
+            meta_path = output_path.replace('.dat', '_metadata.csv')
+            meta_df = pd.DataFrame([metadata])
+            meta_df.to_csv(meta_path, index=False)
+            print(f"Metadata saved to {meta_path}")
+            
+        except Exception as e:
+            print(f"Warning: Could not save metadata: {str(e)}")
