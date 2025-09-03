@@ -37,6 +37,9 @@ class RSoXRProcessor:
             
         if calibration_file:
             self.load_calibration_file(calibration_file)
+        
+        self.scan_registry = {}  # Maps scan numbers to file info
+        self.next_scan_number = 1
     
     def load_calibration_file(self, calibration_file):
         """
@@ -1324,9 +1327,11 @@ class RSoXRProcessor:
         
         return results
     
-    def auto_group_scans(self, data_directory=".", position_tolerance=0.4, energy_tolerance=0.2, auto_trim=False, save_table=True, output_dir=None, sort_by_energy=True):
+    def auto_group_scans(self, data_directory=".", position_tolerance=0.4, 
+                        energy_tolerance=0.2, auto_trim=False, save_table=True, 
+                        output_dir=None, sort_by_energy=True):
         """
-        Automatically group scans based on position, energy, and detector type
+        Enhanced auto-grouping that assigns unique scan numbers to each file
         
         Parameters:
         -----------
@@ -1348,8 +1353,328 @@ class RSoXRProcessor:
         Returns:
         --------
         groups : list of dicts
-            List of file groups with associated metadata
+            List of file groups with associated metadata and scan numbers
         """
+        # Reset scan registry and numbering
+        self.scan_registry = {}
+        self.next_scan_number = 1
+        
+        # Call existing auto_group_scans logic (simplified here)
+        groups = self._perform_auto_grouping(data_directory, position_tolerance, 
+                                           energy_tolerance, auto_trim, sort_by_energy)
+        
+        # Assign unique scan numbers to each file across all groups
+        for group_idx, group in enumerate(groups):
+            group['scan_numbers'] = []
+            for file_idx, filename in enumerate(group['files']):
+                scan_number = self.next_scan_number
+                self.next_scan_number += 1
+                
+                # Store in registry
+                self.scan_registry[scan_number] = {
+                    'filename': filename,
+                    'group_idx': group_idx,
+                    'file_idx': file_idx,
+                    'metadata': group['metadata'][file_idx] if file_idx < len(group['metadata']) else None,
+                    'trim': group['trims'][file_idx] if file_idx < len(group['trims']) else (0, -1)
+                }
+                
+                group['scan_numbers'].append(scan_number)
+        
+        if save_table and groups:
+            self.save_scan_groups_to_table(groups, output_dir=output_dir)
+            
+        return groups
+    
+    def edit_groups(self, scan_groups=None, group=None, add_scan_number=None, 
+                   remove_scan_number=None, remove_group=None):
+        """
+        Edit scan groups by moving individual scans between groups
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts, optional
+            Current scan groups. If None, uses self.scan_groups
+        group : int, optional
+            Target group number (1-based) for adding scans
+        add_scan_number : int or list of int, optional
+            Scan number(s) to add to the target group
+        remove_scan_number : int or list of int, optional
+            Scan number(s) to remove from the specified group
+        remove_group : int, optional
+            Group number to remove entirely
+            
+        Returns:
+        --------
+        updated_groups : list of dicts
+            Updated scan groups
+            
+        Examples:
+        --------
+        # Add scan 4 to group 1 (removes it from its current group)
+        processor.edit_groups(group=1, add_scan_number=4)
+        
+        # Add multiple scans to group 1
+        processor.edit_groups(group=1, add_scan_number=[4, 5])
+        
+        # Remove scan 6 from group 1
+        processor.edit_groups(group=1, remove_scan_number=6)
+        
+        # Remove entire group 4
+        processor.edit_groups(remove_group=4)
+        """
+        if scan_groups is None:
+            if not hasattr(self, 'scan_groups') or self.scan_groups is None:
+                raise ValueError("No scan groups available. Run auto_group_scans first.")
+            scan_groups = deepcopy(self.scan_groups)
+        else:
+            scan_groups = deepcopy(scan_groups)
+        
+        # Handle removing entire group
+        if remove_group is not None:
+            return self._remove_group(scan_groups, remove_group)
+        
+        # Handle removing scans from a specific group
+        if remove_scan_number is not None and group is not None:
+            return self._remove_scans_from_group(scan_groups, group, remove_scan_number)
+        
+        # Handle adding scans to a group
+        if add_scan_number is not None and group is not None:
+            return self._add_scans_to_group(scan_groups, group, add_scan_number)
+        
+        raise ValueError("Invalid combination of parameters. See docstring for examples.")
+    
+    def _add_scans_to_group(self, scan_groups, target_group, scan_numbers):
+        """Add one or more scans to a target group"""
+        if not isinstance(scan_numbers, list):
+            scan_numbers = [scan_numbers]
+        
+        target_group_idx = target_group - 1
+        if not (0 <= target_group_idx < len(scan_groups)):
+            raise ValueError(f"Invalid group number {target_group}. Valid range is 1-{len(scan_groups)}")
+        
+        moved_scans = []
+        
+        for scan_number in scan_numbers:
+            if scan_number not in self.scan_registry:
+                print(f"Warning: Scan number {scan_number} not found in registry")
+                continue
+            
+            scan_info = self.scan_registry[scan_number]
+            source_group_idx = scan_info['group_idx']
+            source_file_idx = scan_info['file_idx']
+            
+            if source_group_idx == target_group_idx:
+                print(f"Scan {scan_number} is already in group {target_group}")
+                continue
+            
+            # Remove from source group
+            source_group = scan_groups[source_group_idx]
+            
+            # Find the current position of this scan in the source group
+            current_idx = None
+            for idx, snum in enumerate(source_group['scan_numbers']):
+                if snum == scan_number:
+                    current_idx = idx
+                    break
+            
+            if current_idx is None:
+                print(f"Warning: Scan {scan_number} not found in expected source group")
+                continue
+            
+            # Remove from source group
+            filename = source_group['files'].pop(current_idx)
+            metadata = source_group['metadata'].pop(current_idx) if current_idx < len(source_group['metadata']) else None
+            trim = source_group['trims'].pop(current_idx) if current_idx < len(source_group['trims']) else (0, -1)
+            source_group['scan_numbers'].pop(current_idx)
+            
+            # Add to target group
+            target_group_dict = scan_groups[target_group_idx]
+            target_group_dict['files'].append(filename)
+            target_group_dict['metadata'].append(metadata)
+            target_group_dict['trims'].append(trim)
+            target_group_dict['scan_numbers'].append(scan_number)
+            
+            # Update registry
+            self.scan_registry[scan_number]['group_idx'] = target_group_idx
+            self.scan_registry[scan_number]['file_idx'] = len(target_group_dict['files']) - 1
+            
+            moved_scans.append(scan_number)
+            
+        # Update file indices for remaining scans in source groups
+        self._update_scan_indices(scan_groups)
+        
+        # Remove empty groups
+        scan_groups = self._remove_empty_groups(scan_groups)
+        
+        # Sort files within groups
+        for group in scan_groups:
+            if hasattr(self, '_sort_files_in_group'):
+                group = self._sort_files_in_group(group)
+        
+        if moved_scans:
+            print(f"Moved scans {moved_scans} to group {target_group}")
+        
+        return scan_groups
+    
+    def _remove_scans_from_group(self, scan_groups, group_number, scan_numbers):
+        """Remove one or more scans from a specific group"""
+        if not isinstance(scan_numbers, list):
+            scan_numbers = [scan_numbers]
+        
+        group_idx = group_number - 1
+        if not (0 <= group_idx < len(scan_groups)):
+            raise ValueError(f"Invalid group number {group_number}. Valid range is 1-{len(scan_groups)}")
+        
+        removed_scans = []
+        group = scan_groups[group_idx]
+        
+        # Sort scan numbers in reverse order to maintain indices during removal
+        scan_numbers_in_group = [(scan_num, idx) for idx, scan_num in enumerate(group['scan_numbers']) 
+                                if scan_num in scan_numbers]
+        scan_numbers_in_group.sort(key=lambda x: x[1], reverse=True)
+        
+        for scan_number, file_idx in scan_numbers_in_group:
+            # Remove from group
+            filename = group['files'].pop(file_idx)
+            group['metadata'].pop(file_idx) if file_idx < len(group['metadata']) else None
+            group['trims'].pop(file_idx) if file_idx < len(group['trims']) else None
+            group['scan_numbers'].pop(file_idx)
+            
+            # Remove from registry
+            if scan_number in self.scan_registry:
+                del self.scan_registry[scan_number]
+            
+            removed_scans.append(scan_number)
+            print(f"Removed scan {scan_number} ({os.path.basename(filename)}) from group {group_number}")
+        
+        # Update indices
+        self._update_scan_indices(scan_groups)
+        
+        # Remove empty groups
+        scan_groups = self._remove_empty_groups(scan_groups)
+        
+        return scan_groups
+    
+    def _remove_group(self, scan_groups, group_number):
+        """Remove an entire group"""
+        group_idx = group_number - 1
+        if not (0 <= group_idx < len(scan_groups)):
+            raise ValueError(f"Invalid group number {group_number}. Valid range is 1-{len(scan_groups)}")
+        
+        # Remove scans from registry
+        group = scan_groups[group_idx]
+        for scan_number in group['scan_numbers']:
+            if scan_number in self.scan_registry:
+                del self.scan_registry[scan_number]
+        
+        # Remove group
+        removed_group = scan_groups.pop(group_idx)
+        print(f"Removed group {group_number} ({removed_group['sample_name']}) with {len(removed_group['files'])} scans")
+        
+        # Update indices for remaining groups
+        self._update_scan_indices(scan_groups)
+        
+        return scan_groups
+    
+    def _update_scan_indices(self, scan_groups):
+        """Update the scan registry with current group and file indices"""
+        for group_idx, group in enumerate(scan_groups):
+            for file_idx, scan_number in enumerate(group['scan_numbers']):
+                if scan_number in self.scan_registry:
+                    self.scan_registry[scan_number]['group_idx'] = group_idx
+                    self.scan_registry[scan_number]['file_idx'] = file_idx
+    
+    def _remove_empty_groups(self, scan_groups):
+        """Remove groups that have no files"""
+        return [group for group in scan_groups if len(group['files']) > 0]
+    
+    def print_scan_registry(self):
+        """Print the current scan registry for debugging"""
+        print("\nScan Registry:")
+        print("=" * 80)
+        print(f"{'Scan#':6} | {'Group':6} | {'File#':6} | {'Filename':30} | {'Detector':12}")
+        print("-" * 80)
+        
+        for scan_num in sorted(self.scan_registry.keys()):
+            info = self.scan_registry[scan_num]
+            filename = os.path.basename(info['filename'])
+            detector = info['metadata']['detector'] if info['metadata'] else 'Unknown'
+            print(f"{scan_num:6} | {info['group_idx']+1:6} | {info['file_idx']+1:6} | {filename:30} | {detector:12}")
+    
+    def print_groups_with_scan_numbers(self, scan_groups, show_details=False):
+        """Print group summary showing scan numbers for each file"""
+        print(f"\nScan Groups Summary ({len(scan_groups)} groups):")
+        print("=" * 100)
+        
+        for i, group in enumerate(scan_groups):
+            print(f"\nGroup {i+1}: {group['sample_name']} ({group['energy']:.1f} eV)")
+            print(f"Position: ({group['x']:.2f}, {group['y']:.2f})")
+            print(f"Files: {len(group['files'])}")
+            
+            if show_details:
+                print(f"{'Scan#':6} | {'Filename':25} | {'Detector':12} | {'Angle Range':15}")
+                print("-" * 65)
+                
+                for j, (filename, scan_num) in enumerate(zip(group['files'], group['scan_numbers'])):
+                    base_filename = os.path.basename(filename)
+                    file_meta = group['metadata'][j] if j < len(group['metadata']) else None
+                    
+                    if file_meta:
+                        detector = file_meta['detector'] if file_meta['detector'] else "Unknown"
+                        angle_range_str = "N/A"
+                        if file_meta.get('min_angle') is not None and file_meta.get('max_angle') is not None:
+                            angle_range_str = f"{file_meta['min_angle']:.2f}-{file_meta['max_angle']:.2f}°"
+                    else:
+                        detector = "Unknown"
+                        angle_range_str = "N/A"
+                    
+                    print(f"{scan_num:6} | {base_filename:25} | {detector:12} | {angle_range_str:15}")
+            else:
+                scan_nums_str = ", ".join(map(str, group['scan_numbers']))
+                print(f"Scan numbers: {scan_nums_str}")
+            
+            print()
+    
+    def get_scan_info(self, scan_number):
+        """Get detailed information about a specific scan"""
+        if scan_number not in self.scan_registry:
+            print(f"Scan number {scan_number} not found")
+            return None
+        
+        return self.scan_registry[scan_number]
+    
+    def find_scans_by_detector(self, detector_type):
+        """Find all scans with a specific detector type"""
+        matching_scans = []
+        for scan_num, info in self.scan_registry.items():
+            if info['metadata'] and info['metadata'].get('detector', '').lower() == detector_type.lower():
+                matching_scans.append(scan_num)
+        return matching_scans
+    
+    def find_scans_by_filename_pattern(self, pattern):
+        """Find all scans whose filenames match a pattern"""
+        import re
+        matching_scans = []
+        for scan_num, info in self.scan_registry.items():
+            filename = os.path.basename(info['filename'])
+            if re.search(pattern, filename, re.IGNORECASE):
+                matching_scans.append(scan_num)
+        return matching_scans
+
+    def _perform_auto_grouping(self, data_directory, position_tolerance, 
+                              energy_tolerance, auto_trim, sort_by_energy):
+        """
+        Perform the actual auto-grouping logic based on position, energy, and detector type
+        This contains the core implementation from the original auto_group_scans method
+        """
+        import os
+        import glob
+        import re
+        import pandas as pd
+        from collections import defaultdict
+        from copy import deepcopy
+        
         if self.log_data is None:
             print("Error: Log data is required for automatic scan grouping.")
             return []
@@ -1523,7 +1848,7 @@ class RSoXRProcessor:
         if sort_by_energy:
             scan_groups.sort(key=lambda x: x['energy'])
         
-        # Create and display a consolidated table of scan groups
+        # Print summary of found groups
         print(f"\nFound {len(scan_groups)} scan groups:")
         print("=" * 115)
         print(f"{'#':3} | {'Sample':12} | {'Energy (eV)':10} | {'Position (X,Y)':20} | {'Angle Range':15} | {'Files':8} | {'Detector Types'}")
@@ -1555,45 +1880,6 @@ class RSoXRProcessor:
         
         print("=" * 115)
         
-        # Print details for each group
-        for i, group in enumerate(scan_groups):
-            print(f"\nGroup {i+1}: {group['sample_name']} ({group['energy']:.1f} eV)")
-            print("-" * 120)
-            print(f"{'#':3} | {'Filename':20} | {'Detector':12} | {'Angle Range':15} | {'Count Time':10} | {'Trim'}")
-            print("-" * 120)
-            
-            for j, filename in enumerate(group['files']):
-                base_filename = os.path.basename(filename)
-                # Find metadata for this file
-                file_meta = None
-                for meta in group['metadata']:
-                    if os.path.basename(meta['filename']) == base_filename:
-                        file_meta = meta
-                        break
-                
-                if file_meta:
-                    trim_str = f"({group['trims'][j][0]}, {group['trims'][j][1]})"
-                    detector = file_meta['detector'] if file_meta['detector'] else "Unknown"
-                    
-                    # Format angle range
-                    angle_range_str = "N/A"
-                    if file_meta['min_angle'] is not None and file_meta['max_angle'] is not None:
-                        angle_range_str = f"{file_meta['min_angle']:.2f} - {file_meta['max_angle']:.2f}°"
-                    
-                    # Add count time if available (mainly for CEM detectors)
-                    count_time = "N/A"
-                    if file_meta.get('count_time') is not None:
-                        count_time = f"{file_meta['count_time']:.6f}"
-                    
-                    print(f"{j+1:3} | {base_filename:20} | {detector:12} | {angle_range_str:15} | {count_time:10} | {trim_str}")
-                else:
-                    print(f"{j+1:3} | {base_filename:20} | {'Unknown':12} | {'N/A':15} | {'N/A':10} | {group['trims'][j]}")
-            
-            print()
-            
-        if save_table and scan_groups:
-            self.save_scan_groups_to_table(scan_groups, output_dir=output_dir)
-
         return scan_groups
         
     def _determine_trims(self, filenames):
