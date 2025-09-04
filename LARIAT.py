@@ -138,7 +138,7 @@ class LariatDataProcessor:
             image = f['Images'][f'Image{i}']['ImagePlane0']
             image_list.append(image)
             energy_list.append(energy)
-        return xr.DataArray(image_list, dims=['energy','pix_x','pix_y'], coords={'energy':energy_list}), metadata
+        return xr.DataArray(image_list, dims=['energy','pix_y','pix_x'], coords={'energy':energy_list}), metadata
     
     def load_hdf5_data(self, filename, path):
         """
