@@ -2979,3 +2979,375 @@ class LariatDataProcessor:
         print(f"Energy series comparison saved to {comparison_filepath}")
         
         return comparison_filepath
+    
+    def process_image_pixel_by_pixel(self, pre_edge_norm_range=None, pre_edge_sub_range=None, 
+                                post_edge_range=None, do_pre_edge_norm=True, do_pre_edge_sub=True,
+                                do_post_edge_norm=True, plot_comparison=False, comparison_energies=None,
+                                plot_pixel_spectrum=False, pixel_location=None, 
+                                save_processed_data=False, save_path=None, save_name='processed_image'):
+        """
+        Apply spectral processing (pre-edge normalization, subtraction, post-edge normalization) 
+        to each pixel individually across the entire image.
+        
+        Parameters:
+        -----------
+        pre_edge_norm_range : tuple, optional
+            (min_energy, max_energy) defining the range for pre-edge slope normalization.
+            If None, uses the first 20% of the energy range.
+        pre_edge_sub_range : tuple, optional
+            (min_energy, max_energy) defining the range for pre-edge background subtraction.
+            If None, uses the first 10% of the energy range.
+        post_edge_range : tuple, optional
+            (min_energy, max_energy) defining the range for post-edge normalization.
+            If None, uses the last 20% of the energy range.
+        do_pre_edge_norm : bool, optional
+            If True, perform pre-edge slope normalization
+        do_pre_edge_sub : bool, optional
+            If True, perform pre-edge background subtraction
+        do_post_edge_norm : bool, optional
+            If True, perform post-edge normalization
+        plot_comparison : bool, optional
+            If True, plot comparison of original vs processed images at specified energies
+        comparison_energies : list of float, optional
+            Energy values to use for comparison plots. If None, uses 3 evenly spaced energies.
+        plot_pixel_spectrum : bool, optional
+            If True, plot the spectrum processing for a specific pixel
+        pixel_location : tuple, optional
+            (x, y) coordinates of pixel to plot spectrum for. If None, uses center pixel.
+        save_processed_data : bool, optional
+            If True, save the processed datacube
+        save_path : str, optional
+            Directory to save processed data. If None, uses current directory.
+        save_name : str, optional
+            Base name for saved files
+            
+        Returns:
+        --------
+        processed_data : xarray.DataArray
+            The processed datacube with same structure as original but processed spectra
+        processing_info : dict
+            Information about the processing parameters used
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from scipy.stats import linregress
+        from scipy.interpolate import interp1d
+        import os
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        print("Starting pixel-by-pixel spectral processing...")
+        
+        # Get energy coordinates and data dimensions
+        energies = self.data.energy.values
+        n_energies, n_y, n_x = self.data.shape
+        
+        # Set default ranges if not provided
+        e_min, e_max = energies.min(), energies.max()
+        e_range = e_max - e_min
+        
+        if pre_edge_norm_range is None:
+            pre_edge_norm_range = (e_min, e_min + 0.2 * e_range)
+        if pre_edge_sub_range is None:
+            pre_edge_sub_range = (e_min, e_min + 0.1 * e_range)
+        if post_edge_range is None:
+            post_edge_range = (e_max - 0.2 * e_range, e_max)
+        
+        print(f"Processing {n_x} x {n_y} pixels across {n_energies} energy points")
+        print(f"Pre-edge norm range: {pre_edge_norm_range[0]:.2f} - {pre_edge_norm_range[1]:.2f} eV")
+        print(f"Pre-edge sub range: {pre_edge_sub_range[0]:.2f} - {pre_edge_sub_range[1]:.2f} eV")
+        print(f"Post-edge range: {post_edge_range[0]:.2f} - {post_edge_range[1]:.2f} eV")
+        
+        # Create copy of original data for processing
+        processed_data = self.data.copy()
+        
+        # Initialize arrays to store processing statistics
+        processing_stats = {
+            'pre_edge_slopes': np.full((n_y, n_x), np.nan),
+            'pre_edge_intercepts': np.full((n_y, n_x), np.nan),
+            'pre_edge_values': np.full((n_y, n_x), np.nan),
+            'post_edge_values': np.full((n_y, n_x), np.nan),
+            'valid_pixels': np.zeros((n_y, n_x), dtype=bool)
+        }
+        
+        # Process each pixel
+        pixels_processed = 0
+        pixels_failed = 0
+        
+        for y in range(n_y):
+            if y % 10 == 0:  # Progress update every 10 rows
+                progress = (y * n_x) / (n_y * n_x) * 100
+                print(f"Progress: {progress:.1f}% (row {y}/{n_y})")
+            
+            for x in range(n_x):
+                try:
+                    # Extract spectrum for this pixel
+                    pixel_spectrum = self.data[:, y, x].values
+                    
+                    # Skip pixels with all zeros or very low intensity
+                    if np.all(pixel_spectrum <= 0) or np.max(pixel_spectrum) < 1e-10:
+                        pixels_failed += 1
+                        continue
+                    
+                    # Create spectrum array [Energy, Intensity]
+                    spectrum_np = np.column_stack((energies, pixel_spectrum))
+                    
+                    # Apply processing steps in order
+                    spectrum_processed = spectrum_np.copy()
+                    
+                    # Step 1: Pre-edge slope normalization
+                    if do_pre_edge_norm:
+                        try:
+                            # Find indices for pre-edge normalization range
+                            norm_mask = (energies >= pre_edge_norm_range[0]) & (energies <= pre_edge_norm_range[1])
+                            if np.sum(norm_mask) < 2:
+                                raise ValueError("Not enough points for pre-edge normalization")
+                            
+                            # Fit line to pre-edge region
+                            slope, intercept, r_value, p_value, std_err = linregress(
+                                energies[norm_mask], pixel_spectrum[norm_mask])
+                            
+                            # Store slope and intercept
+                            processing_stats['pre_edge_slopes'][y, x] = slope
+                            processing_stats['pre_edge_intercepts'][y, x] = intercept
+                            
+                            # Calculate fitted line for all energies and normalize
+                            line_values = slope * energies + intercept
+                            epsilon = 1e-10
+                            spectrum_processed[:, 1] = spectrum_processed[:, 1] / (line_values + epsilon)
+                            
+                        except Exception as e:
+                            # If slope normalization fails, skip this pixel
+                            pixels_failed += 1
+                            continue
+                    
+                    # Step 2: Pre-edge background subtraction
+                    if do_pre_edge_sub:
+                        try:
+                            # Find indices for pre-edge subtraction range
+                            sub_mask = (energies >= pre_edge_sub_range[0]) & (energies <= pre_edge_sub_range[1])
+                            if np.sum(sub_mask) < 1:
+                                raise ValueError("No points in pre-edge subtraction range")
+                            
+                            # Calculate pre-edge value and subtract
+                            pre_edge_value = np.mean(spectrum_processed[sub_mask, 1])
+                            processing_stats['pre_edge_values'][y, x] = pre_edge_value
+                            spectrum_processed[:, 1] = spectrum_processed[:, 1] - pre_edge_value
+                            
+                        except Exception as e:
+                            pixels_failed += 1
+                            continue
+                    
+                    # Step 3: Post-edge normalization
+                    if do_post_edge_norm:
+                        try:
+                            # Find indices for post-edge range
+                            post_mask = (energies >= post_edge_range[0]) & (energies <= post_edge_range[1])
+                            if np.sum(post_mask) < 1:
+                                raise ValueError("No points in post-edge range")
+                            
+                            # Calculate post-edge value and normalize
+                            post_edge_value = np.mean(spectrum_processed[post_mask, 1])
+                            processing_stats['post_edge_values'][y, x] = post_edge_value
+                            
+                            epsilon = 1e-10
+                            spectrum_processed[:, 1] = spectrum_processed[:, 1] / (post_edge_value + epsilon)
+                            
+                        except Exception as e:
+                            pixels_failed += 1
+                            continue
+                    
+                    # Store processed spectrum back to datacube
+                    processed_data[:, y, x] = spectrum_processed[:, 1]
+                    processing_stats['valid_pixels'][y, x] = True
+                    pixels_processed += 1
+                    
+                except Exception as e:
+                    pixels_failed += 1
+                    continue
+        
+        print(f"Processing complete: {pixels_processed:,} pixels processed, {pixels_failed:,} pixels failed")
+        
+        # Store processing information
+        processing_info = {
+            'pre_edge_norm_range': pre_edge_norm_range,
+            'pre_edge_sub_range': pre_edge_sub_range,
+            'post_edge_range': post_edge_range,
+            'do_pre_edge_norm': do_pre_edge_norm,
+            'do_pre_edge_sub': do_pre_edge_sub,
+            'do_post_edge_norm': do_post_edge_norm,
+            'pixels_processed': pixels_processed,
+            'pixels_failed': pixels_failed,
+            'processing_stats': processing_stats
+        }
+        
+        # Update attributes
+        processed_data.attrs = self.data.attrs.copy()
+        processed_data.attrs['pixel_by_pixel_processing'] = True
+        processed_data.attrs['processing_steps'] = f"norm:{do_pre_edge_norm}, sub:{do_pre_edge_sub}, post:{do_post_edge_norm}"
+        
+        # Plot comparison if requested
+        if plot_comparison:
+            if comparison_energies is None:
+                # Use 3 evenly spaced energies
+                energy_indices = np.linspace(0, len(energies)-1, 3, dtype=int)
+                comparison_energies = energies[energy_indices]
+            
+            n_energies_plot = len(comparison_energies)
+            fig, axes = plt.subplots(2, n_energies_plot, figsize=(5*n_energies_plot, 10))
+            if n_energies_plot == 1:
+                axes = axes.reshape(2, 1)
+            
+            for i, energy in enumerate(comparison_energies):
+                # Original image
+                orig_slice = self.data.sel(energy=energy, method='nearest')
+                axes[0, i].imshow(orig_slice.values, cmap='viridis', origin='lower')
+                axes[0, i].set_title(f'Original\n{float(orig_slice.energy.values):.2f} eV')
+                axes[0, i].set_xlabel('Pixel X')
+                axes[0, i].set_ylabel('Pixel Y')
+                
+                # Processed image
+                proc_slice = processed_data.sel(energy=energy, method='nearest')
+                im = axes[1, i].imshow(proc_slice.values, cmap='viridis', origin='lower')
+                axes[1, i].set_title(f'Processed\n{float(proc_slice.energy.values):.2f} eV')
+                axes[1, i].set_xlabel('Pixel X')
+                axes[1, i].set_ylabel('Pixel Y')
+                
+                # Add colorbar to each processed image
+                plt.colorbar(im, ax=axes[1, i], fraction=0.046, pad=0.04)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Plot pixel spectrum if requested
+        if plot_pixel_spectrum:
+            if pixel_location is None:
+                pixel_location = (n_x // 2, n_y // 2)  # Center pixel
+            
+            x_pixel, y_pixel = pixel_location
+            
+            if x_pixel >= n_x or y_pixel >= n_y or x_pixel < 0 or y_pixel < 0:
+                print(f"Warning: Pixel location ({x_pixel}, {y_pixel}) is outside image bounds. Using center pixel.")
+                x_pixel, y_pixel = (n_x // 2, n_y // 2)
+            
+            # Extract original and processed spectra for this pixel
+            orig_spectrum = self.data[:, y_pixel, x_pixel].values
+            proc_spectrum = processed_data[:, y_pixel, x_pixel].values
+            
+            # Create processing steps visualization
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            
+            # Original spectrum with processing regions highlighted
+            ax = axes[0, 0]
+            ax.plot(energies, orig_spectrum, 'o-', label='Original', markersize=3)
+            
+            # Highlight processing regions
+            if do_pre_edge_norm:
+                norm_mask = (energies >= pre_edge_norm_range[0]) & (energies <= pre_edge_norm_range[1])
+                ax.axvspan(pre_edge_norm_range[0], pre_edge_norm_range[1], alpha=0.3, color='green', 
+                        label='Pre-edge Norm')
+            if do_pre_edge_sub:
+                sub_mask = (energies >= pre_edge_sub_range[0]) & (energies <= pre_edge_sub_range[1])
+                ax.axvspan(pre_edge_sub_range[0], pre_edge_sub_range[1], alpha=0.3, color='red', 
+                        label='Pre-edge Sub')
+            if do_post_edge_norm:
+                post_mask = (energies >= post_edge_range[0]) & (energies <= post_edge_range[1])
+                ax.axvspan(post_edge_range[0], post_edge_range[1], alpha=0.3, color='purple', 
+                        label='Post-edge Norm')
+            
+            ax.set_title(f'Original Spectrum\nPixel ({x_pixel}, {y_pixel})')
+            ax.set_xlabel('Energy (eV)')
+            ax.set_ylabel('Intensity')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Processed spectrum
+            ax = axes[0, 1]
+            ax.plot(energies, proc_spectrum, 'o-', color='orange', markersize=3)
+            ax.set_title(f'Processed Spectrum\nPixel ({x_pixel}, {y_pixel})')
+            ax.set_xlabel('Energy (eV)')
+            ax.set_ylabel('Processed Intensity')
+            ax.grid(True, alpha=0.3)
+            
+            # Add reference lines
+            if do_post_edge_norm:
+                ax.axhline(y=1, color='purple', linestyle='--', alpha=0.7, label='Post-edge Level')
+            if do_pre_edge_sub:
+                ax.axhline(y=0, color='red', linestyle='--', alpha=0.7, label='Pre-edge Level')
+            ax.legend()
+            
+            # Comparison plot
+            ax = axes[1, 0]
+            ax.plot(energies, orig_spectrum, 'o-', label='Original', markersize=3, alpha=0.7)
+            ax.plot(energies, proc_spectrum, 'o-', label='Processed', markersize=3)
+            ax.set_title('Original vs Processed')
+            ax.set_xlabel('Energy (eV)')
+            ax.set_ylabel('Intensity')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Processing statistics for this pixel
+            ax = axes[1, 1]
+            ax.axis('off')
+            
+            stats_text = f"Processing Statistics for Pixel ({x_pixel}, {y_pixel}):\n\n"
+            if processing_stats['valid_pixels'][y_pixel, x_pixel]:
+                if do_pre_edge_norm:
+                    slope = processing_stats['pre_edge_slopes'][y_pixel, x_pixel]
+                    intercept = processing_stats['pre_edge_intercepts'][y_pixel, x_pixel]
+                    stats_text += f"Pre-edge slope: {slope:.4f}\n"
+                    stats_text += f"Pre-edge intercept: {intercept:.4f}\n"
+                if do_pre_edge_sub:
+                    pre_val = processing_stats['pre_edge_values'][y_pixel, x_pixel]
+                    stats_text += f"Pre-edge value: {pre_val:.4f}\n"
+                if do_post_edge_norm:
+                    post_val = processing_stats['post_edge_values'][y_pixel, x_pixel]
+                    stats_text += f"Post-edge value: {post_val:.4f}\n"
+            else:
+                stats_text += "Processing failed for this pixel"
+            
+            ax.text(0.1, 0.9, stats_text, transform=ax.transAxes, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8), fontsize=10)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Save processed data if requested
+        if save_processed_data:
+            import os
+            if save_path is None:
+                save_path = os.getcwd()
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Save processed datacube as NetCDF
+            processed_filename = f"{save_name}_processed.nc"
+            processed_filepath = os.path.join(save_path, processed_filename)
+            processed_data.to_netcdf(processed_filepath)
+            
+            # Save processing statistics
+            stats_filename = f"{save_name}_processing_stats.npz"
+            stats_filepath = os.path.join(save_path, stats_filename)
+            np.savez_compressed(stats_filepath, **processing_stats)
+            
+            # Save processing info
+            info_filename = f"{save_name}_processing_info.txt"
+            info_filepath = os.path.join(save_path, info_filename)
+            with open(info_filepath, 'w') as f:
+                f.write("Pixel-by-Pixel Processing Information\n")
+                f.write("=" * 50 + "\n")
+                f.write(f"Pre-edge norm range: {pre_edge_norm_range[0]:.3f} - {pre_edge_norm_range[1]:.3f} eV\n")
+                f.write(f"Pre-edge sub range: {pre_edge_sub_range[0]:.3f} - {pre_edge_sub_range[1]:.3f} eV\n")
+                f.write(f"Post-edge range: {post_edge_range[0]:.3f} - {post_edge_range[1]:.3f} eV\n")
+                f.write(f"Pre-edge normalization: {do_pre_edge_norm}\n")
+                f.write(f"Pre-edge subtraction: {do_pre_edge_sub}\n")
+                f.write(f"Post-edge normalization: {do_post_edge_norm}\n")
+                f.write(f"Pixels processed: {pixels_processed:,}\n")
+                f.write(f"Pixels failed: {pixels_failed:,}\n")
+                f.write(f"Success rate: {pixels_processed/(pixels_processed+pixels_failed)*100:.1f}%\n")
+            
+            print(f"Processed data saved to {processed_filepath}")
+            print(f"Processing statistics saved to {stats_filepath}")
+            print(f"Processing info saved to {info_filepath}")
+        
+        return processed_data, processing_info
