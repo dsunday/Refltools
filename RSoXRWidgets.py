@@ -712,37 +712,51 @@ class RSoXRTrimWidget:
     Enhanced to support manually edited groups and background subtraction
     """
     
-    def __init__(self, processor, scan_groups=None, data_directory='.', default_output_dir='trimmed_output'):
+    def __init__(self, processor, scan_groups=None, data_directory='.', default_output_dir='trimmed_output', open_beam=None):
         """
-        Initialize the widget
+        Initialize the widget - UPDATED to handle scan numbers
         
         Parameters:
         -----------
         processor : RSoXRProcessor
             The initialized RSoXR processor instance
         scan_groups : list, optional
-            List of scan groups. If provided, these groups will be used directly.
+            List of scan groups with scan numbers. If provided, these groups will be used directly.
             If None, auto-detect scan groups from data_directory.
         data_directory : str
             Directory containing the data files (used only if scan_groups not provided)
         default_output_dir : str
             Default output directory for saved files
+        open_beam : str, optional
+            Path to open beam file. If provided, will automatically load open beam data
         """
         self.processor = processor
         self.data_directory = data_directory
         self.default_output_dir = default_output_dir
         
         if scan_groups is None:
-            # Auto-detect scan groups if not provided
-            self.scan_groups = self.processor.auto_group_scans(
-                data_directory=data_directory, 
-                save_table=False
-            )
+            # Auto-detect scan groups if not provided (with new scan numbering)
+            # Try the new method first, fall back to old method if not available
+            if hasattr(processor, 'auto_group_scans_with_numbers'):
+                self.scan_groups = self.processor.auto_group_scans_with_numbers(
+                    data_directory=data_directory, 
+                    save_table=False
+                )
+            else:
+                # Fall back to old method and add scan numbers
+                self.scan_groups = self.processor.auto_group_scans(
+                    data_directory=data_directory, 
+                    save_table=False
+                )
+                self._add_scan_numbers_to_groups()
             self.groups_source = "autoscan"
         else:
-            # Use provided groups (assumed to be manually edited)
+            # Use provided groups (assumed to be manually edited with scan numbers)
             self.scan_groups = scan_groups
             self.groups_source = "provided"
+        
+        # Validate that scan groups have scan_numbers field
+        self._validate_scan_numbers()
         
         # Set default trim values to min and max points of each section
         self._set_default_trim_values()
@@ -769,6 +783,41 @@ class RSoXRTrimWidget:
         
         # Create the widget UI
         self._create_widgets()
+        
+        # Load open beam data if provided
+        if open_beam is not None:
+            self._load_open_beam_on_init(open_beam)
+            
+        # Generate initial stitching preview after everything is set up
+        if self.scan_groups and len(self.scan_groups) > 0:
+            # Small delay to ensure UI is fully rendered
+            import threading
+            def delayed_preview():
+                import time
+                time.sleep(0.1)  # Brief delay
+                self._auto_preview_stitching()
+            
+            thread = threading.Thread(target=delayed_preview)
+            thread.daemon = True
+            thread.start()
+
+    def _validate_scan_numbers(self):
+        """NEW: Ensure all groups have scan_numbers field"""
+        for group_idx, group in enumerate(self.scan_groups):
+            if 'scan_numbers' not in group:
+                # Generate scan numbers if missing
+                print(f"Warning: Group {group_idx+1} missing scan_numbers. Generating...")
+                group['scan_numbers'] = list(range(1, len(group['files']) + 1))
+
+    def _add_scan_numbers_to_groups(self):
+        """NEW: Add scan numbers to groups that don't have them (for backward compatibility)"""
+        scan_counter = 1
+        for group in self.scan_groups:
+            if 'scan_numbers' not in group:
+                group['scan_numbers'] = []
+                for _ in group['files']:
+                    group['scan_numbers'].append(scan_counter)
+                    scan_counter += 1
     
     def _set_default_trim_values(self):
         """
@@ -784,21 +833,26 @@ class RSoXRTrimWidget:
         # Select group widget
         group_options = []
         for i, group in enumerate(self.scan_groups):
-            group_options.append(f"{i+1}: {group['sample_name']} ({group['energy']:.1f} eV)")
+            scan_count = len(group['scan_numbers'])
+            if scan_count > 1:
+                scan_range = f"Scans {min(group['scan_numbers'])}-{max(group['scan_numbers'])}"
+            else:
+                scan_range = f"Scan {group['scan_numbers'][0]}"
+            group_options.append(f"Group {i+1}: {group['sample_name']} ({group['energy']:.1f} eV) - {scan_range}")
         
         self.group_select = widgets.Dropdown(
             options=group_options,
             description='Group:',
             disabled=False,
-            layout=widgets.Layout(width='50%')
+            layout=widgets.Layout(width='80%')
         )
         
-        # Select file within group widget
+        # Select file within group widget - Updated to show scan numbers
         self.file_select = widgets.Dropdown(
             options=[],
-            description='File:',
+            description='Scan:',
             disabled=False,
-            layout=widgets.Layout(width='50%')
+            layout=widgets.Layout(width='80%')
         )
         
         # Trim start and end value display with manual adjustment
@@ -861,7 +915,7 @@ class RSoXRTrimWidget:
         
         # Reset button for current file
         self.reset_file_button = widgets.Button(
-            description='Reset This File',
+            description='Reset This Scan',
             disabled=False,
             button_style='warning',
             tooltip='Reset trims and background for the current file',
@@ -907,7 +961,7 @@ class RSoXRTrimWidget:
         # Processing options
         self.normalize_checkbox = widgets.Checkbox(
             value=True,
-            description='Normalize',
+            description='Normalize to Open Beam',
             disabled=False
         )
         
@@ -999,10 +1053,12 @@ class RSoXRTrimWidget:
             tooltip='Show effect of background subtraction in plots'
         )
         
-        # Group source info
+         # Group source info - Updated to show scan numbering information
+        total_scans = sum(len(g['scan_numbers']) for g in self.scan_groups) if self.scan_groups else 0
+        scan_range_info = f"Scan numbers: 1-{total_scans}" if total_scans > 0 else "No scans"
         group_source_text = "✓ Using provided scan groups (manually edited)" if self.groups_source == "provided" else "Using autoscanned groups"
         self.group_source_info = widgets.HTML(
-            value=f"<i style='color:#666;'>{group_source_text} | Total groups: {len(self.scan_groups)}</i>",
+            value=f"<i style='color:#666;'>{group_source_text} | Total groups: {len(self.scan_groups)} | {scan_range_info}</i>",
             layout=widgets.Layout(width='100%')
         )
         
@@ -1053,6 +1109,7 @@ class RSoXRTrimWidget:
             self.save_button
         ])
         
+        
         # Output area
         self.output_area = widgets.Output()
         
@@ -1101,10 +1158,10 @@ class RSoXRTrimWidget:
         return corrected_data
     
     def _on_apply_background(self, b):
-        """Apply manually entered background value"""
+        """UPDATED: Apply manually entered background value with correct indexing"""
         # Get current indices
         group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
         
         file_str = self.file_select.value
         file_idx = int(file_str.split(':')[0]) - 1
@@ -1133,41 +1190,59 @@ class RSoXRTrimWidget:
                 self.current_group_data.append(None)
     
     def _on_group_change(self, change):
-        """Handle group selection change"""
-        # Extract group index from selection string (format: "1: name (energy eV)")
+        """UPDATED: Handle group selection change with scan numbers"""
         group_str = change['new']
-        group_idx = int(group_str.split(':')[0]) - 1
+        # Extract group number from "Group X: ..." format
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1
         
-        # Update file selection dropdown with files from this group
+        group = self.scan_groups[group_idx]
+        energy = group['energy']
+        
+        # Check if energy is within open beam range and warn if not
+        is_within_range, min_energy, max_energy, distance = self._check_open_beam_energy_range(energy)
+        
+        # Update file dropdown with scan numbers
         file_options = []
-        for i, filename in enumerate(self.scan_groups[group_idx]['files']):
-            # Get detector type if available
-            detector_type = ""
-            if group_idx < len(self.scan_groups) and i < len(self.scan_groups[group_idx]['metadata']):
-                metadata = self.scan_groups[group_idx]['metadata'][i]
-                if metadata and 'detector' in metadata:
-                    detector_type = f" ({metadata['detector']})"
-            
-            file_options.append(f"{i+1}: {os.path.basename(filename)}{detector_type}")
+        for i, (filename, scan_num) in enumerate(zip(group['files'], group['scan_numbers'])):
+            file_options.append(f"{i+1}: Scan {scan_num} - {os.path.basename(filename)}")
         
         self.file_select.options = file_options
+        self.file_select.value = file_options[0] if file_options else ""
         
-        # Clear current data
+        # Clear current data to force reload
         self.current_data = None
         self.current_group_data = None
         
-        # Select the first file
+        # Update group source info if it exists
+        if hasattr(self, 'group_source_info'):
+            total_scans = sum(len(g['scan_numbers']) for g in self.scan_groups)
+            scan_range_info = f"Scan numbers: 1-{total_scans}" if total_scans > 0 else "No scans"
+            group_source_text = "✓ Using provided scan groups (manually edited)" if self.groups_source == "provided" else "Using autoscanned groups"
+            total_files = sum(len(g['files']) for g in self.scan_groups)
+            self.group_source_info.value = f"<i style='color:#666;'>{group_source_text} | Groups: {len(self.scan_groups)} | {scan_range_info} | Files: {total_files}</i>"
+        
+        # Display energy range warning if needed (BEFORE loading files and preview)
+        if not is_within_range and min_energy is not None:
+            with self.output_area:
+                clear_output(wait=True)
+                self._display_energy_range_warning(energy, min_energy, max_energy, distance)
+        
+        # Load the first file to display
         if file_options:
-            self.file_select.value = file_options[0]
+            self._on_file_change({'new': file_options[0]})
+        
+        # Auto-generate stitching preview for the new group
+        if getattr(self, 'auto_preview', True):
+            self._auto_preview_stitching()
 
     def _on_file_change(self, change):
-        """Handle file selection change"""
+        """UPDATED: Handle file selection change with scan numbers"""
         # Clear current data to force reload
         self.current_data = None
         
         # Extract indices from selection strings
         group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
         
         file_str = self.file_select.value
         file_idx = int(file_str.split(':')[0]) - 1
@@ -1179,6 +1254,8 @@ class RSoXRTrimWidget:
         
         # Load data for visualization
         filename = self.scan_groups[group_idx]['files'][file_idx]
+        scan_number = self.scan_groups[group_idx]['scan_numbers'][file_idx]
+        
         try:
             self.current_data = self.processor.load_data_file(filename)
         except Exception as e:
@@ -1199,11 +1276,11 @@ class RSoXRTrimWidget:
         # Update background display
         self.background_value.value = current_background
         
-        # Update trim info display
+        # Update trim info display with scan number
         if current_trim != original_trim:
             self.trim_info.value = f"<span style='color:orange'>Modified: Original trim was {original_trim}</span>"
         else:
-            self.trim_info.value = ""
+            self.trim_info.value = f"<span style='color:green'>Scan #{scan_number}</span>"
         
         # Update background info display
         if current_background != 0.0:
@@ -1215,16 +1292,17 @@ class RSoXRTrimWidget:
         self._plot_current_file()
     
     def _plot_current_file(self):
-        """Plot the currently selected file with trim indicators and background subtraction"""
+        """UPDATED: Plot the currently selected file with scan number in title"""
         # Get the selected indices
         group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
         
         file_str = self.file_select.value
         file_idx = int(file_str.split(':')[0]) - 1
         
-        # Get the filename and load the data if not already loaded
+        # Get the filename and scan number
         filename = self.scan_groups[group_idx]['files'][file_idx]
+        scan_number = self.scan_groups[group_idx]['scan_numbers'][file_idx]
         if self.current_data is None:
             try:
                 self.current_data = self.processor.load_data_file(filename)
@@ -1287,7 +1365,7 @@ class RSoXRTrimWidget:
             # Add labels and title
             ax.set_xlabel('Angle (degrees)')
             ax.set_ylabel('Intensity')
-            ax.set_title(f"File: {os.path.basename(filename)}")
+            ax.set_title(f"Scan #{scan_number}: {os.path.basename(filename)}")
             
             # Add trim and background info to the plot
             info_text = f"Trim: [{trim_start}, {trim_end if trim_end != -1 else 'end'}]"
@@ -1311,11 +1389,11 @@ class RSoXRTrimWidget:
         """Apply manually entered trim values"""
         # Get current indices
         group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
         
         file_str = self.file_select.value
         file_idx = int(file_str.split(':')[0]) - 1
-        
+            
         # Get the manually entered values
         start_trim = self.trim_start_display.value
         end_trim = self.trim_end_display.value
@@ -1348,13 +1426,16 @@ class RSoXRTrimWidget:
         print(f"Applied trim: [{start_trim}, {end_trim if end_trim != -1 else 'end'}]")
     
     def _on_reset_file(self, b):
-        """Reset trim and background for the current file to original values"""
+        """UPDATED: Reset trim and background for the current file with scan number reference"""
         # Get current indices
         group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
         
         file_str = self.file_select.value
         file_idx = int(file_str.split(':')[0]) - 1
+        
+        # Get scan number for display
+        scan_number = self.scan_groups[group_idx]['scan_numbers'][file_idx]
         
         # Reset to original trim and clear background
         self.current_trims[group_idx][file_idx] = self.original_trims[group_idx][file_idx]
@@ -1364,15 +1445,15 @@ class RSoXRTrimWidget:
         self._on_file_change({'new': self.file_select.value})
         
         with self.output_area:
-            print(f"Reset trim values for file {file_idx+1} to original: {self.original_trims[group_idx][file_idx]}")
+            print(f"Reset trim values for scan #{scan_number} to original: {self.original_trims[group_idx][file_idx]}")
             print(f"Reset background to 0.0")
     
     def _on_reset_group(self, b):
-        """Reset all trims and backgrounds for the current group to original values"""
+        """UPDATED: Reset all trims and backgrounds for the current group with correct indexing"""
         # Get current group index
         group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
-        
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
+            
         # Reset to original trims and clear backgrounds
         self.current_trims[group_idx] = deepcopy(self.original_trims[group_idx])
         self.current_backgrounds[group_idx] = [0.0] * len(self.scan_groups[group_idx]['files'])
@@ -1385,139 +1466,238 @@ class RSoXRTrimWidget:
             print(f"Reset all trim values for group {group_idx+1} to original values")
             print(f"Reset all background values to 0.0")
             print("Use the 'Preview Stitching' button to see how the original values affect the stitching.")
+            
+    def _auto_preview_stitching(self):
+        """Automatically show stitching preview (called on group change)"""
+        # Only auto-preview if we have valid data
+        try:
+            if hasattr(self, 'group_select') and self.group_select.value:
+                print("Auto-generating stitching preview...")
+                self._on_preview_stitching(None)  # Pass None since we don't have a button event
+        except Exception as e:
+            print(f"Auto-preview failed: {str(e)}")
 
     def _on_preview_stitching(self, b):
         """Preview the stitching between different scans with current trim and background values"""
-        # Get current group
-        group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
-        
-        group = self.scan_groups[group_idx]
-        energy = group['energy']
-        
-        # Ensure all data is loaded
-        if not self.current_group_data or any(data is None for data in self.current_group_data):
-            self._load_group_data(group_idx)
-        
-        # Prepare trimmed and background-corrected data
-        scans = []
-        for i, data in enumerate(self.current_group_data):
-            if data is None:
-                print(f"Warning: Data for scan {i+1} is not available")
-                continue
-                
-            # Apply current trim
-            trim_start, trim_end = self.current_trims[group_idx][i]
-            end_idx = len(data) + trim_end if trim_end < 0 else trim_end
-            trimmed_data = data[trim_start:end_idx]
+        try:
+            # Get current group
+            group_str = self.group_select.value
+            group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
             
-            # Apply background subtraction
-            background_value = self.current_backgrounds[group_idx][i]
-            if background_value != 0.0:
-                trimmed_data = self._apply_background_subtraction(trimmed_data, background_value)
+            group = self.scan_groups[group_idx]
+            energy = group['energy']
             
-            # Remove zeros if requested
-            if self.remove_zeros_checkbox.value:
-                non_zero_mask = trimmed_data[:, 1] > 0
-                if not all(non_zero_mask):
-                    print(f"Removing {len(trimmed_data) - np.sum(non_zero_mask)} zero points from scan {i+1}")
-                    trimmed_data = trimmed_data[non_zero_mask]
+            # Check energy range first
+            is_within_range, min_energy, max_energy, distance = self._check_open_beam_energy_range(energy)
             
-            scans.append(trimmed_data)
-        
-        # Preview the stitching
-        with self.output_area:
-            clear_output(wait=True)
+            # Ensure all data is loaded
+            if not self.current_group_data or any(data is None for data in self.current_group_data):
+                self._load_group_data(group_idx)
             
-            if len(scans) == 0:
-                print("No valid scans found for preview")
+            # Check if we have valid data
+            if not self.current_group_data:
+                with self.output_area:
+                    clear_output(wait=True)
+                    print("Error: No data loaded for current group. Please select a valid group.")
                 return
-                
-            # Create side-by-side plots
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
             
-            # Left plot: individual scans
-            for i, scan in enumerate(scans):
-                if len(scan) > 0:
-                    ax1.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
-                            color=f'C{i}', label=f'Scan {i+1}')
+            # Check if open beam normalization is available (simplified logic)
+            use_open_beam = (hasattr(self.processor, 'open_beam_data') and 
+                            self.processor.open_beam_data is not None and
+                            len(self.processor.open_beam_data) > 0)
             
-            # Right plot: stitched preview with scaling
-            combined = np.array([]).reshape(0, 2)
+            open_beam_intensity = None
+            if use_open_beam:
+                open_beam_intensity = self.processor.get_open_beam_intensity(energy)
             
-            for i, scan in enumerate(scans):
-                if len(scan) == 0:
+            # Prepare trimmed and background-corrected data
+            # Prepare trimmed and background-corrected data with scan labels
+            raw_scans = []  # For left plot (no open beam correction)
+            scans = []      # For right plot (with open beam correction if available)
+            scan_labels = []  # Store scan numbers for labels
+            
+            for i, data in enumerate(self.current_group_data):
+                if data is None:
+                    print(f"Warning: Data for scan {i+1} is not available")
                     continue
                     
-                # Store original scan for comparison
-                orig_scan = scan.copy()
+                # Get scan number for labeling
+                scan_number = group['scan_numbers'][i]
+                    
+                # Apply current trim
+                trim_start, trim_end = self.current_trims[group_idx][i]
+                end_idx = len(data) + trim_end if trim_end < 0 else trim_end
+                trimmed_data = data[trim_start:end_idx].copy()  # Make a copy to avoid modifying original
                 
-                if len(combined) > 0:
-                    # Find overlap region and calculate scaling factor
-                    overlap_angles = scan[:, 0]
-                    overlap_mask = (overlap_angles >= combined[:, 0].min()) & (overlap_angles <= combined[:, 0].max())
+                # Apply background subtraction
+                background_value = self.current_backgrounds[group_idx][i]
+                if background_value != 0.0:
+                    trimmed_data = self._apply_background_subtraction(trimmed_data, background_value)
+                
+                # Create raw scan data (without open beam correction) for left plot
+                raw_scan_data = trimmed_data.copy()
+                
+                # Apply open beam normalization if available (only for stitching preview)
+                if use_open_beam and open_beam_intensity is not None and open_beam_intensity > 0:
+                    trimmed_data[:, 1] = trimmed_data[:, 1] / open_beam_intensity
+                
+                # Remove zeros if requested (apply to both datasets)
+                if self.remove_zeros_checkbox.value:
+                    non_zero_mask = trimmed_data[:, 1] > 0
+                    raw_non_zero_mask = raw_scan_data[:, 1] > 0
                     
-                    if np.any(overlap_mask):
-                        # Simple scaling based on median ratio in overlap region
-                        overlap_scan = scan[overlap_mask]
-                        overlap_combined_interp = np.interp(overlap_scan[:, 0], combined[:, 0], combined[:, 1])
-                        valid_ratios = overlap_combined_interp / overlap_scan[:, 1]
-                        valid_ratios = valid_ratios[np.isfinite(valid_ratios) & (valid_ratios > 0)]
+                    if not all(non_zero_mask):
+                        print(f"Removing {len(trimmed_data) - np.sum(non_zero_mask)} zero points from scan {i+1}")
+                        trimmed_data = trimmed_data[non_zero_mask]
+                    
+                    if not all(raw_non_zero_mask):
+                        raw_scan_data = raw_scan_data[raw_non_zero_mask]
+                
+                if len(trimmed_data) > 0:  # Only add non-empty scans
+                    scans.append(trimmed_data)
+                    raw_scans.append(raw_scan_data)
+                    scan_labels.append(f'Scan #{scan_number}')
+            
+            # Preview the stitching
+            with self.output_area:
+                clear_output(wait=True)
+                
+                # Display energy warning if applicable
+                if not is_within_range and min_energy is not None:
+                    self._display_energy_range_warning(energy, min_energy, max_energy, distance)
+                
+                if len(scans) == 0:
+                    print("Error: No valid scan data available for stitching preview.")
+                    return
+                
+                print(f"Generating stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.1f} eV")
+                
+                # Print open beam information (enhanced with range warning)
+                if use_open_beam and open_beam_intensity is not None:
+                    status = "APPLIED" if is_within_range else "APPLIED (EXTRAPOLATED)"
+                    print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} ({status})")
+                    if not is_within_range:
+                        print(f"⚠️  WARNING: Using extrapolation - energy is {distance:.1f} eV outside open beam range!")
+                else:
+                    print("Open beam normalization not available")
+                
+                # Create figure with two subplots
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+                
+                # Left plot: Raw scans (trimmed and background corrected, NO open beam correction)
+                for i, raw_scan in enumerate(raw_scans):
+                    if len(raw_scan) > 0:
+                        ax1.plot(raw_scan[:, 0], raw_scan[:, 1], marker='o', linestyle='-', 
+                                color=f'C{i}', label=f'Scan {i+1}', markersize=3)
+                
+                # Right plot: Stitching preview with scaling
+                combined = np.empty((0, 2))
+                
+                for i, scan in enumerate(scans):
+                    if len(scan) == 0:
+                        continue
                         
-                        if len(valid_ratios) > 0:
-                            scale = np.median(valid_ratios)
-                        else:
-                            scale = 1.0
+                    if i == 0:
+                        # First scan doesn't need scaling
+                        ax2.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
+                                color=f'C{i}', label=f'Scan {i+1}', markersize=3)
+                        combined = scan.copy()
                     else:
-                        scale = 1.0
+                        # Find overlapping region and calculate scaling factor
+                        prev_max_angle = combined[:, 0].max()
+                        curr_min_angle = scan[:, 0].min()
                         
-                    print(f"Scan {i+1}: scaling factor = {scale:.3f}")
+                        # Store original data for plotting
+                        orig_scan = scan.copy()
+                        
+                        # Calculate scaling factor if there's overlap
+                        scale = 1.0
+                        if curr_min_angle <= prev_max_angle:
+                            # There's overlap - calculate scaling factor
+                            overlap_mask_combined = combined[:, 0] >= curr_min_angle
+                            overlap_mask_scan = scan[:, 0] <= prev_max_angle
+                            
+                            if np.any(overlap_mask_combined) and np.any(overlap_mask_scan):
+                                overlap_combined = combined[overlap_mask_combined]
+                                overlap_scan = scan[overlap_mask_scan]
+                                
+                                if len(overlap_combined) > 0 and len(overlap_scan) > 0:
+                                    # Use median ratio for robust scaling
+                                    ratios = []
+                                    for angle in overlap_scan[:, 0]:
+                                        # Find closest angle in combined data
+                                        idx = np.argmin(np.abs(overlap_combined[:, 0] - angle))
+                                        scan_idx = np.argmin(np.abs(overlap_scan[:, 0] - angle))
+                                        if (overlap_combined[idx, 1] > 0 and 
+                                            overlap_scan[scan_idx, 1] > 0):  # Avoid division by zero
+                                            ratios.append(overlap_combined[idx, 1] / overlap_scan[scan_idx, 1])
+                                    
+                                    if len(ratios) > 0:
+                                        scale = np.median(ratios)
+                        
+                        print(f"Scan {i+1}: scaling factor = {scale:.3f}")
+                        
+                        # Apply scaling
+                        scan[:, 1] = scan[:, 1] * scale
+                        
+                        # Plot the unscaled data (dashed line)
+                        ax2.plot(orig_scan[:, 0], orig_scan[:, 1], marker='', linestyle='--', 
+                                color=f'C{i}', alpha=0.4, label=f'Scan {i+1} (Unscaled)')
+                        
+                        # Plot the scaled data
+                        ax2.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
+                                color=f'C{i}', label=f'Scan {i+1} (Scaled)', markersize=3)
+                        
+                        # Concatenate with existing data
+                        combined = np.concatenate((combined, scan))
+                
+                # Set y-scale based on checkbox
+                if self.log_scale_checkbox.value:
+                    ax1.set_yscale('log')
+                    ax2.set_yscale('log')
+                else:
+                    ax1.set_yscale('linear')
+                    ax2.set_yscale('linear')
+                
+                # Set labels and titles
+                ax1.set_xlabel('Angle (degrees)')
+                ax1.set_ylabel('Intensity')  # Raw scans always show raw intensity
+                ax1.set_title(f'Raw Scans (Trimmed & BG Corrected) - {energy:.1f} eV')
+                ax1.legend()
+                ax1.grid(True, which="both", ls="--", alpha=0.3)
+                
+                ax2.set_xlabel('Angle (degrees)')
+                ax2.set_ylabel('Intensity' + (' / I₀' if use_open_beam else ''))
+                title_suffix = ' (Open Beam Corrected)' if use_open_beam else ''
+                if not is_within_range and use_open_beam:
+                    title_suffix += ' ⚠️ EXTRAPOLATED'
+                ax2.set_title(f'Stitching Preview{title_suffix} - {energy:.1f} eV')
+                ax2.legend()
+                ax2.grid(True, which="both", ls="--", alpha=0.3)
+                
+                plt.tight_layout()
+                plt.show()
+                
+                print("Stitching preview complete!")
+                if use_open_beam:
+                    if is_within_range:
+                        print("Open beam normalization has been applied to the preview data.")
+                    else:
+                        print("⚠️  Open beam normalization applied using EXTRAPOLATION - results may be unreliable!")
+                print("Overlapping regions are highlighted in the right plot.")
+                print("Dotted lines show unscaled data, solid lines show scaled data.")
+                print("Background subtraction has been applied where specified.")
+                print("To adjust the overlap regions, modify the trim values for each file.")
+                print("Note: This is only a preview. Click 'Process Group' to apply the final processing.")
+        
+        except Exception as e:
+            with self.output_area:
+                clear_output(wait=True)
+                print(f"Error generating stitching preview: {str(e)}")
+                import traceback
+                traceback.print_exc()
                     
-                    # Apply scaling
-                    scan[:, 1] = scan[:, 1] * scale
-                    
-                    # Plot the unscaled data (dashed line)
-                    ax2.plot(orig_scan[:, 0], orig_scan[:, 1], marker='', linestyle='--', 
-                            color=f'C{i}', alpha=0.4, label=f'Scan {i+1} (Unscaled)')
-                    
-                    # Plot the scaled data
-                    ax2.plot(scan[:, 0], scan[:, 1], marker='o', linestyle='-', 
-                            color=f'C{i}', label=f'Scan {i+1} (Scaled)')
-                    
-                    # Concatenate with existing data
-                    combined = np.concatenate((combined, scan))
-            
-            # Set y-scale based on checkbox
-            if self.log_scale_checkbox.value:
-                ax1.set_yscale('log')
-                ax2.set_yscale('log')
-            else:
-                ax1.set_yscale('linear')
-                ax2.set_yscale('linear')
-            
-            # Set labels and titles
-            ax1.set_xlabel('Angle (degrees)')
-            ax1.set_ylabel('Intensity')
-            ax1.set_title(f'Raw Scans (Trimmed & Background Corrected) - {energy:.1f} eV')
-            ax1.legend()
-            ax1.grid(True, which="both", ls="--", alpha=0.3)
-            
-            ax2.set_xlabel('Angle (degrees)')
-            ax2.set_ylabel('Intensity')
-            ax2.set_title(f'Stitching Preview - {energy:.1f} eV')
-            ax2.legend()
-            ax2.grid(True, which="both", ls="--", alpha=0.3)
-            
-            plt.tight_layout()
-            plt.show()
-            
-            print(f"Stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.1f} eV")
-            print("Overlapping regions are highlighted in the right plot.")
-            print("Dotted lines show unscaled data, solid lines show scaled data.")
-            print("Background subtraction has been applied where specified.")
-            print("To adjust the overlap regions, modify the trim values for each file.")
-            print("Note: This is only a preview. Click 'Process Group' to apply the final processing.")
-    
+                
     def _validate_smoothing_params(self):
         """Validate smoothing parameters and adjust if necessary"""
         window = self.smoothing_window.value
@@ -1563,7 +1743,7 @@ class RSoXRTrimWidget:
             
             # Apply trimming first
             group_str = self.group_select.value
-            group_idx = int(group_str.split(':')[0]) - 1
+            group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
             file_str = self.file_select.value
             file_idx = int(file_str.split(':')[0]) - 1
             trim_start, trim_end = self.current_trims[group_idx][file_idx]
@@ -1606,9 +1786,12 @@ class RSoXRTrimWidget:
                 else:
                     ax.set_yscale('linear')
                 
+                # Get scan number for title
+                scan_number = self.scan_groups[group_idx]['scan_numbers'][file_idx]
+                
                 ax.set_xlabel('Angle (degrees)')
                 ax.set_ylabel('Intensity')
-                ax.set_title('Smoothing Preview')
+                ax.set_title(f'Smoothing Preview - Scan #{scan_number}')
                 ax.legend()
                 ax.grid(True, linestyle='--', alpha=0.7)
                 
@@ -1623,12 +1806,11 @@ class RSoXRTrimWidget:
         except Exception as e:
             print(f"Error previewing smoothing: {str(e)}")
             print("Tip: Try adjusting the window size or polynomial order.")
-    
     def _on_process_group(self, b):
-        """Process the current group with current trim and background settings"""
+        """UPDATED: Process the current group with scan number references and consistent open beam handling"""
         # Get current group index
         group_str = self.group_select.value
-        group_idx = int(group_str.split(':')[0]) - 1
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
         
         # Get the current group
         group = deepcopy(self.scan_groups[group_idx])
@@ -1649,21 +1831,127 @@ class RSoXRTrimWidget:
         else:
             window_size, polynomial_order = None, 2
         
+        # Check if open beam normalization is available and enabled
+        use_open_beam = (hasattr(self.processor, 'open_beam_data') and 
+                        self.processor.open_beam_data is not None and
+                        len(self.processor.open_beam_data) > 0 and
+                        getattr(self.processor, 'use_open_beam_normalization', False))
+        
         # Process the group with current settings
         with self.output_area:
             clear_output(wait=True)
             print(f"Processing group {group_idx+1}: {group['sample_name']} at {group['energy']:.1f} eV")
+            print(f"Scan numbers: {', '.join(f'#{num}' for num in group['scan_numbers'])}")
             print(f"Using trims: {group['trims']}")
             print(f"Using backgrounds: {group['backgrounds']}")
             print(f"Output directory: {output_dir}")
+            
+            # Print normalization info
+            if self.normalize_checkbox.value:
+                if use_open_beam:
+                    open_beam_intensity = self.processor.get_open_beam_intensity(group['energy'])
+                    print(f"Open beam normalization: ENABLED (I₀ = {open_beam_intensity:.3e})")
+                else:
+                    print("Standard normalization: ENABLED")
+            else:
+                print("Normalization: DISABLED")
             
             try:
                 # Generate output filename
                 output_filename = f"{group['sample_name']}_{group['energy']:.1f}eV.dat"
                 
-                # Check if the processor has the updated method
-                if hasattr(self.processor, 'reduce_data_with_background'):
-                    # Use the updated processor with background subtraction support
+                # Check if the processor has the enhanced open beam method
+                if hasattr(self.processor, 'process_scan_set_with_open_beam_option'):
+                    # Use the enhanced processor with explicit open beam support
+                    result = self.processor.process_scan_set_with_open_beam_option(
+                        scan_group=group,
+                        output_filename=output_filename,
+                        normalize=self.normalize_checkbox.value,
+                        plot=True,
+                        convert_to_photons=self.convert_photons_checkbox.value,
+                        smooth_data=self.smooth_checkbox.value,
+                        savgol_window=window_size,
+                        savgol_order=polynomial_order,
+                        remove_zeros=self.remove_zeros_checkbox.value,
+                        estimate_thickness=False,  # Disabled thickness estimation
+                        output_dir=output_dir,
+                        use_open_beam=use_open_beam  # Explicitly pass open beam setting
+                    )
+                    
+                    print("\nProcessing completed successfully with explicit open beam handling!")
+                    print(f"Data saved to {os.path.join(output_dir, output_filename)}")
+                    
+                elif hasattr(self.processor, 'reduce_data_with_open_beam_option'):
+                    # Use the enhanced reduce_data method directly with plotting
+                    print("\nUsing enhanced reduce_data method with open beam support...")
+                    
+                    # Load and process data manually to ensure consistency
+                    scans = []
+                    for filename in group['files']:
+                        try:
+                            data = self.processor.load_data_file(filename)
+                            scans.append(data)
+                        except Exception as e:
+                            print(f"Error loading {os.path.basename(filename)}: {str(e)}")
+                            continue
+                    
+                    if not scans:
+                        print("Error: No valid scan data loaded")
+                        return
+                    
+                    # Process using the enhanced method WITH PLOTTING ENABLED
+                    result = self.processor.reduce_data_with_open_beam_option(
+                        scans=scans,
+                        trims=group['trims'],
+                        backgrounds=group['backgrounds'],
+                        energy=group['energy'],
+                        normalize=self.normalize_checkbox.value,
+                        plot=True,  # IMPORTANT: Enable plotting
+                        convert_to_photons=self.convert_photons_checkbox.value,
+                        smooth_data=self.smooth_checkbox.value,
+                        savgol_window=window_size,
+                        savgol_order=polynomial_order,
+                        remove_zeros=self.remove_zeros_checkbox.value,
+                        output_dir=output_dir,
+                        plot_prefix=f"{group['sample_name']}_{group['energy']:.1f}eV",
+                        use_open_beam=use_open_beam  # Explicitly control open beam
+                    )
+                    
+                    if result is not None:
+                        # Save the data manually
+                        output_path = os.path.join(output_dir, output_filename)
+                        
+                        # Handle tuple result (smoothed, raw)
+                        if isinstance(result, tuple) and self.smooth_checkbox.value:
+                            data_to_save = result[0]  # Use smoothed data
+                        else:
+                            data_to_save = result
+                        
+                        # Create header with processing info
+                        header = f"# Processed RSoXR data\n# Sample: {group['sample_name']}\n# Energy: {group['energy']:.1f} eV"
+                        header += f"\n# Normalization: {'Open Beam' if use_open_beam else 'Standard'}"
+                        if use_open_beam:
+                            open_beam_intensity = self.processor.get_open_beam_intensity(group['energy'])
+                            header += f"\n# Open beam I0: {open_beam_intensity:.3e}"
+                        header += "\n# Columns: Angle(deg), Reflectivity"
+                        
+                        # Add background information to header
+                        bg_info = [f"Scan #{scan_num}: -{bg:.3f}" for scan_num, bg in zip(group['scan_numbers'], group['backgrounds']) if bg != 0.0]
+                        if bg_info:
+                            header += f"\n# Background subtractions: {', '.join(bg_info)}"
+                        
+                        np.savetxt(output_path, data_to_save, delimiter='\t', 
+                                header=header, fmt='%.6e')
+                        
+                        print(f"Data saved to {output_path}")
+                        print("Processing completed successfully with consistent open beam handling!")
+                    else:
+                        print("Error: Processing returned no data")
+                    
+                else:
+                    # Fall back to standard processor with warning about potential inconsistency
+                    print("\nWARNING: Using standard processor - open beam handling may be inconsistent with preview!")
+                    
                     result = self.processor.process_scan_set(
                         scan_group=group,
                         output_filename=output_filename,
@@ -1678,67 +1966,43 @@ class RSoXRTrimWidget:
                         output_dir=output_dir
                     )
                     
-                    print("\nProcessing completed successfully!")
-                    print(f"Data saved to {os.path.join(output_dir, output_filename)}")
-                    
-                    # Show background subtraction summary
+                    if result is not None:
+                        print(f"\nProcessing completed, but open beam normalization may not match preview!")
+                        print(f"Data saved to {os.path.join(output_dir, output_filename)}")
+                        print("To ensure consistent open beam handling, update the processor with enhanced methods.")
+                
+                # Show processing summary
+                if result is not None:
+                    # Show background subtraction summary with scan numbers
                     bg_applied = [bg for bg in group['backgrounds'] if bg != 0.0]
                     if bg_applied:
-                        print(f"Background subtraction applied to {len(bg_applied)} files")
+                        print(f"Background subtraction applied to {len(bg_applied)} scans")
                     else:
                         print("No background subtraction was applied")
-                        
-                else:
-                    # Fall back to manual processing demonstration
-                    print("\nWARNING: Background subtraction not yet implemented in processor.")
-                    print("To enable background subtraction, add the updated methods to RSoXRProcessor:")
-                    print("1. Updated process_scan_set method")
-                    print("2. reduce_data_with_background method") 
-                    print("3. _plot_processed_data_with_background method")
-                    print("\nFor now, showing what would be processed:")
                     
-                    # Show the processing steps that would be applied
-                    print("\nProcessing steps that would be applied:")
-                    print("1. Load each scan file")
-                    print("2. Apply trim values")
-                    print("3. Apply background subtraction")
-                    print("4. Remove zeros (if enabled)")
-                    print("5. Apply smoothing (if enabled)")
-                    print("6. Normalize and stitch scans together")
-                    print("7. Save final result")
-                    
-                    # Show the processing settings
-                    print(f"\nProcessing settings:")
-                    print(f"  Normalize: {self.normalize_checkbox.value}")
-                    print(f"  Remove zeros: {self.remove_zeros_checkbox.value}")
-                    print(f"  Convert to photons: {self.convert_photons_checkbox.value}")
-                    print(f"  Smooth data: {self.smooth_checkbox.value}")
-                    if self.smooth_checkbox.value:
-                        print(f"    Window size: {window_size}")
-                        print(f"    Polynomial order: {polynomial_order}")
-                    
-                    # Show background subtraction summary
-                    print(f"\nBackground subtraction summary:")
-                    for i, (filename, bg_val) in enumerate(zip(group['files'], group['backgrounds'])):
-                        if bg_val != 0.0:
-                            print(f"  File {i+1} ({os.path.basename(filename)}): -{bg_val:.3f}")
+                    # Show normalization summary
+                    if self.normalize_checkbox.value:
+                        if use_open_beam:
+                            print("✓ Open beam normalization applied to saved data")
                         else:
-                            print(f"  File {i+1} ({os.path.basename(filename)}): No background subtraction")
-                    
-                    print(f"\nThe processed data would be saved as: {os.path.join(output_dir, output_filename)}")
+                            print("✓ Standard normalization applied to saved data")
+                    else:
+                        print("No normalization applied to saved data")
                 
             except Exception as e:
                 print(f"Error processing group: {str(e)}")
-                print("If background subtraction is enabled, ensure the processor has been updated with the new methods.")
+                print("Check that the processor has the required methods for background subtraction and open beam normalization.")
+                import traceback
+                traceback.print_exc()
 
     def _on_save_settings(self, b):
-        """Save current trim and background settings to a CSV file"""
+        """UPDATED: Save current trim and background settings with scan numbers"""
         try:
             # Create a list to collect trim and background data
             settings_data = []
             
             for group_idx, group in enumerate(self.scan_groups):
-                for file_idx, filename in enumerate(group['files']):
+                for file_idx, (filename, scan_num) in enumerate(zip(group['files'], group['scan_numbers'])):
                     original_trim = self.original_trims[group_idx][file_idx]
                     current_trim = self.current_trims[group_idx][file_idx]
                     background_value = self.current_backgrounds[group_idx][file_idx]
@@ -1748,6 +2012,7 @@ class RSoXRTrimWidget:
                         'Group': group_idx + 1,
                         'Sample': group['sample_name'],
                         'Energy (eV)': group['energy'],
+                        'Scan Number': scan_num,
                         'File Index': file_idx + 1,
                         'Filename': os.path.basename(filename),
                         'Original Trim Start': original_trim[0],
@@ -1779,18 +2044,20 @@ class RSoXRTrimWidget:
                 print("\nSummary of current configuration:")
                 print(f"Groups source: {self.groups_source}")
                 print(f"Total groups: {len(self.scan_groups)}")
+                total_scans = sum(len(g['scan_numbers']) for g in self.scan_groups)
+                print(f"Total scans: {total_scans}")
                 
                 print("\nSummary of modifications:")
                 modified_df = df[(df['Trim Modified']) | (df['Background Applied'])]
                 if len(modified_df) > 0:
-                    print("Files with modifications:")
+                    print("Scans with modifications:")
                     for _, row in modified_df.iterrows():
                         changes = []
                         if row['Trim Modified']:
                             changes.append(f"Trim: [{row['Current Trim Start']}, {row['Current Trim End']}]")
                         if row['Background Applied']:
                             changes.append(f"Background: -{row['Background Value']:.3f}")
-                        print(f"  Group {int(row['Group'])}, File {int(row['File Index'])}: {', '.join(changes)}")
+                        print(f"  Group {int(row['Group'])}, Scan #{int(row['Scan Number'])}: {', '.join(changes)}")
                 else:
                     print("No modifications were made from original values.")
                     
@@ -1803,10 +2070,251 @@ class RSoXRTrimWidget:
         """Handle log scale checkbox change"""
         # Redraw the plot with new scale
         self._plot_current_file()
+        
+    def add_open_beam_controls_to_widget(self):
+        """
+        Add open beam controls to the RSoXRTrimWidget
+        This method should be called during widget initialization
+        """
+        import ipywidgets as widgets
+        from IPython.display import clear_output
+        
+        # Open beam file selection
+        self.open_beam_file_input = widgets.Text(
+            value='',
+            placeholder='Path to open beam file',
+            description='Open Beam File:',
+            disabled=False,
+            layout=widgets.Layout(width='70%')
+        )
+        
+        # Load open beam button
+        self.load_open_beam_button = widgets.Button(
+            description='Load Open Beam',
+            disabled=False,
+            button_style='info',
+            tooltip='Load open beam intensity data',
+            icon='upload'
+        )
+        
+        # Open beam normalization checkbox
+        self.use_open_beam_checkbox = widgets.Checkbox(
+            value=False,
+            description='Use Open Beam Normalization',
+            disabled=True,  # Disabled until open beam data is loaded
+            tooltip='Use open beam intensity for normalization instead of standard normalization'
+        )
+        
+        # Open beam status display
+        self.open_beam_status = widgets.HTML(
+            value="<b>Open Beam Status:</b> No data loaded",
+            description='',
+            layout=widgets.Layout(width='100%')
+        )
+        
+        # Set up event handlers
+        self.load_open_beam_button.on_click(self._on_load_open_beam)
+        self.use_open_beam_checkbox.observe(self._on_open_beam_checkbox_change, names='value')
+        
+        # Create the open beam controls widget
+        self.open_beam_controls = widgets.VBox([
+            widgets.HTML("<h4>Open Beam Normalization</h4>"),
+            widgets.HBox([self.open_beam_file_input, self.load_open_beam_button]),
+            self.use_open_beam_checkbox,
+            self.open_beam_status
+        ])
+        
+        return self.open_beam_controls
+
+
+    def _on_load_open_beam(self, b):
+        """Handle open beam file loading in widget"""
+        file_path = self.open_beam_file_input.value.strip()
+        
+        if not file_path:
+            with self.output_area:
+                print("Please enter a path to the open beam file.")
+            return
+        
+        if not os.path.exists(file_path):
+            with self.output_area:
+                print(f"Error: File not found: {file_path}")
+            return
+        
+        with self.output_area:
+            clear_output(wait=True)
+            print(f"Loading open beam data from: {file_path}")
+            
+            # Load the open beam file
+            success = self.processor.load_open_beam_file(file_path)
+            
+            if success:
+                # Update status and enable checkbox
+                energy_range = f"{self.processor.open_beam_data['energy'].min():.1f} - {self.processor.open_beam_data['energy'].max():.1f} eV"
+                self.open_beam_status.value = f"<b>Open Beam Status:</b> ✓ Loaded ({len(self.processor.open_beam_data)} points, {energy_range})"
+                self.use_open_beam_checkbox.disabled = False
+                
+                print("Open beam data loaded successfully!")
+                print("You can now enable 'Use Open Beam Normalization' in the processing options.")
+            else:
+                self.open_beam_status.value = "<b>Open Beam Status:</b> ✗ Failed to load"
+                self.use_open_beam_checkbox.disabled = True
+                self.use_open_beam_checkbox.value = False
+
+
+    def _on_open_beam_checkbox_change(self, change):
+        """Handle open beam normalization checkbox change in widget"""
+        use_open_beam = change['new']
+        
+        # Update the processor setting
+        success = self.processor.set_open_beam_normalization(use_open_beam)
+        
+        if not success:
+            # Revert checkbox if setting failed
+            self.use_open_beam_checkbox.value = False
+        
+        with self.output_area:
+            if success:
+                norm_type = "open beam" if use_open_beam else "standard"
+                print(f"Normalization mode set to: {norm_type}")
+            else:
+                print("Failed to set open beam normalization. Please load open beam data first.")
+
+    def _load_open_beam_on_init(self, open_beam_path):
+        """
+        Load open beam data during widget initialization and automatically enable normalization
+        
+        Parameters:
+        -----------
+        open_beam_path : str
+            Path to the open beam file
+        """
+        try:
+            print(f"Loading open beam data from initialization parameter: {open_beam_path}")
+            
+            # Load the open beam file using the processor
+            success = self.processor.load_open_beam_file(open_beam_path)
+            
+            if success:
+                # Automatically enable open beam normalization
+                self.processor.set_open_beam_normalization(True)
+                
+                energy_range = f"{self.processor.open_beam_data['energy'].min():.1f} - {self.processor.open_beam_data['energy'].max():.1f} eV"
+                
+                print(f"✓ Open beam data loaded and enabled successfully!")
+                print(f"  Energy range: {energy_range}")
+                print(f"  Data points: {len(self.processor.open_beam_data)}")
+                print(f"  Open beam normalization: ENABLED")
+                
+            else:
+                print(f"✗ Failed to load open beam data from: {open_beam_path}")
+                
+        except Exception as e:
+            print(f"Error loading open beam data during initialization: {str(e)}")
+                
+    
+    def _check_open_beam_energy_range(self, energy):
+        """
+        Check if the given energy is within the open beam data range
+        
+        Parameters:
+        -----------
+        energy : float
+            Energy in eV to check
+            
+        Returns:
+        --------
+        tuple : (is_within_range, min_energy, max_energy, distance_from_range)
+            - is_within_range: bool, True if energy is within range
+            - min_energy: float, minimum energy in open beam data
+            - max_energy: float, maximum energy in open beam data  
+            - distance_from_range: float, how far outside range (0 if within range)
+        """
+        if not hasattr(self.processor, 'open_beam_data') or self.processor.open_beam_data is None:
+            return False, None, None, None
+        
+        min_energy = self.processor.open_beam_data['energy'].min()
+        max_energy = self.processor.open_beam_data['energy'].max()
+        
+        if energy < min_energy:
+            distance = min_energy - energy
+            return False, min_energy, max_energy, distance
+        elif energy > max_energy:
+            distance = energy - max_energy
+            return False, min_energy, max_energy, distance
+        else:
+            return True, min_energy, max_energy, 0.0
+
+
+
+    def _display_energy_range_warning(self, energy, min_energy, max_energy, distance):
+        """
+        Display a prominent warning about energy being outside open beam range
+        
+        Parameters:
+        -----------
+        energy : float
+            Current energy
+        min_energy : float
+            Minimum open beam energy
+        max_energy : float
+            Maximum open beam energy
+        distance : float
+            Distance outside the range
+        """
+        # Create HTML formatted warning message
+        if energy < min_energy:
+            position = "BELOW"
+            closest = f"(minimum open beam energy: {min_energy:.1f} eV)"
+        else:
+            position = "ABOVE" 
+            closest = f"(maximum open beam energy: {max_energy:.1f} eV)"
+        
+        warning_html = f"""
+        <div style="border: 3px solid red; background-color: #ffebee; padding: 15px; margin: 10px 0;">
+            <h3 style="color: red; margin: 0 0 10px 0; text-align: center;">
+                ⚠️ ENERGY OUT OF OPEN BEAM RANGE WARNING ⚠️
+            </h3>
+            <p style="color: red; font-weight: bold; font-size: 14px; margin: 5px 0; text-align: center;">
+                Current energy: <span style="font-size: 16px;">{energy:.1f} eV</span> is 
+                <span style="font-size: 16px;">{position}</span> the open beam data range!
+            </p>
+            <p style="color: red; font-weight: bold; font-size: 14px; margin: 5px 0; text-align: center;">
+                Open beam range: {min_energy:.1f} - {max_energy:.1f} eV
+            </p>
+            <p style="color: red; font-weight: bold; font-size: 14px; margin: 5px 0; text-align: center;">
+                Distance from range: <span style="font-size: 16px;">{distance:.1f} eV</span> {closest}
+            </p>
+            <p style="color: #d32f2f; font-weight: bold; font-size: 13px; margin: 10px 0 0 0; text-align: center;">
+                Open beam correction will use EXTRAPOLATION - results may be unreliable!
+            </p>
+        </div>
+        """
+        
+        # Display the warning
+        from IPython.display import display, HTML
+        display(HTML(warning_html))
+        
+        # Also print to console
+        print(f"\n{'='*80}")
+        print(f"🚨 WARNING: ENERGY {energy:.1f} eV IS {position} OPEN BEAM RANGE! 🚨")
+        print(f"Open beam range: {min_energy:.1f} - {max_energy:.1f} eV")
+        print(f"Distance from range: {distance:.1f} eV")
+        print(f"Using extrapolation - results may be unreliable!")
+        print(f"{'='*80}\n")
+
+        
     
     def display(self):
-        """Display the widget"""
+        """UPDATED: Display the widget with scan number summary"""
         display(self.main_container)
         print(f"RSoXR Trim Widget initialized with default output directory: {self.default_output_dir}")
         print(f"Default trim values set to use full range of each data section (0, -1)")
-        print(f"Loaded {len(self.scan_groups)} scan groups")
+        print(f"Loaded {len(self.scan_groups)} scan groups with scan numbering")
+        
+        # Print scan numbering summary
+        if self.scan_groups:
+            total_scans = sum(len(g['scan_numbers']) for g in self.scan_groups)
+            min_scan = min(min(g['scan_numbers']) for g in self.scan_groups if g['scan_numbers'])
+            max_scan = max(max(g['scan_numbers']) for g in self.scan_groups if g['scan_numbers'])
+            print(f"Scan numbering: {total_scans} total scans (#{min_scan} to #{max_scan})")

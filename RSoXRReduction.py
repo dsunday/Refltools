@@ -37,6 +37,9 @@ class RSoXRProcessor:
             
         if calibration_file:
             self.load_calibration_file(calibration_file)
+        
+        self.scan_registry = {}  # Maps scan numbers to file info
+        self.next_scan_number = 1
     
     def load_calibration_file(self, calibration_file):
         """
@@ -1174,11 +1177,11 @@ class RSoXRProcessor:
         # Normalize if requested
         if normalize:
             if smooth_data:
-                refl_q[:, 1] = refl_q[:, 1] / np.max(refl_q[:, 1])
-                raw_refl_q[:, 1] = raw_refl_q[:, 1] / np.max(raw_refl_q[:, 1])
+                refl[:, 1] = self.apply_normalization(refl[:, 1], energy)
+                raw_refl_q[:, 1] = self.apply_normalization(raw_refl_q[:, 1], energy)
             else:
-                refl[:, 1] = refl[:, 1] / np.max(refl[:, 1])
-            print("Applied normalization")
+                refl[:, 1] = self.apply_normalization(refl[:, 1], energy)
+            print("Applied Energy normalization")
         
         # Generate plots if requested
         if plot and plot_prefix:
@@ -1324,9 +1327,11 @@ class RSoXRProcessor:
         
         return results
     
-    def auto_group_scans(self, data_directory=".", position_tolerance=0.4, energy_tolerance=0.2, auto_trim=False, save_table=True, output_dir=None, sort_by_energy=True):
+    def auto_group_scans(self, data_directory=".", position_tolerance=0.4, 
+                        energy_tolerance=0.2, auto_trim=False, save_table=True, 
+                        output_dir=None, sort_by_energy=True):
         """
-        Automatically group scans based on position, energy, and detector type
+        Enhanced auto-grouping that assigns unique scan numbers to each file
         
         Parameters:
         -----------
@@ -1348,8 +1353,421 @@ class RSoXRProcessor:
         Returns:
         --------
         groups : list of dicts
-            List of file groups with associated metadata
+            List of file groups with associated metadata and scan numbers
         """
+        # Reset scan registry and numbering
+        self.scan_registry = {}
+        self.next_scan_number = 1
+        
+        # Call existing auto_group_scans logic (simplified here)
+        groups = self._perform_auto_grouping(data_directory, position_tolerance, 
+                                           energy_tolerance, auto_trim, sort_by_energy)
+        
+        # Assign unique scan numbers to each file across all groups
+        for group_idx, group in enumerate(groups):
+            group['scan_numbers'] = []
+            for file_idx, filename in enumerate(group['files']):
+                scan_number = self.next_scan_number
+                self.next_scan_number += 1
+                
+                # Store in registry
+                self.scan_registry[scan_number] = {
+                    'filename': filename,
+                    'group_idx': group_idx,
+                    'file_idx': file_idx,
+                    'metadata': group['metadata'][file_idx] if file_idx < len(group['metadata']) else None,
+                    'trim': group['trims'][file_idx] if file_idx < len(group['trims']) else (0, -1)
+                }
+                
+                group['scan_numbers'].append(scan_number)
+        
+        if save_table and groups:
+            self.save_scan_groups_to_table(groups, output_dir=output_dir)
+            
+        return groups
+    
+    def edit_groups(self, scan_groups=None, group=None, add_scan_number=None, 
+               remove_scan_number=None, remove_group=None, resort_group=False):
+        """
+        Edit scan groups by moving individual scans between groups
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts, optional
+            Current scan groups. If None, uses self.scan_groups
+        group : int, optional
+            Target group number (1-based) for adding scans
+        add_scan_number : int or list of int, optional
+            Scan number(s) to add to the target group
+        remove_scan_number : int or list of int, optional
+            Scan number(s) to remove from the specified group
+        remove_group : int, optional
+            Group number to remove entirely
+        resort_group : bool, optional
+            Whether to resort groups after editing (default: False)
+            
+        Returns:
+        --------
+        updated_groups : list of dicts
+            Updated scan groups
+            
+        Examples:
+        --------
+        # Add scan 4 to group 1 (removes it from its current group)
+        processor.edit_groups(group=1, add_scan_number=4)
+        
+        # Add multiple scans to group 1
+        processor.edit_groups(group=1, add_scan_number=[4, 5])
+        
+        # Remove scan 6 from group 1
+        processor.edit_groups(group=1, remove_scan_number=6)
+        
+        # Remove entire group 4
+        processor.edit_groups(remove_group=4)
+        
+        # Add scan and resort the target group
+        processor.edit_groups(group=1, add_scan_number=4, resort_group=True)
+        """
+        if scan_groups is None:
+            if not hasattr(self, 'scan_groups') or self.scan_groups is None:
+                raise ValueError("No scan groups available. Run auto_group_scans first.")
+            scan_groups = deepcopy(self.scan_groups)
+        else:
+            scan_groups = deepcopy(scan_groups)
+        
+        # Handle removing entire group
+        if remove_group is not None:
+            return self._remove_group(scan_groups, remove_group)
+        
+        # Handle removing scans from a specific group
+        if remove_scan_number is not None and group is not None:
+            return self._remove_scans_from_group(scan_groups, group, remove_scan_number, resort_group=resort_group)
+        
+        # Handle adding scans to a group
+        if add_scan_number is not None and group is not None:
+            return self._add_scans_to_group(scan_groups, group, add_scan_number, resort_group=resort_group)
+        
+        raise ValueError("Invalid combination of parameters. See docstring for examples.")
+
+    def _remove_scans_from_group(self, scan_groups, group_number, scan_numbers, resort_group=False):
+        """Remove one or more scans from a specific group"""
+        if not isinstance(scan_numbers, list):
+            scan_numbers = [scan_numbers]
+        
+        group_idx = group_number - 1
+        if not (0 <= group_idx < len(scan_groups)):
+            raise ValueError(f"Invalid group number {group_number}. Valid range is 1-{len(scan_groups)}")
+        
+        removed_scans = []
+        group = scan_groups[group_idx]
+        
+        # Sort scan numbers in reverse order to maintain indices during removal
+        scan_numbers_in_group = [(scan_num, idx) for idx, scan_num in enumerate(group['scan_numbers']) 
+                                if scan_num in scan_numbers]
+        scan_numbers_in_group.sort(key=lambda x: x[1], reverse=True)
+        
+        for scan_number, file_idx in scan_numbers_in_group:
+            # Remove from group
+            filename = group['files'].pop(file_idx)
+            group['metadata'].pop(file_idx) if file_idx < len(group['metadata']) else None
+            group['trims'].pop(file_idx) if file_idx < len(group['trims']) else None
+            group['scan_numbers'].pop(file_idx)
+            
+            # Remove from registry
+            if scan_number in self.scan_registry:
+                del self.scan_registry[scan_number]
+            
+            removed_scans.append(scan_number)
+            print(f"Removed scan {scan_number} ({os.path.basename(filename)}) from group {group_number}")
+        
+        # Update indices
+        self._update_scan_indices(scan_groups)
+        
+        # Remove empty groups
+        scan_groups = self._remove_empty_groups(scan_groups)
+        
+        # Sort the group only if explicitly requested
+        if not scan_groups:  # Check if any groups remain
+            return scan_groups
+        
+        # Find the group again after potential removal of empty groups
+        updated_group_idx = None
+        for idx, grp in enumerate(scan_groups):
+            if grp is group:  # Same object reference
+                updated_group_idx = idx
+                break
+        
+        if updated_group_idx is not None:
+            if resort_group:
+                scan_groups[updated_group_idx] = self._sort_files_in_group(scan_groups[updated_group_idx], preserve_scan_numbers=False)
+            else:
+                scan_groups[updated_group_idx] = self._sort_files_in_group(scan_groups[updated_group_idx], preserve_scan_numbers=True)
+        
+        return scan_groups
+
+    
+    def _add_scans_to_group(self, scan_groups, target_group, scan_numbers, resort_group=False):
+        """Add one or more scans to a target group"""
+        if not isinstance(scan_numbers, list):
+            scan_numbers = [scan_numbers]
+        
+        target_group_idx = target_group - 1
+        if not (0 <= target_group_idx < len(scan_groups)):
+            raise ValueError(f"Invalid group number {target_group}. Valid range is 1-{len(scan_groups)}")
+        
+        moved_scans = []
+        
+        for scan_number in scan_numbers:
+            if scan_number not in self.scan_registry:
+                print(f"Warning: Scan number {scan_number} not found in registry")
+                continue
+            
+            scan_info = self.scan_registry[scan_number]
+            source_group_idx = scan_info['group_idx']
+            source_file_idx = scan_info['file_idx']
+            
+            if source_group_idx == target_group_idx:
+                print(f"Scan {scan_number} is already in group {target_group}")
+                continue
+            
+            # Remove from source group
+            source_group = scan_groups[source_group_idx]
+            
+            # Find the current position of this scan in the source group
+            current_idx = None
+            for idx, snum in enumerate(source_group['scan_numbers']):
+                if snum == scan_number:
+                    current_idx = idx
+                    break
+            
+            if current_idx is None:
+                print(f"Warning: Scan {scan_number} not found in expected source group")
+                continue
+            
+            # Remove from source group
+            filename = source_group['files'].pop(current_idx)
+            metadata = source_group['metadata'].pop(current_idx) if current_idx < len(source_group['metadata']) else None
+            trim = source_group['trims'].pop(current_idx) if current_idx < len(source_group['trims']) else (0, -1)
+            source_group['scan_numbers'].pop(current_idx)
+            
+            # Add to target group
+            target_group_dict = scan_groups[target_group_idx]
+            target_group_dict['files'].append(filename)
+            target_group_dict['metadata'].append(metadata)
+            target_group_dict['trims'].append(trim)
+            target_group_dict['scan_numbers'].append(scan_number)
+            
+            # Update registry
+            self.scan_registry[scan_number]['group_idx'] = target_group_idx
+            self.scan_registry[scan_number]['file_idx'] = len(target_group_dict['files']) - 1
+            
+            moved_scans.append(scan_number)
+            
+        # Update file indices for remaining scans in source groups
+        self._update_scan_indices(scan_groups)
+        
+        # Remove empty groups
+        scan_groups = self._remove_empty_groups(scan_groups)
+        
+        # Sort files within groups - with new preserve_scan_numbers parameter
+        for group in scan_groups:
+            if hasattr(self, '_sort_files_in_group'):
+                group = self._sort_files_in_group(group, preserve_scan_numbers=not resort_group)
+        
+        if moved_scans:
+            print(f"Moved scans {moved_scans} to group {target_group}")
+        
+        return scan_groups
+
+    def remove_scan_from_group(self, scan_groups, group_index, file_index, resort_group=False):
+        """
+        Remove a specific scan from a group
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        group_index : int
+            Index of the group to modify (1-based, as displayed to user)
+        file_index : int
+            Index of the file within the group to remove (1-based, as displayed to user)
+        resort_group : bool
+            Whether to resort the group after removing the scan (default: False)
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups
+        removed_info : dict
+            Information about the removed scan (filename, metadata, trim)
+        """
+        # Convert to 0-based indices
+        zero_based_group_index = group_index - 1
+        zero_based_file_index = file_index - 1
+        
+        if not (0 <= zero_based_group_index < len(scan_groups)):
+            print(f"Error: Invalid group number {group_index}. Valid range is 1-{len(scan_groups)}")
+            return scan_groups, None
+        
+        group = scan_groups[zero_based_group_index]
+        
+        if not (0 <= zero_based_file_index < len(group['files'])):
+            print(f"Error: Invalid file number {file_index}. Valid range is 1-{len(group['files'])}")
+            return scan_groups, None
+        
+        # Store information about the removed scan
+        removed_info = {
+            'filename': group['files'][zero_based_file_index],
+            'metadata': group['metadata'][zero_based_file_index] if zero_based_file_index < len(group['metadata']) else None,
+            'trim': group['trims'][zero_based_file_index] if zero_based_file_index < len(group['trims']) else (0, -1),
+            'scan_number': group['scan_numbers'][zero_based_file_index] if 'scan_numbers' in group and zero_based_file_index < len(group['scan_numbers']) else None
+        }
+        
+        # Remove from all lists
+        group['files'].pop(zero_based_file_index)
+        if zero_based_file_index < len(group['metadata']):
+            group['metadata'].pop(zero_based_file_index)
+        if zero_based_file_index < len(group['trims']):
+            group['trims'].pop(zero_based_file_index)
+        if 'scan_numbers' in group and zero_based_file_index < len(group['scan_numbers']):
+            group['scan_numbers'].pop(zero_based_file_index)
+        
+        # Check if group is now empty
+        if not group['files']:
+            print(f"Warning: Group {group_index} is now empty after removing scan")
+            # Optionally remove the empty group
+            scan_groups.pop(zero_based_group_index)
+            print(f"Removed empty group {group_index}")
+        else:
+            # Re-sort the group only if explicitly requested
+            if resort_group:
+                scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=False)
+            else:
+                scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=True)
+        
+        print(f"Removed {os.path.basename(removed_info['filename'])} from group {group_index}")
+        
+        return scan_groups, removed_info
+    
+    def _remove_group(self, scan_groups, group_number):
+        """Remove an entire group"""
+        group_idx = group_number - 1
+        if not (0 <= group_idx < len(scan_groups)):
+            raise ValueError(f"Invalid group number {group_number}. Valid range is 1-{len(scan_groups)}")
+        
+        # Remove scans from registry
+        group = scan_groups[group_idx]
+        for scan_number in group['scan_numbers']:
+            if scan_number in self.scan_registry:
+                del self.scan_registry[scan_number]
+        
+        # Remove group
+        removed_group = scan_groups.pop(group_idx)
+        print(f"Removed group {group_number} ({removed_group['sample_name']}) with {len(removed_group['files'])} scans")
+        
+        # Update indices for remaining groups
+        self._update_scan_indices(scan_groups)
+        
+        return scan_groups
+    
+    def _update_scan_indices(self, scan_groups):
+        """Update the scan registry with current group and file indices"""
+        for group_idx, group in enumerate(scan_groups):
+            for file_idx, scan_number in enumerate(group['scan_numbers']):
+                if scan_number in self.scan_registry:
+                    self.scan_registry[scan_number]['group_idx'] = group_idx
+                    self.scan_registry[scan_number]['file_idx'] = file_idx
+    
+    def _remove_empty_groups(self, scan_groups):
+        """Remove groups that have no files"""
+        return [group for group in scan_groups if len(group['files']) > 0]
+    
+    def print_scan_registry(self):
+        """Print the current scan registry for debugging"""
+        print("\nScan Registry:")
+        print("=" * 80)
+        print(f"{'Scan#':6} | {'Group':6} | {'File#':6} | {'Filename':30} | {'Detector':12}")
+        print("-" * 80)
+        
+        for scan_num in sorted(self.scan_registry.keys()):
+            info = self.scan_registry[scan_num]
+            filename = os.path.basename(info['filename'])
+            detector = info['metadata']['detector'] if info['metadata'] else 'Unknown'
+            print(f"{scan_num:6} | {info['group_idx']+1:6} | {info['file_idx']+1:6} | {filename:30} | {detector:12}")
+    
+    def print_groups_with_scan_numbers(self, scan_groups, show_details=False):
+        """Print group summary showing scan numbers for each file"""
+        print(f"\nScan Groups Summary ({len(scan_groups)} groups):")
+        print("=" * 100)
+        
+        for i, group in enumerate(scan_groups):
+            print(f"\nGroup {i+1}: {group['sample_name']} ({group['energy']:.1f} eV)")
+            print(f"Position: ({group['x']:.2f}, {group['y']:.2f})")
+            print(f"Files: {len(group['files'])}")
+            
+            if show_details:
+                print(f"{'Scan#':6} | {'Filename':25} | {'Detector':12} | {'Angle Range':15}")
+                print("-" * 65)
+                
+                for j, (filename, scan_num) in enumerate(zip(group['files'], group['scan_numbers'])):
+                    base_filename = os.path.basename(filename)
+                    file_meta = group['metadata'][j] if j < len(group['metadata']) else None
+                    
+                    if file_meta:
+                        detector = file_meta['detector'] if file_meta['detector'] else "Unknown"
+                        angle_range_str = "N/A"
+                        if file_meta.get('min_angle') is not None and file_meta.get('max_angle') is not None:
+                            angle_range_str = f"{file_meta['min_angle']:.2f}-{file_meta['max_angle']:.2f}°"
+                    else:
+                        detector = "Unknown"
+                        angle_range_str = "N/A"
+                    
+                    print(f"{scan_num:6} | {base_filename:25} | {detector:12} | {angle_range_str:15}")
+            else:
+                scan_nums_str = ", ".join(map(str, group['scan_numbers']))
+                print(f"Scan numbers: {scan_nums_str}")
+            
+            print()
+    
+    def get_scan_info(self, scan_number):
+        """Get detailed information about a specific scan"""
+        if scan_number not in self.scan_registry:
+            print(f"Scan number {scan_number} not found")
+            return None
+        
+        return self.scan_registry[scan_number]
+    
+    def find_scans_by_detector(self, detector_type):
+        """Find all scans with a specific detector type"""
+        matching_scans = []
+        for scan_num, info in self.scan_registry.items():
+            if info['metadata'] and info['metadata'].get('detector', '').lower() == detector_type.lower():
+                matching_scans.append(scan_num)
+        return matching_scans
+    
+    def find_scans_by_filename_pattern(self, pattern):
+        """Find all scans whose filenames match a pattern"""
+        import re
+        matching_scans = []
+        for scan_num, info in self.scan_registry.items():
+            filename = os.path.basename(info['filename'])
+            if re.search(pattern, filename, re.IGNORECASE):
+                matching_scans.append(scan_num)
+        return matching_scans
+
+    def _perform_auto_grouping(self, data_directory, position_tolerance, 
+                              energy_tolerance, auto_trim, sort_by_energy):
+        """
+        Perform the actual auto-grouping logic based on position, energy, and detector type
+        This contains the core implementation from the original auto_group_scans method
+        """
+        import os
+        import glob
+        import re
+        import pandas as pd
+        from collections import defaultdict
+        from copy import deepcopy
+        
         if self.log_data is None:
             print("Error: Log data is required for automatic scan grouping.")
             return []
@@ -1523,7 +1941,7 @@ class RSoXRProcessor:
         if sort_by_energy:
             scan_groups.sort(key=lambda x: x['energy'])
         
-        # Create and display a consolidated table of scan groups
+        # Print summary of found groups
         print(f"\nFound {len(scan_groups)} scan groups:")
         print("=" * 115)
         print(f"{'#':3} | {'Sample':12} | {'Energy (eV)':10} | {'Position (X,Y)':20} | {'Angle Range':15} | {'Files':8} | {'Detector Types'}")
@@ -1555,47 +1973,107 @@ class RSoXRProcessor:
         
         print("=" * 115)
         
-        # Print details for each group
-        for i, group in enumerate(scan_groups):
-            print(f"\nGroup {i+1}: {group['sample_name']} ({group['energy']:.1f} eV)")
-            print("-" * 120)
-            print(f"{'#':3} | {'Filename':20} | {'Detector':12} | {'Angle Range':15} | {'Count Time':10} | {'Trim'}")
-            print("-" * 120)
-            
-            for j, filename in enumerate(group['files']):
-                base_filename = os.path.basename(filename)
-                # Find metadata for this file
-                file_meta = None
-                for meta in group['metadata']:
-                    if os.path.basename(meta['filename']) == base_filename:
-                        file_meta = meta
-                        break
-                
-                if file_meta:
-                    trim_str = f"({group['trims'][j][0]}, {group['trims'][j][1]})"
-                    detector = file_meta['detector'] if file_meta['detector'] else "Unknown"
-                    
-                    # Format angle range
-                    angle_range_str = "N/A"
-                    if file_meta['min_angle'] is not None and file_meta['max_angle'] is not None:
-                        angle_range_str = f"{file_meta['min_angle']:.2f} - {file_meta['max_angle']:.2f}°"
-                    
-                    # Add count time if available (mainly for CEM detectors)
-                    count_time = "N/A"
-                    if file_meta.get('count_time') is not None:
-                        count_time = f"{file_meta['count_time']:.6f}"
-                    
-                    print(f"{j+1:3} | {base_filename:20} | {detector:12} | {angle_range_str:15} | {count_time:10} | {trim_str}")
-                else:
-                    print(f"{j+1:3} | {base_filename:20} | {'Unknown':12} | {'N/A':15} | {'N/A':10} | {group['trims'][j]}")
-            
-            print()
-            
-        if save_table and scan_groups:
-            self.save_scan_groups_to_table(scan_groups, output_dir=output_dir)
-
         return scan_groups
+    
+    def resort_group(self, scan_groups, group_index):
+        """
+        Explicitly resort a group by detector type and angle, allowing scan numbers to be reordered
         
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        group_index : int
+            Index of the group to resort (1-based, as displayed to user)
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups with resorted group
+        """
+        zero_based_group_index = group_index - 1
+        
+        if not (0 <= zero_based_group_index < len(scan_groups)):
+            print(f"Error: Invalid group number {group_index}. Valid range is 1-{len(scan_groups)}")
+            return scan_groups
+        
+        group = scan_groups[zero_based_group_index]
+        scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=False)
+        
+        print(f"Resorted group {group_index} by detector type and angle")
+        
+        return scan_groups
+
+    def validate_scan_number_consistency(self, scan_groups):
+        """
+        Validate that scan numbers are consistent and warn about any issues
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups to validate
+            
+        Returns:
+        --------
+        bool : True if consistent, False if issues found
+        """
+        issues_found = False
+        all_scan_numbers = set()
+        
+        for group_idx, group in enumerate(scan_groups):
+            if 'scan_numbers' not in group:
+                print(f"Warning: Group {group_idx + 1} missing scan_numbers field")
+                issues_found = True
+                continue
+                
+            # Check for duplicates within this group
+            group_scan_numbers = group['scan_numbers']
+            if len(group_scan_numbers) != len(set(group_scan_numbers)):
+                print(f"Warning: Group {group_idx + 1} has duplicate scan numbers")
+                issues_found = True
+                
+            # Check for duplicates across groups
+            for scan_num in group_scan_numbers:
+                if scan_num in all_scan_numbers:
+                    print(f"Warning: Scan number {scan_num} appears in multiple groups")
+                    issues_found = True
+                all_scan_numbers.add(scan_num)
+                
+            # Check that scan_numbers list matches other lists in length
+            expected_length = len(group['files'])
+            if len(group_scan_numbers) != expected_length:
+                print(f"Warning: Group {group_idx + 1} scan_numbers length ({len(group_scan_numbers)}) "
+                    f"doesn't match files length ({expected_length})")
+                issues_found = True
+        
+        if not issues_found:
+            print("All scan number assignments are consistent")
+            
+        return not issues_found
+
+
+    def resort_all_groups(self, scan_groups):
+        """
+        Explicitly resort all groups by detector type and angle, allowing scan numbers to be reordered
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups with all groups resorted
+        """
+        for i in range(len(scan_groups)):
+            scan_groups[i] = self._sort_files_in_group(scan_groups[i], preserve_scan_numbers=False)
+        
+        print(f"Resorted all {len(scan_groups)} groups by detector type and angle")
+        
+        return scan_groups
+
+            
     def _determine_trims(self, filenames):
         """
         Automatically determine trim values for a list of files
@@ -1922,319 +2400,6 @@ class RSoXRProcessor:
             return csv_path
 
 
-    def estimate_film_thickness(self, reflectivity_data, min_prominence=0.1, min_spacing=0.01, 
-                            max_spacing=0.3, min_thickness_nm=20, max_thickness_nm=100, 
-                            plot=True, output_dir=None, plot_prefix=None, smooth_data=True,
-                            savgol_window=None, savgol_order=2):
-        """
-        Estimate the film thickness based on the fringe spacing in Q-space
-        
-        Parameters:
-        -----------
-        reflectivity_data : numpy array
-            Reduced reflectivity data with columns [Q, R, error]
-        min_prominence : float
-            Minimum prominence for peak/valley detection
-        min_spacing : float
-            Minimum spacing between adjacent peaks/valleys in Q-space (Å⁻¹)
-            For a 100nm film, fringe spacing is ~0.031 Å⁻¹
-        max_spacing : float
-            Maximum spacing between adjacent peaks/valleys in Q-space (Å⁻¹)
-            For a 20nm film, fringe spacing is ~0.157 Å⁻¹
-        min_thickness_nm : float
-            Minimum expected film thickness in nm
-        max_thickness_nm : float
-            Maximum expected film thickness in nm
-        plot : bool
-            Whether to generate plots during processing
-        output_dir : str, optional
-            Directory to save plots if provided
-        plot_prefix : str, optional
-            Prefix for plot filenames
-        smooth_data : bool
-            Whether to apply smoothing to the data before peak detection
-        savgol_window : int, optional
-            Window size for Savitzky-Golay filter. Must be odd and >= 5.
-            If None, will be automatically determined based on data size.
-        savgol_order : int
-            Polynomial order for the Savitzky-Golay filter. Default is 2.
-            
-        Returns:
-        --------
-        thickness : float
-            Estimated film thickness in Ångstroms
-        peak_positions : array
-            Positions of detected peaks in Q-space
-        valley_positions : array
-            Positions of detected valleys in Q-space
-        """
-        import numpy as np
-        from scipy.signal import find_peaks, peak_prominences, savgol_filter
-        import matplotlib.pyplot as plt
-        import os
-        
-        # Convert thickness range to expected fringe spacing range
-        min_fringe_spacing = 2 * np.pi / (max_thickness_nm * 10)  # max thickness -> min spacing
-        max_fringe_spacing = 2 * np.pi / (min_thickness_nm * 10)  # min thickness -> max spacing
-        
-        print(f"Expected fringe spacing range: {min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹")
-        print(f"Based on thickness range: {min_thickness_nm} - {max_thickness_nm} nm")
-        
-        # Use user-specified spacing if provided
-        if min_spacing > 0:
-            min_fringe_spacing = min_spacing
-        if max_spacing > 0:
-            max_fringe_spacing = max_spacing
-        
-        # Extract Q and reflectivity
-        Q = reflectivity_data[:, 0]
-        R = reflectivity_data[:, 1]
-        
-        # Sort data by Q values (just to be safe)
-        sort_indices = np.argsort(Q)
-        Q = Q[sort_indices]
-        R = R[sort_indices]
-        
-        # Apply smoothing if requested
-        if smooth_data:
-            # Determine the best window size for Savitzky-Golay filter (must be odd)
-            if savgol_window is None:
-                window_size = max(min(25, len(Q) // 10 * 2 + 1), 5)
-                if window_size % 2 == 0:
-                    window_size += 1
-            else:
-                # Use the user-specified window size
-                window_size = savgol_window
-                # Ensure it's odd and at least 5
-                if window_size % 2 == 0:
-                    window_size += 1
-                window_size = max(window_size, 5)
-                
-            print(f"Using Savitzky-Golay filter with window size: {window_size}, order: {savgol_order}")
-                
-            # Apply Savitzky-Golay filter to reduce noise
-            try:
-                log_R_smooth = savgol_filter(np.log10(R), window_size, savgol_order)
-            except Exception as e:
-                print(f"Warning: Smoothing failed ({str(e)}), using raw data")
-                log_R_smooth = np.log10(R)
-        else:
-            log_R_smooth = np.log10(R)
-        
-        # Find the valleys (minima) in the reflectivity
-        # For valleys, we'll find peaks in the negative of log_R
-        valley_indices, valley_props = find_peaks(-log_R_smooth, 
-                                                prominence=min_prominence,
-                                                distance=int(min_fringe_spacing / (Q[1] - Q[0])))
-        
-        if len(valley_indices) > 0:
-            valley_positions = Q[valley_indices]
-            valley_values = log_R_smooth[valley_indices]
-            valley_prominences = peak_prominences(-log_R_smooth, valley_indices)[0]
-        else:
-            valley_positions = np.array([])
-            valley_values = np.array([])
-            valley_prominences = np.array([])
-        
-        # Find the peaks (maxima) in the reflectivity
-        peak_indices, peak_props = find_peaks(log_R_smooth, 
-                                            prominence=min_prominence,
-                                            distance=int(min_fringe_spacing / (Q[1] - Q[0])))
-        
-        if len(peak_indices) > 0:
-            peak_positions = Q[peak_indices]
-            peak_values = log_R_smooth[peak_indices]
-            peak_prominences = peak_prominences(log_R_smooth, peak_indices)[0]
-        else:
-            peak_positions = np.array([])
-            peak_values = np.array([])
-            peak_prominences = np.array([])
-        
-        # Filter out peak/valley pairs that are too close or too far apart
-        valid_valley_spacings = []
-        valid_valley_positions = []
-        
-        if len(valley_positions) >= 2:
-            valley_spacings = np.diff(valley_positions)
-            
-            # Filter valid spacings
-            valid_indices = np.where((valley_spacings >= min_fringe_spacing) & 
-                                    (valley_spacings <= max_fringe_spacing))[0]
-            
-            # Get valid spacings
-            if len(valid_indices) > 0:
-                for idx in valid_indices:
-                    valid_valley_spacings.append(valley_spacings[idx])
-                    valid_valley_positions.append(valley_positions[idx:idx+2])
-        
-        # Calculate valley-based thickness
-        if valid_valley_spacings:
-            avg_valley_spacing = np.mean(valid_valley_spacings)
-            valley_thickness = 2 * np.pi / avg_valley_spacing
-        else:
-            avg_valley_spacing = None
-            valley_thickness = None
-        
-        # Similarly for peaks
-        valid_peak_spacings = []
-        valid_peak_positions = []
-        
-        if len(peak_positions) >= 2:
-            peak_spacings = np.diff(peak_positions)
-            
-            # Filter valid spacings
-            valid_indices = np.where((peak_spacings >= min_fringe_spacing) & 
-                                (peak_spacings <= max_fringe_spacing))[0]
-            
-            # Get valid spacings
-            if len(valid_indices) > 0:
-                for idx in valid_indices:
-                    valid_peak_spacings.append(peak_spacings[idx])
-                    valid_peak_positions.append(peak_positions[idx:idx+2])
-        
-        # Calculate peak-based thickness
-        if valid_peak_spacings:
-            avg_peak_spacing = np.mean(valid_peak_spacings)
-            peak_thickness = 2 * np.pi / avg_peak_spacing
-        else:
-            avg_peak_spacing = None
-            peak_thickness = None
-        
-        # Combine the results
-        thicknesses = []
-        if valley_thickness is not None:
-            thicknesses.append(valley_thickness)
-        if peak_thickness is not None:
-            thicknesses.append(peak_thickness)
-        
-        # Calculate final thickness estimate
-        if thicknesses:
-            thickness = np.mean(thicknesses)
-            thickness_nm = thickness / 10  # Convert Å to nm
-        else:
-            thickness = None
-            thickness_nm = None
-        
-        # Print results
-        print("\nFilm Thickness Estimation Results:")
-        print("-" * 40)
-        
-        if valley_thickness is not None:
-            print(f"Valley-based estimate: {valley_thickness:.1f} Å ({valley_thickness/10:.1f} nm)")
-            print(f"  Average spacing between valleys: {avg_valley_spacing:.4f} Å⁻¹")
-            print(f"  Number of valid valley spacings: {len(valid_valley_spacings)}")
-        else:
-            print("No valid valley spacings detected for thickness estimation")
-        
-        if peak_thickness is not None:
-            print(f"Peak-based estimate: {peak_thickness:.1f} Å ({peak_thickness/10:.1f} nm)")
-            print(f"  Average spacing between peaks: {avg_peak_spacing:.4f} Å⁻¹")
-            print(f"  Number of valid peak spacings: {len(valid_peak_spacings)}")
-        else:
-            print("No valid peak spacings detected for thickness estimation")
-        
-        if thickness is not None:
-            print(f"\nFinal thickness estimate: {thickness:.1f} Å ({thickness_nm:.1f} nm)")
-        else:
-            print("\nCould not estimate thickness - insufficient valid peaks/valleys detected")
-            print(f"Try adjusting the spacing range ({min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹)")
-            print(f"Or min_prominence parameter (currently {min_prominence})")
-        
-        # Create plot if requested
-        if plot and (valley_positions.size > 0 or peak_positions.size > 0):
-            plt.figure(figsize=(12, 8))
-            
-            # Plot the reflectivity data
-            plt.plot(Q, log_R_smooth, 'b-', label='log(Reflectivity) [Smoothed]')
-            if smooth_data:
-                plt.plot(Q, np.log10(R), 'b-', alpha=0.3, label='log(Reflectivity) [Raw]')
-            
-            # Mark all detected valleys
-            if len(valley_positions) > 0:
-                plt.plot(valley_positions, valley_values, 'rv', markersize=8, alpha=0.5, label='All Valleys')
-            
-            # Mark all detected peaks
-            if len(peak_positions) > 0:
-                plt.plot(peak_positions, peak_values, 'go', markersize=8, alpha=0.5, label='All Peaks')
-            
-            # Mark valid valley pairs
-            for pos_pair in valid_valley_positions:
-                idx1 = np.where(valley_positions == pos_pair[0])[0][0]
-                idx2 = np.where(valley_positions == pos_pair[1])[0][0]
-                
-                spacing = pos_pair[1] - pos_pair[0]
-                midpoint = (pos_pair[0] + pos_pair[1]) / 2
-                
-                plt.plot(pos_pair, [valley_values[idx1], valley_values[idx2]], 'r-', linewidth=2)
-                plt.annotate(f"{spacing:.4f}", 
-                        xy=(midpoint, np.interp(midpoint, Q, log_R_smooth)),
-                        xytext=(0, -20),
-                        textcoords='offset points',
-                        ha='center',
-                        color='red',
-                        arrowprops=dict(arrowstyle='->', color='red'))
-            
-            # Mark valid peak pairs
-            for pos_pair in valid_peak_positions:
-                idx1 = np.where(peak_positions == pos_pair[0])[0][0]
-                idx2 = np.where(peak_positions == pos_pair[1])[0][0]
-                
-                spacing = pos_pair[1] - pos_pair[0]
-                midpoint = (pos_pair[0] + pos_pair[1]) / 2
-                
-                plt.plot(pos_pair, [peak_values[idx1], peak_values[idx2]], 'g-', linewidth=2)
-                plt.annotate(f"{spacing:.4f}", 
-                        xy=(midpoint, np.interp(midpoint, Q, log_R_smooth)),
-                        xytext=(0, 20),
-                        textcoords='offset points',
-                        ha='center',
-                        color='green',
-                        arrowprops=dict(arrowstyle='->', color='green'))
-            
-            # Add thickness annotation
-            if thickness is not None:
-                title = f"Film Thickness Estimation: {thickness:.1f} Å ({thickness_nm:.1f} nm)"
-                if valley_thickness is not None and peak_thickness is not None:
-                    title += f"\nPeak-based: {peak_thickness:.1f} Å, Valley-based: {valley_thickness:.1f} Å"
-            else:
-                title = "Film Thickness Estimation: Insufficient Valid Data"
-                
-            plt.title(title)
-            plt.xlabel('Q (Å⁻¹)')
-            plt.ylabel('log(Reflectivity)')
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.7)
-            
-            # Add a text box with parameter settings
-            textbox_props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-            info_text = (
-                f"Parameters:\n"
-                f"Min prominence: {min_prominence}\n"
-                f"Q spacing range: {min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹\n"
-                f"Expected thickness: {min_thickness_nm} - {max_thickness_nm} nm\n"
-                f"Savgol window: {window_size if smooth_data else 'N/A'}"
-            )
-            plt.text(0.02, 0.02, info_text, transform=plt.gca().transAxes, 
-                    fontsize=9, verticalalignment='bottom', horizontalalignment='left',
-                    bbox=textbox_props)
-            
-            # Save plot if output directory is specified
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                if plot_prefix is None:
-                    plot_prefix = "thickness_estimate"
-                plot_filename = f"{plot_prefix}_thickness.png"
-                plot_path = os.path.join(output_dir, plot_filename)
-                plt.savefig(plot_path, dpi=150)
-                print(f"\nSaved thickness estimation plot to {plot_path}")
-                
-            plt.tight_layout()
-            plt.show()
-        
-        # Return the results
-        return thickness, peak_positions, valley_positions
-    
-
     def save_reduced_data_metadata(self, scan_group, reduced_data, output_dir=None, output_format='csv'):
         """
         Save metadata about the reduced data to a file with the same name as the original log file
@@ -2402,306 +2567,9 @@ class RSoXRProcessor:
             print(f"Saved metadata to {meta_path}")
             return meta_path
 
-    def estimate_film_thickness(self, reflectivity_data, min_prominence=0.1, min_spacing=0.01, 
-                              max_spacing=0.3, min_thickness_nm=20, max_thickness_nm=100, 
-                              plot=True, output_dir=None, plot_prefix=None, smooth_data=True):
-        """
-        Estimate the film thickness based on the fringe spacing in Q-space
-        
-        Parameters:
-        -----------
-        reflectivity_data : numpy array
-            Reduced reflectivity data with columns [Q, R, error]
-        min_prominence : float
-            Minimum prominence for peak/valley detection
-        min_spacing : float
-            Minimum spacing between adjacent peaks/valleys in Q-space (Å⁻¹)
-            For a 100nm film, fringe spacing is ~0.031 Å⁻¹
-        max_spacing : float
-            Maximum spacing between adjacent peaks/valleys in Q-space (Å⁻¹)
-            For a 20nm film, fringe spacing is ~0.157 Å⁻¹
-        min_thickness_nm : float
-            Minimum expected film thickness in nm
-        max_thickness_nm : float
-            Maximum expected film thickness in nm
-        plot : bool
-            Whether to generate plots during processing
-        output_dir : str, optional
-            Directory to save plots if provided
-        plot_prefix : str, optional
-            Prefix for plot filenames
-        smooth_data : bool
-            Whether to apply smoothing to the data before peak detection
-            
-        Returns:
-        --------
-        thickness : float
-            Estimated film thickness in Ångstroms
-        peak_positions : array
-            Positions of detected peaks in Q-space
-        valley_positions : array
-            Positions of detected valleys in Q-space
-        """
-        import numpy as np
-        from scipy.signal import find_peaks, peak_prominences, savgol_filter
-        import matplotlib.pyplot as plt
-        import os
-        
-        # Convert thickness range to expected fringe spacing range
-        min_fringe_spacing = 2 * np.pi / (max_thickness_nm * 10)  # max thickness -> min spacing
-        max_fringe_spacing = 2 * np.pi / (min_thickness_nm * 10)  # min thickness -> max spacing
-        
-        print(f"Expected fringe spacing range: {min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹")
-        print(f"Based on thickness range: {min_thickness_nm} - {max_thickness_nm} nm")
-        
-        # Use user-specified spacing if provided
-        if min_spacing > 0:
-            min_fringe_spacing = min_spacing
-        if max_spacing > 0:
-            max_fringe_spacing = max_spacing
-        
-        # Extract Q and reflectivity
-        Q = reflectivity_data[:, 0]
-        R = reflectivity_data[:, 1]
-        
-        # Sort data by Q values (just to be safe)
-        sort_indices = np.argsort(Q)
-        Q = Q[sort_indices]
-        R = R[sort_indices]
-        
-        # Apply smoothing if requested
-        if smooth_data:
-            # Determine the best window size for Savitzky-Golay filter (must be odd)
-            window_size = max(min(25, len(Q) // 10 * 2 + 1), 5)
-            if window_size % 2 == 0:
-                window_size += 1
-                
-            # Apply Savitzky-Golay filter to reduce noise
-            try:
-                log_R_smooth = savgol_filter(np.log10(R), window_size, 2)
-            except Exception as e:
-                print(f"Warning: Smoothing failed ({str(e)}), using raw data")
-                log_R_smooth = np.log10(R)
-        else:
-            log_R_smooth = np.log10(R)
-        
-        # Find the valleys (minima) in the reflectivity
-        # For valleys, we'll find peaks in the negative of log_R
-        valley_indices, valley_props = find_peaks(-log_R_smooth, 
-                                                prominence=min_prominence,
-                                                distance=int(min_fringe_spacing / (Q[1] - Q[0])))
-        
-        if len(valley_indices) > 0:
-            valley_positions = Q[valley_indices]
-            valley_values = log_R_smooth[valley_indices]
-            valley_prominences = peak_prominences(-log_R_smooth, valley_indices)[0]
-        else:
-            valley_positions = np.array([])
-            valley_values = np.array([])
-            valley_prominences = np.array([])
-        
-        # Find the peaks (maxima) in the reflectivity
-        peak_indices, peak_props = find_peaks(log_R_smooth, 
-                                             prominence=min_prominence,
-                                             distance=int(min_fringe_spacing / (Q[1] - Q[0])))
-        
-        if len(peak_indices) > 0:
-            peak_positions = Q[peak_indices]
-            peak_values = log_R_smooth[peak_indices]
-            peak_prominences = peak_prominences(log_R_smooth, peak_indices)[0]
-        else:
-            peak_positions = np.array([])
-            peak_values = np.array([])
-            peak_prominences = np.array([])
-        
-        # Filter out peak/valley pairs that are too close or too far apart
-        valid_valley_spacings = []
-        valid_valley_positions = []
-        
-        if len(valley_positions) >= 2:
-            valley_spacings = np.diff(valley_positions)
-            
-            # Filter valid spacings
-            valid_indices = np.where((valley_spacings >= min_fringe_spacing) & 
-                                    (valley_spacings <= max_fringe_spacing))[0]
-            
-            # Get valid spacings
-            if len(valid_indices) > 0:
-                for idx in valid_indices:
-                    valid_valley_spacings.append(valley_spacings[idx])
-                    valid_valley_positions.append(valley_positions[idx:idx+2])
-        
-        # Calculate valley-based thickness
-        if valid_valley_spacings:
-            avg_valley_spacing = np.mean(valid_valley_spacings)
-            valley_thickness = 2 * np.pi / avg_valley_spacing
-        else:
-            avg_valley_spacing = None
-            valley_thickness = None
-        
-        # Similarly for peaks
-        valid_peak_spacings = []
-        valid_peak_positions = []
-        
-        if len(peak_positions) >= 2:
-            peak_spacings = np.diff(peak_positions)
-            
-            # Filter valid spacings
-            valid_indices = np.where((peak_spacings >= min_fringe_spacing) & 
-                                   (peak_spacings <= max_fringe_spacing))[0]
-            
-            # Get valid spacings
-            if len(valid_indices) > 0:
-                for idx in valid_indices:
-                    valid_peak_spacings.append(peak_spacings[idx])
-                    valid_peak_positions.append(peak_positions[idx:idx+2])
-        
-        # Calculate peak-based thickness
-        if valid_peak_spacings:
-            avg_peak_spacing = np.mean(valid_peak_spacings)
-            peak_thickness = 2 * np.pi / avg_peak_spacing
-        else:
-            avg_peak_spacing = None
-            peak_thickness = None
-        
-        # Combine the results
-        thicknesses = []
-        if valley_thickness is not None:
-            thicknesses.append(valley_thickness)
-        if peak_thickness is not None:
-            thicknesses.append(peak_thickness)
-        
-        # Calculate final thickness estimate
-        if thicknesses:
-            thickness = np.mean(thicknesses)
-            thickness_nm = thickness / 10  # Convert Å to nm
-        else:
-            thickness = None
-            thickness_nm = None
-        
-        # Print results
-        print("\nFilm Thickness Estimation Results:")
-        print("-" * 40)
-        
-        if valley_thickness is not None:
-            print(f"Valley-based estimate: {valley_thickness:.1f} Å ({valley_thickness/10:.1f} nm)")
-            print(f"  Average spacing between valleys: {avg_valley_spacing:.4f} Å⁻¹")
-            print(f"  Number of valid valley spacings: {len(valid_valley_spacings)}")
-        else:
-            print("No valid valley spacings detected for thickness estimation")
-        
-        if peak_thickness is not None:
-            print(f"Peak-based estimate: {peak_thickness:.1f} Å ({peak_thickness/10:.1f} nm)")
-            print(f"  Average spacing between peaks: {avg_peak_spacing:.4f} Å⁻¹")
-            print(f"  Number of valid peak spacings: {len(valid_peak_spacings)}")
-        else:
-            print("No valid peak spacings detected for thickness estimation")
-        
-        if thickness is not None:
-            print(f"\nFinal thickness estimate: {thickness:.1f} Å ({thickness_nm:.1f} nm)")
-        else:
-            print("\nCould not estimate thickness - insufficient valid peaks/valleys detected")
-            print(f"Try adjusting the spacing range ({min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹)")
-            print(f"Or min_prominence parameter (currently {min_prominence})")
-        
-        # Create plot if requested
-        if plot:
-            plt.figure(figsize=(12, 8))
-            
-            # Plot the reflectivity data
-            plt.plot(Q, log_R_smooth, 'b-', label='log(Reflectivity) [Smoothed]')
-            if smooth_data:
-                plt.plot(Q, np.log10(R), 'b-', alpha=0.3, label='log(Reflectivity) [Raw]')
-            
-            # Mark all detected valleys
-            if len(valley_positions) > 0:
-                plt.plot(valley_positions, valley_values, 'rv', markersize=8, alpha=0.5, label='All Valleys')
-            
-            # Mark all detected peaks
-            if len(peak_positions) > 0:
-                plt.plot(peak_positions, peak_values, 'go', markersize=8, alpha=0.5, label='All Peaks')
-            
-            # Mark valid valley pairs
-            for pos_pair in valid_valley_positions:
-                idx1 = np.where(valley_positions == pos_pair[0])[0][0]
-                idx2 = np.where(valley_positions == pos_pair[1])[0][0]
-                
-                spacing = pos_pair[1] - pos_pair[0]
-                midpoint = (pos_pair[0] + pos_pair[1]) / 2
-                
-                plt.plot(pos_pair, [valley_values[idx1], valley_values[idx2]], 'r-', linewidth=2)
-                plt.annotate(f"{spacing:.4f}", 
-                           xy=(midpoint, np.interp(midpoint, Q, log_R_smooth)),
-                           xytext=(0, -20),
-                           textcoords='offset points',
-                           ha='center',
-                           color='red',
-                           arrowprops=dict(arrowstyle='->', color='red'))
-            
-            # Mark valid peak pairs
-            for pos_pair in valid_peak_positions:
-                idx1 = np.where(peak_positions == pos_pair[0])[0][0]
-                idx2 = np.where(peak_positions == pos_pair[1])[0][0]
-                
-                spacing = pos_pair[1] - pos_pair[0]
-                midpoint = (pos_pair[0] + pos_pair[1]) / 2
-                
-                plt.plot(pos_pair, [peak_values[idx1], peak_values[idx2]], 'g-', linewidth=2)
-                plt.annotate(f"{spacing:.4f}", 
-                           xy=(midpoint, np.interp(midpoint, Q, log_R_smooth)),
-                           xytext=(0, 20),
-                           textcoords='offset points',
-                           ha='center',
-                           color='green',
-                           arrowprops=dict(arrowstyle='->', color='green'))
-            
-            # Add thickness annotation
-            if thickness is not None:
-                title = f"Film Thickness Estimation: {thickness:.1f} Å ({thickness_nm:.1f} nm)"
-                if valley_thickness is not None and peak_thickness is not None:
-                    title += f"\nPeak-based: {peak_thickness:.1f} Å, Valley-based: {valley_thickness:.1f} Å"
-            else:
-                title = "Film Thickness Estimation: Insufficient Valid Data"
-                
-            plt.title(title)
-            plt.xlabel('Q (Å⁻¹)')
-            plt.ylabel('log(Reflectivity)')
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.7)
-            
-            # Add the expected fringe spacing range as vertical lines
-            min_thickness_spacing = 2 * np.pi / (max_thickness_nm * 10)
-            max_thickness_spacing = 2 * np.pi / (min_thickness_nm * 10)
-            
-            # Add a text box with parameter settings
-            textbox_props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-            info_text = (
-                f"Parameters:\n"
-                f"Min prominence: {min_prominence}\n"
-                f"Q spacing range: {min_fringe_spacing:.4f} - {max_fringe_spacing:.4f} Å⁻¹\n"
-                f"Expected thickness: {min_thickness_nm} - {max_thickness_nm} nm"
-            )
-            plt.text(0.02, 0.02, info_text, transform=plt.gca().transAxes, 
-                    fontsize=9, verticalalignment='bottom', horizontalalignment='left',
-                    bbox=textbox_props)
-            
-            # Save plot if output directory is specified
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                if plot_prefix is None:
-                    plot_prefix = "thickness_estimate"
-                plot_filename = f"{plot_prefix}_thickness.png"
-                plot_path = os.path.join(output_dir, plot_filename)
-                plt.savefig(plot_path, dpi=150)
-                print(f"\nSaved thickness estimation plot to {plot_path}")
-                
-            plt.tight_layout()
-            plt.show()
-        
-        # Return the results
-        return thickness, peak_positions, valley_positions
     
-    def _sort_files_in_group(self, group):
+    
+    def _sort_files_in_group(self, group, preserve_scan_numbers=True):
         """
         Sort files within a group by detector type and angle (same as initial grouping)
         
@@ -2709,6 +2577,9 @@ class RSoXRProcessor:
         -----------
         group : dict
             Scan group dictionary
+        preserve_scan_numbers : bool
+            If True, preserve original scan number assignments after sorting.
+            If False, allow scan numbers to be reordered with files (old behavior).
             
         Returns:
         --------
@@ -2717,6 +2588,11 @@ class RSoXRProcessor:
         """
         if not group.get('metadata'):
             return group
+        
+        # Store original scan numbers if they exist and we want to preserve them
+        original_scan_numbers = None
+        if preserve_scan_numbers and 'scan_numbers' in group:
+            original_scan_numbers = list(group['scan_numbers'])
         
         # Separate files by detector type
         photodiode_items = []
@@ -2728,7 +2604,8 @@ class RSoXRProcessor:
             item = {
                 'filename': group['files'][i],
                 'metadata': meta,
-                'trim': group['trims'][i] if i < len(group['trims']) else (0, -1)
+                'trim': group['trims'][i] if i < len(group['trims']) else (0, -1),
+                'scan_number': group['scan_numbers'][i] if 'scan_numbers' in group and i < len(group['scan_numbers']) else None
             }
             
             if "photodiode" in detector_str:
@@ -2749,6 +2626,15 @@ class RSoXRProcessor:
         group['files'] = [item['filename'] for item in sorted_items]
         group['metadata'] = [item['metadata'] for item in sorted_items]
         group['trims'] = [item['trim'] for item in sorted_items]
+        
+        # Handle scan numbers based on preserve_scan_numbers flag
+        if 'scan_numbers' in group:
+            if preserve_scan_numbers and original_scan_numbers:
+                # Keep original scan numbers unchanged
+                group['scan_numbers'] = original_scan_numbers
+            else:
+                # Allow scan numbers to be reordered with their files (old behavior)
+                group['scan_numbers'] = [item['scan_number'] for item in sorted_items if item['scan_number'] is not None]
         
         # Recalculate overall angle range
         overall_min_angle = float('inf')
@@ -2771,7 +2657,8 @@ class RSoXRProcessor:
         
         return group
 
-    def combine_groups(self, scan_groups, group_indices, new_sample_name=None):
+
+    def combine_groups(self, scan_groups, group_indices, new_sample_name=None, resort_combined_group=False):
         """
         Combine multiple groups into a single group
         
@@ -2783,6 +2670,8 @@ class RSoXRProcessor:
             Indices of groups to combine (1-based, as displayed to user)
         new_sample_name : str, optional
             Name for the combined group. If None, uses the first group's name
+        resort_combined_group : bool
+            Whether to resort the combined group by detector/angle (default: False)
             
         Returns:
         --------
@@ -2820,31 +2709,39 @@ class RSoXRProcessor:
         for idx in zero_based_indices[:-1]:  # Skip the base group
             group = scan_groups[idx]
             if abs(group['energy'] - base_energy) > energy_tolerance:
-                print(f"Warning: Energy mismatch between groups. Base: {base_energy:.1f} eV, "
-                    f"Group {idx+1}: {group['energy']:.1f} eV")
+                print(f"Warning: Energy mismatch between groups. "
+                        f"Base: {base_energy:.1f} eV, "
+                        f"Group {idx+1}: {group['energy']:.1f} eV")
         
-        # Combine all files, metadata, and trims
+        # Combine all files, metadata, trims, and scan numbers
         combined_files = list(base_group['files'])
         combined_metadata = list(base_group['metadata'])
         combined_trims = list(base_group['trims'])
+        combined_scan_numbers = list(base_group.get('scan_numbers', []))
         
         for idx in zero_based_indices[:-1]:  # Skip the base group
             group = scan_groups[idx]
             combined_files.extend(group['files'])
             combined_metadata.extend(group['metadata'])
             combined_trims.extend(group['trims'])
+            combined_scan_numbers.extend(group.get('scan_numbers', []))
         
         # Update the base group
         base_group['files'] = combined_files
         base_group['metadata'] = combined_metadata
         base_group['trims'] = combined_trims
+        if 'scan_numbers' in base_group or combined_scan_numbers:
+            base_group['scan_numbers'] = combined_scan_numbers
         
         # Update sample name if provided
         if new_sample_name:
             base_group['sample_name'] = new_sample_name
         
-        # Sort the combined group
-        base_group = self._sort_files_in_group(base_group)
+        # Sort the combined group only if explicitly requested
+        if resort_combined_group:
+            base_group = self._sort_files_in_group(base_group, preserve_scan_numbers=False)
+        else:
+            base_group = self._sort_files_in_group(base_group, preserve_scan_numbers=True)
         
         # Remove the other groups (in reverse order to maintain indices)
         new_scan_groups = list(scan_groups)
@@ -2866,7 +2763,9 @@ class RSoXRProcessor:
         
         return new_scan_groups
 
-    def remove_scan_from_group(self, scan_groups, group_index, file_index):
+
+
+    def remove_scan_from_group(self, scan_groups, group_index, file_index, resort_group=False):
         """
         Remove a specific scan from a group
         
@@ -2878,6 +2777,8 @@ class RSoXRProcessor:
             Index of the group to modify (1-based, as displayed to user)
         file_index : int
             Index of the file within the group to remove (1-based, as displayed to user)
+        resort_group : bool
+            Whether to resort the group after removing the scan (default: False)
             
         Returns:
         --------
@@ -2904,7 +2805,8 @@ class RSoXRProcessor:
         removed_info = {
             'filename': group['files'][zero_based_file_index],
             'metadata': group['metadata'][zero_based_file_index] if zero_based_file_index < len(group['metadata']) else None,
-            'trim': group['trims'][zero_based_file_index] if zero_based_file_index < len(group['trims']) else (0, -1)
+            'trim': group['trims'][zero_based_file_index] if zero_based_file_index < len(group['trims']) else (0, -1),
+            'scan_number': group['scan_numbers'][zero_based_file_index] if 'scan_numbers' in group and zero_based_file_index < len(group['scan_numbers']) else None
         }
         
         # Remove from all lists
@@ -2913,6 +2815,8 @@ class RSoXRProcessor:
             group['metadata'].pop(zero_based_file_index)
         if zero_based_file_index < len(group['trims']):
             group['trims'].pop(zero_based_file_index)
+        if 'scan_numbers' in group and zero_based_file_index < len(group['scan_numbers']):
+            group['scan_numbers'].pop(zero_based_file_index)
         
         # Check if group is now empty
         if not group['files']:
@@ -2921,8 +2825,11 @@ class RSoXRProcessor:
             scan_groups.pop(zero_based_group_index)
             print(f"Removed empty group {group_index}")
         else:
-            # Re-sort the group and update angle ranges
-            scan_groups[zero_based_group_index] = self._sort_files_in_group(group)
+            # Re-sort the group only if explicitly requested
+            if resort_group:
+                scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=False)
+            else:
+                scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=True)
         
         print(f"Removed {os.path.basename(removed_info['filename'])} from group {group_index}")
         
@@ -2983,7 +2890,7 @@ class RSoXRProcessor:
         
         return updated_groups
 
-    def move_scan_to_existing_group(self, scan_groups, source_group_index, file_index, target_group_index):
+    def move_scan_to_existing_group(self, scan_groups, source_group_index, file_index, target_group_index, resort_groups=False):
         """
         Move a scan from one group to another existing group
         
@@ -2997,6 +2904,8 @@ class RSoXRProcessor:
             Index of the file within the source group to move (1-based, as displayed to user)
         target_group_index : int
             Index of the target group (1-based, as displayed to user)
+        resort_groups : bool
+            Whether to resort both groups after the move (default: False)
             
         Returns:
         --------
@@ -3015,7 +2924,7 @@ class RSoXRProcessor:
             return scan_groups
         
         # Remove the scan from the source group
-        updated_groups, removed_info = self.remove_scan_from_group(scan_groups, source_group_index, file_index)
+        updated_groups, removed_info = self.remove_scan_from_group(scan_groups, source_group_index, file_index, resort_group=resort_groups)
         
         if removed_info is None:
             return scan_groups
@@ -3035,9 +2944,14 @@ class RSoXRProcessor:
         if removed_info['metadata']:
             target_group['metadata'].append(removed_info['metadata'])
         target_group['trims'].append(removed_info['trim'])
+        if 'scan_numbers' in target_group and removed_info.get('scan_number'):
+            target_group['scan_numbers'].append(removed_info['scan_number'])
         
-        # Sort the target group
-        updated_groups[adjusted_target_index] = self._sort_files_in_group(target_group)
+        # Sort the target group only if explicitly requested
+        if resort_groups:
+            updated_groups[adjusted_target_index] = self._sort_files_in_group(target_group, preserve_scan_numbers=False)
+        else:
+            updated_groups[adjusted_target_index] = self._sort_files_in_group(target_group, preserve_scan_numbers=True)
         
         print(f"Moved {os.path.basename(removed_info['filename'])} to group {adjusted_target_index + 1}")
         
@@ -3325,3 +3239,659 @@ class RSoXRProcessor:
         self.print_group_summary(current_groups, show_details=False)
         
         return current_groups
+    
+    def load_open_beam_file(self, file_path):
+        """
+        Load open beam intensity data from file
+        
+        Parameters:
+        -----------
+        file_path : str
+            Path to the open beam data file
+            
+        Returns:
+        --------
+        bool
+            True if loaded successfully, False otherwise
+        """
+        try:
+            # Based on the example file, the format appears to be:
+            # Column 1: Energy (eV) 
+            # Column 2: Intensity
+            # Column 3: Error (optional)
+            # Column 4: Another parameter (optional)
+            
+            print(f"Loading open beam file: {file_path}")
+            
+            # Try loading with numpy first (handles whitespace/tab separation automatically)
+            try:
+                data = np.loadtxt(file_path, skiprows=1)
+                print(f"Loaded data shape: {data.shape}")
+                
+                if len(data.shape) == 1:
+                    print("Error: File appears to contain only one row or one column")
+                    return False
+                    
+                if data.shape[1] >= 2:
+                    # Use only the first two columns (energy, intensity)
+                    self.open_beam_data = pd.DataFrame({
+                        'energy': data[:, 0],
+                        'intensity': data[:, 1]
+                    })
+                    print(f"Using columns: Energy (col 1), Intensity (col 2)")
+                    
+                    # Optionally store additional columns for reference
+                    if data.shape[1] >= 3:
+                        self.open_beam_data['error'] = data[:, 2]
+                        print(f"Also loaded error column (col 3)")
+                    if data.shape[1] >= 4:
+                        self.open_beam_data['monitor'] = data[:, 3]
+                        print(f"Also loaded monitor/additional data (col 4)")
+                        
+                else:
+                    print(f"Error: Open beam file must have at least 2 columns (energy, intensity)")
+                    print(f"Found {data.shape[1]} columns")
+                    return False
+                    
+            except Exception as e:
+                print(f"numpy.loadtxt failed: {e}")
+                print("Trying pandas read_csv...")
+                
+                # If numpy fails, try pandas with various separators
+                for sep in ['\t', ' ', ',', None]:  # None means any whitespace
+                    try:
+                        print(f"Trying separator: {repr(sep)}")
+                        self.open_beam_data = pd.read_csv(file_path, sep=sep, header=None, comment='#')
+                        
+                        if self.open_beam_data.shape[1] >= 2:
+                            # Use only first two columns
+                            self.open_beam_data = self.open_beam_data.iloc[:, :2]
+                            self.open_beam_data.columns = ['energy', 'intensity']
+                            print(f"Successfully loaded with pandas using separator {repr(sep)}")
+                            break
+                        else:
+                            print(f"Not enough columns with separator {repr(sep)}")
+                            continue
+                            
+                    except Exception as e2:
+                        print(f"Pandas with separator {repr(sep)} failed: {e2}")
+                        continue
+                else:
+                    # If all methods fail
+                    print("All loading methods failed")
+                    return False
+            
+            self.open_beam_file = file_path
+            
+            # Basic validation
+            if len(self.open_beam_data) == 0:
+                print(f"Error: Open beam file is empty")
+                return False
+                
+            # Check for valid data
+            if self.open_beam_data['energy'].isna().any():
+                print("Warning: Some energy values are NaN, removing those rows")
+                self.open_beam_data = self.open_beam_data.dropna(subset=['energy'])
+                
+            if self.open_beam_data['intensity'].isna().any():
+                print("Warning: Some intensity values are NaN, removing those rows")
+                self.open_beam_data = self.open_beam_data.dropna(subset=['intensity'])
+            
+            if len(self.open_beam_data) == 0:
+                print("Error: No valid data remaining after removing NaN values")
+                return False
+                
+            # Sort by energy for interpolation
+            self.open_beam_data = self.open_beam_data.sort_values('energy').reset_index(drop=True)
+            
+            # Initialize open beam normalization flag
+            if not hasattr(self, 'use_open_beam_normalization'):
+                self.use_open_beam_normalization = False
+            
+            print(f"Successfully loaded open beam data from {os.path.basename(file_path)}")
+            print(f"Energy range: {self.open_beam_data['energy'].min():.1f} - {self.open_beam_data['energy'].max():.1f} eV")
+            print(f"Data points: {len(self.open_beam_data)}")
+            print(f"Sample data:")
+            print(f"  First few points: Energy={self.open_beam_data['energy'].iloc[0]:.1f} eV, Intensity={self.open_beam_data['intensity'].iloc[0]:.3e}")
+            print(f"  Last few points: Energy={self.open_beam_data['energy'].iloc[-1]:.1f} eV, Intensity={self.open_beam_data['intensity'].iloc[-1]:.3e}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error loading open beam file {file_path}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+
+    def get_open_beam_intensity(self, energy):
+        """
+        Get open beam intensity at a specific energy using interpolation
+        
+        Parameters:
+        -----------
+        energy : float
+            Energy in eV
+            
+        Returns:
+        --------
+        float
+            Open beam intensity at the specified energy, or None if error
+        """
+        if not hasattr(self, 'open_beam_data') or self.open_beam_data is None:
+            print("Error: No open beam data loaded")
+            return None
+            
+        try:
+            # Create interpolation function
+            energy_values = self.open_beam_data['energy'].values
+            intensity_values = self.open_beam_data['intensity'].values
+            
+            if len(energy_values) == 1:
+                # If only one data point, use that value
+                return intensity_values[0]
+            
+            # Use linear interpolation with extrapolation for energies outside range
+            interp_func = interp1d(energy_values, intensity_values, 
+                                kind='linear', bounds_error=False, fill_value='extrapolate')
+            
+            intensity = float(interp_func(energy))
+            
+            # Check if extrapolation was used (warn user)
+            if energy < energy_values.min() or energy > energy_values.max():
+                print(f"Warning: Energy {energy:.1f} eV is outside open beam data range "
+                    f"({energy_values.min():.1f} - {energy_values.max():.1f} eV). Using extrapolation.")
+            
+            return intensity
+            
+        except Exception as e:
+            print(f"Error interpolating open beam intensity at {energy:.1f} eV: {str(e)}")
+            return None
+
+
+    def set_open_beam_normalization(self, use_open_beam=True):
+        """
+        Enable or disable open beam normalization
+        
+        Parameters:
+        -----------
+        use_open_beam : bool
+            True to use open beam normalization, False for standard normalization
+            
+        Returns:
+        --------
+        bool
+            True if setting was successful
+        """
+        if use_open_beam and (not hasattr(self, 'open_beam_data') or self.open_beam_data is None):
+            print("Warning: No open beam data loaded. Please load open beam file first.")
+            return False
+            
+        self.use_open_beam_normalization = use_open_beam
+        norm_type = "open beam" if use_open_beam else "standard"
+        print(f"Normalization set to: {norm_type}")
+        return True
+
+
+    def plot_open_beam_data(self, save_path=None):
+        """
+        Plot the loaded open beam data
+        
+        Parameters:
+        -----------
+        save_path : str, optional
+            Path to save the plot
+        """
+        if not hasattr(self, 'open_beam_data') or self.open_beam_data is None:
+            print("Error: No open beam data to plot")
+            return
+            
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.open_beam_data['energy'], self.open_beam_data['intensity'], 'bo-', markersize=4)
+        plt.xlabel('Energy (eV)')
+        plt.ylabel('Open Beam Intensity')
+        plt.title(f'Open Beam Data\n{os.path.basename(self.open_beam_file)}')
+        plt.grid(True, alpha=0.3)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Open beam plot saved to {save_path}")
+        
+        plt.show()
+
+
+    def apply_normalization(self, intensity_data, energy, normalize_type="auto"):
+        """
+        Apply normalization to intensity data (standard or open beam)
+        
+        Parameters:
+        -----------
+        intensity_data : numpy.ndarray
+            Intensity data to normalize
+        energy : float
+            Photon energy in eV
+        normalize_type : str
+            "auto" (use current setting), "standard", "open_beam", or "none"
+            
+        Returns:
+        --------
+        numpy.ndarray
+            Normalized intensity data
+        """
+        if normalize_type == "none":
+            return intensity_data
+        
+        # Determine which normalization to use
+        if normalize_type == "auto":
+            use_open_beam = getattr(self, 'use_open_beam_normalization', False)
+        elif normalize_type == "open_beam":
+            use_open_beam = True
+        elif normalize_type == "standard":
+            use_open_beam = False
+        else:
+            print(f"Warning: Unknown normalization type '{normalize_type}'. Using standard.")
+            use_open_beam = False
+        
+        if use_open_beam and hasattr(self, 'open_beam_data') and self.open_beam_data is not None:
+            # Use open beam normalization
+            open_beam_intensity = self.get_open_beam_intensity(energy)
+            
+            if open_beam_intensity is None or open_beam_intensity <= 0:
+                print(f"Warning: Invalid open beam intensity at {energy:.1f} eV. Using standard normalization.")
+                normalized_data = intensity_data / np.max(intensity_data)
+                print("Applied standard normalization (fallback)")
+            else:
+                normalized_data = intensity_data / open_beam_intensity
+                print(f"Applied open beam normalization at {energy:.1f} eV (I0 = {open_beam_intensity:.3e})")
+        else:
+            # Use standard normalization
+            normalized_data = intensity_data / np.max(intensity_data)
+            print("Applied standard normalization")
+        
+        return normalized_data
+
+
+    def reduce_data_with_open_beam_option(self, scans, trims, backgrounds, energy, 
+                                    normalize=True, plot=False, convert_to_photons=False,
+                                    output_dir=None, plot_prefix=None,
+                                    smooth_data=False, savgol_window=None, savgol_order=2,
+                                    remove_zeros=True, use_open_beam=None):
+        """
+        Enhanced version of reduce_data_with_backgrounds that supports open beam normalization
+        UPDATED to include proper plotting functionality
+        """
+        # Temporarily set open beam normalization if override provided
+        original_setting = getattr(self, 'use_open_beam_normalization', False)
+        if use_open_beam is not None:
+            self.use_open_beam_normalization = use_open_beam
+        
+        try:
+            if len(scans) != len(trims) or len(scans) != len(backgrounds):
+                print(f"Error: Mismatch in number of scans ({len(scans)}), trims ({len(trims)}), and backgrounds ({len(backgrounds)})")
+                return None
+            
+            # Ensure we have trim values for all scans
+            if len(trims) < len(scans):
+                print(f"Warning: Not enough trim values provided. Adding default trims for {len(scans) - len(trims)} scans.")
+                trims.extend([(0, -1)] * (len(scans) - len(trims)))
+            
+            # Process the first scan
+            refl = deepcopy(scans[0][trims[0][0]:(len(scans[0][:,0])+trims[0][1]), 0:2])
+            
+            # Apply background subtraction to first scan
+            if backgrounds[0] != 0.0:
+                refl[:, 1] = refl[:, 1] - backgrounds[0]
+                print(f"Applied background subtraction to scan 1: -{backgrounds[0]:.3f}")
+            
+            # Remove zeros if requested
+            if remove_zeros:
+                non_zero_mask = refl[:,1] > 0
+                if not all(non_zero_mask):
+                    print(f"Removing {len(refl) - np.sum(non_zero_mask)} zero data points from first scan")
+                    refl = refl[non_zero_mask]
+            
+            # Convert to photon flux if requested
+            if convert_to_photons and hasattr(self, 'calibration_data') and self.calibration_data is not None:
+                refl[:,1] = self.amp_to_photon_flux(refl[:,1], energy)
+            
+            # Store all raw scans for combined plotting (IMPORTANT FOR PLOTTING)
+            all_scans = [deepcopy(refl)]
+            
+            # Process additional scans (similar logic to existing methods)
+            for i in range(1, len(scans)):
+                scan = scans[i][trims[i][0]:(len(scans[i][:,0])+trims[i][1]), 0:2]
+                
+                # Apply background subtraction
+                if backgrounds[i] != 0.0:
+                    scan[:, 1] = scan[:, 1] - backgrounds[i]
+                    print(f"Applied background subtraction to scan {i+1}: -{backgrounds[i]:.3f}")
+                
+                # Remove zeros if requested
+                if remove_zeros:
+                    non_zero_mask = scan[:,1] > 0
+                    if not all(non_zero_mask):
+                        print(f"Removing {len(scan) - np.sum(non_zero_mask)} zero data points from scan {i+1}")
+                        scan = scan[non_zero_mask]
+                
+                # Convert to photon flux if requested
+                if convert_to_photons and hasattr(self, 'calibration_data') and self.calibration_data is not None:
+                    scan[:,1] = self.amp_to_photon_flux(scan[:,1], energy)
+                
+                # Find overlap and scale (use existing logic from your processor)
+                idx, val = self.find_nearest(scan[:,0], refl[-1,0])
+                
+                # Check for valid overlap
+                if idx <= 0 or np.isnan(val):
+                    print(f"Warning: No overlap found for scan {i+1}. Appending without scaling.")
+                    scale = 1.0
+                else:
+                    # Calculate scaling factor
+                    scale = refl[-1, 1] / scan[idx, 1] if scan[idx, 1] != 0 else 1.0
+                    scan[:, 1] = scan[:, 1] * scale
+                    print(f"Scaling scan {i+1} by factor {scale:.3f}")
+                
+                # Store processed scan for plotting
+                all_scans.append(deepcopy(scan))
+                
+                # Combine with existing data
+                refl = np.concatenate((refl, scan))
+            
+            # Apply smoothing if requested
+            if smooth_data and len(refl) > 0:
+                # Validate smoothing parameters
+                if savgol_window is None:
+                    window_size = max(min(25, len(refl) // 10 * 2 + 1), 5)
+                    if window_size % 2 == 0:
+                        window_size += 1
+                else:
+                    window_size = savgol_window
+                    if window_size % 2 == 0:
+                        window_size += 1
+                    window_size = max(window_size, 5)
+                
+                polynomial_order = min(savgol_order, window_size - 1)
+                polynomial_order = max(polynomial_order, 1)
+                
+                if len(refl) >= window_size:
+                    from scipy.signal import savgol_filter
+                    refl_smooth = deepcopy(refl)
+                    refl_smooth[:, 1] = savgol_filter(refl[:, 1], window_size, polynomial_order)
+                    print(f"Applied Savitzky-Golay smoothing (window={window_size}, order={polynomial_order})")
+                else:
+                    print(f"Warning: Not enough data points ({len(refl)}) for smoothing. Returning unsmoothed data.")
+                    refl_smooth = deepcopy(refl)
+            else:
+                refl_smooth = deepcopy(refl)
+            
+            # Store raw data copy
+            raw_refl_q = deepcopy(refl)
+            
+            # Apply normalization using the new method
+            if normalize:
+                # Apply normalization (open beam or standard based on current setting)
+                refl_smooth[:, 1] = self.apply_normalization(refl_smooth[:, 1], energy)
+                raw_refl_q[:, 1] = self.apply_normalization(raw_refl_q[:, 1], energy)
+                
+                # Add error column (1% error assumption)
+                refl_smooth = np.column_stack((refl_smooth, refl_smooth[:, 1] * 0.01))
+                raw_refl_q = np.column_stack((raw_refl_q, raw_refl_q[:, 1] * 0.01))
+            else:
+                # Add error column without normalization
+                refl_smooth = np.column_stack((refl_smooth, refl_smooth[:, 1] * 0.01))
+                raw_refl_q = np.column_stack((raw_refl_q, raw_refl_q[:, 1] * 0.01))
+            
+            # IMPORTANT: Sort by Q values for final output (THIS WAS MISSING!)
+            raw_refl_q = raw_refl_q[raw_refl_q[:, 0].argsort()]
+            refl_smooth = refl_smooth[refl_smooth[:, 0].argsort()]
+            
+            # Generate plots if requested (THIS IS THE KEY PART THAT WAS MISSING)
+            if plot and plot_prefix:
+                self._plot_processed_data_with_open_beam_info(all_scans, refl_smooth if smooth_data else raw_refl_q, 
+                                                            backgrounds, energy, plot_prefix, output_dir)
+            
+            # Return processed data
+            if smooth_data:
+                return refl_smooth, raw_refl_q
+            else:
+                return raw_refl_q
+        
+        finally:
+            # Restore original setting if override was used
+            if use_open_beam is not None:
+                self.use_open_beam_normalization = original_setting
+
+
+    def _plot_processed_data_with_open_beam_info(self, all_scans, final_data, backgrounds, energy, 
+                                        plot_prefix, output_dir=None):
+        """
+        Generate plots showing the effect of background subtraction and normalization type
+        UPDATED VERSION that includes open beam information in plots
+        
+        Parameters:
+        -----------
+        all_scans : list of numpy arrays
+            Individual processed scans (after background subtraction and scaling)
+        final_data : numpy array
+            Final combined and processed data
+        backgrounds : list of floats
+            Background values that were subtracted
+        energy : float
+            Photon energy in eV
+        plot_prefix : str
+            Prefix for saved plot files
+        output_dir : str, optional
+            Directory to save plots
+        """
+        import matplotlib.pyplot as plt
+        
+        try:
+            # Create figure with subplots
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Plot 1: Individual scans (after background subtraction)
+            for i, (scan, bg) in enumerate(zip(all_scans, backgrounds)):
+                label = f'Scan {i+1}'
+                if bg != 0.0:
+                    label += f' (BG: -{bg:.3f})'
+                ax1.plot(scan[:, 0], scan[:, 1], 'o-', alpha=0.7, markersize=3, label=label)
+            
+            ax1.set_xlabel('Angle (degrees)')
+            ax1.set_ylabel('Intensity')
+            ax1.set_title(f'Individual Scans (Background Corrected) - {energy:.1f} eV')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.set_yscale('log')
+            
+            # Plot 2: Final combined data with normalization info
+            use_open_beam = getattr(self, 'use_open_beam_normalization', False)
+            norm_type = "Open Beam Normalized" if use_open_beam else "Standard Normalized"
+            
+            ax2.plot(final_data[:, 0], final_data[:, 1], 'b-', linewidth=2, label=f'Combined Data')
+            ax2.set_xlabel('Angle (degrees)')
+            ax2.set_ylabel('Normalized Intensity')
+            ax2.set_title(f'Final Combined Data ({norm_type}) - {energy:.1f} eV')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            ax2.set_yscale('log')
+            
+            # Add open beam info to plot if available
+            if use_open_beam and hasattr(self, 'open_beam_data') and self.open_beam_data is not None:
+                open_beam_intensity = self.get_open_beam_intensity(energy)
+                if open_beam_intensity:
+                    ax2.text(0.05, 0.95, f'I₀({energy:.1f} eV) = {open_beam_intensity:.3e}', 
+                            transform=ax2.transAxes, verticalalignment='top',
+                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            plt.tight_layout()
+            
+            # Save plot if output directory specified
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                plot_path = os.path.join(output_dir, f"{plot_prefix}_processing_comparison.png")
+                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+                print(f"Processing comparison plot saved to {plot_path}")
+            
+            plt.show()
+            
+        except Exception as e:
+            print(f"Error generating plots: {str(e)}")
+
+    def process_scan_set_with_open_beam_option(self, scan_group, output_filename="output.dat",
+                                        normalize=True, plot=False, convert_to_photons=False,
+                                        smooth_data=False, savgol_window=None, savgol_order=2,
+                                        remove_zeros=True, estimate_thickness=False,
+                                        min_prominence=0.1, min_thickness_nm=1.0, 
+                                        max_thickness_nm=100.0, output_dir=None,
+                                        plot_prefix=None, use_open_beam=None):
+        """
+        Enhanced version of process_scan_set that supports open beam normalization
+        UPDATED to ensure plotting works correctly
+        
+        This method extends the existing process_scan_set functionality with open beam normalization.
+        """
+        # Extract data from scan group
+        file_patterns = scan_group['files']
+        trims = scan_group.get('trims', [(0, -1)] * len(file_patterns))
+        backgrounds = scan_group.get('backgrounds', [0.0] * len(file_patterns))
+        energy = scan_group['energy']
+        
+        # Ensure background list matches file list length
+        if len(backgrounds) < len(file_patterns):
+            print(f"Warning: Not enough background values ({len(backgrounds)}) for files ({len(file_patterns)}). Padding with zeros.")
+            backgrounds.extend([0.0] * (len(file_patterns) - len(backgrounds)))
+        elif len(backgrounds) > len(file_patterns):
+            print(f"Warning: More background values than files. Truncating background list.")
+            backgrounds = backgrounds[:len(file_patterns)]
+        
+        scans = []
+        actual_trims = []
+        actual_backgrounds = []
+        
+        # Load all data files
+        for i, pattern in enumerate(file_patterns):
+            try:
+                scan_data = self.load_data_file(pattern)
+                scans.append(scan_data)
+                
+                # Use the trim value for this pattern
+                if i < len(trims):
+                    actual_trims.append(trims[i])
+                else:
+                    # Default trim if not provided
+                    actual_trims.append((0, -1))
+                
+                # Use the background value for this pattern
+                actual_backgrounds.append(backgrounds[i])
+                
+                print(f"Loaded file: {pattern}")
+                if backgrounds[i] != 0.0:
+                    print(f"  Background subtraction: -{backgrounds[i]:.3f}")
+            except Exception as e:
+                print(f"Error loading file {pattern}: {str(e)}")
+        
+        if not scans:
+            print("No valid scan data found.")
+            return None
+        
+        # Set default plot prefix if not provided
+        if output_filename and plot_prefix is None:
+            # Use the output filename without extension as plot prefix
+            plot_prefix = os.path.splitext(os.path.basename(output_filename))[0]
+        elif plot_prefix is None:
+            # Default prefix based on energy
+            plot_prefix = f"{scan_group['sample_name']}_{energy:.1f}eV"
+        
+        # Use the enhanced reduce_data method with open beam option AND PLOTTING
+        result = self.reduce_data_with_open_beam_option(
+            scans=scans,
+            trims=actual_trims,
+            backgrounds=actual_backgrounds,
+            energy=energy,
+            normalize=normalize,
+            plot=plot,  # IMPORTANT: Pass through the plot parameter
+            convert_to_photons=convert_to_photons,
+            output_dir=output_dir,
+            plot_prefix=plot_prefix,
+            smooth_data=smooth_data,
+            savgol_window=savgol_window,
+            savgol_order=savgol_order,
+            remove_zeros=remove_zeros,
+            use_open_beam=use_open_beam
+        )
+        
+        if result is None:
+            return None
+        
+        # Handle saving (rest of method similar to existing process_scan_set)
+        if output_filename != "output.dat":
+            output_path = os.path.join(output_dir or '.', output_filename)
+            
+            try:
+                if smooth_data and isinstance(result, tuple):
+                    # Save smoothed data
+                    np.savetxt(output_path, result[0], delimiter='\t',
+                            header='Angle(deg)\tIntensity\tError', comments='')
+                    print(f"Saved smoothed data to {output_path}")
+                else:
+                    # Save regular data  
+                    data_to_save = result[0] if isinstance(result, tuple) else result
+                    np.savetxt(output_path, data_to_save, delimiter='\t',
+                            header='Angle(deg)\tIntensity\tError', comments='')
+                    print(f"Saved processed data to {output_path}")
+                    
+            except Exception as e:
+                print(f"Error saving data: {str(e)}")
+        
+        return result
+
+
+    def _save_metadata_with_open_beam_info(self, scan_group, output_path, normalize, 
+                                        convert_to_photons, smooth_data, remove_zeros,
+                                        savgol_window, savgol_order, backgrounds):
+        """
+        Save metadata including open beam normalization information
+        """
+        try:
+            sample_name = scan_group.get('sample_name', 'Unknown')
+            energy = scan_group['energy']
+            
+            # Create metadata with open beam info
+            metadata = {
+                'Sample Name': sample_name,
+                'Energy (eV)': energy,
+                'Files Processed': len(scan_group['files']),
+                'Normalization': normalize,
+                'Normalization Type': 'Open Beam' if getattr(self, 'use_open_beam_normalization', False) else 'Standard',
+                'Photon Conversion': convert_to_photons,
+                'Smoothing': smooth_data,
+                'Zero Removal': remove_zeros,
+                'Processing Date': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'Output File': os.path.basename(output_path),
+                'Background Subtraction Applied': any(bg != 0.0 for bg in backgrounds)
+            }
+            
+            # Add open beam specific info
+            if getattr(self, 'use_open_beam_normalization', False) and hasattr(self, 'open_beam_data'):
+                open_beam_intensity = self.get_open_beam_intensity(energy)
+                metadata['Open Beam File'] = getattr(self, 'open_beam_file', 'Unknown')
+                metadata['Open Beam Intensity at Energy'] = open_beam_intensity
+                energy_range = f"{self.open_beam_data['energy'].min():.1f}-{self.open_beam_data['energy'].max():.1f}"
+                metadata['Open Beam Energy Range'] = energy_range
+            
+            # Add smoothing parameters if used
+            if smooth_data:
+                metadata['Smoothing Window'] = savgol_window
+                metadata['Smoothing Order'] = savgol_order
+            
+            # Add background details
+            for i, bg in enumerate(backgrounds):
+                metadata[f'Background File {i+1}'] = bg
+            
+            # Save metadata
+            meta_path = output_path.replace('.dat', '_metadata.csv')
+            meta_df = pd.DataFrame([metadata])
+            meta_df.to_csv(meta_path, index=False)
+            print(f"Metadata saved to {meta_path}")
+            
+        except Exception as e:
+            print(f"Warning: Could not save metadata: {str(e)}")
