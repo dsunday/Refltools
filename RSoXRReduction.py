@@ -1387,7 +1387,7 @@ class RSoXRProcessor:
         return groups
     
     def edit_groups(self, scan_groups=None, group=None, add_scan_number=None, 
-                   remove_scan_number=None, remove_group=None):
+               remove_scan_number=None, remove_group=None, resort_group=False):
         """
         Edit scan groups by moving individual scans between groups
         
@@ -1403,6 +1403,8 @@ class RSoXRProcessor:
             Scan number(s) to remove from the specified group
         remove_group : int, optional
             Group number to remove entirely
+        resort_group : bool, optional
+            Whether to resort groups after editing (default: False)
             
         Returns:
         --------
@@ -1422,6 +1424,9 @@ class RSoXRProcessor:
         
         # Remove entire group 4
         processor.edit_groups(remove_group=4)
+        
+        # Add scan and resort the target group
+        processor.edit_groups(group=1, add_scan_number=4, resort_group=True)
         """
         if scan_groups is None:
             if not hasattr(self, 'scan_groups') or self.scan_groups is None:
@@ -1436,15 +1441,72 @@ class RSoXRProcessor:
         
         # Handle removing scans from a specific group
         if remove_scan_number is not None and group is not None:
-            return self._remove_scans_from_group(scan_groups, group, remove_scan_number)
+            return self._remove_scans_from_group(scan_groups, group, remove_scan_number, resort_group=resort_group)
         
         # Handle adding scans to a group
         if add_scan_number is not None and group is not None:
-            return self._add_scans_to_group(scan_groups, group, add_scan_number)
+            return self._add_scans_to_group(scan_groups, group, add_scan_number, resort_group=resort_group)
         
         raise ValueError("Invalid combination of parameters. See docstring for examples.")
+
+    def _remove_scans_from_group(self, scan_groups, group_number, scan_numbers, resort_group=False):
+        """Remove one or more scans from a specific group"""
+        if not isinstance(scan_numbers, list):
+            scan_numbers = [scan_numbers]
+        
+        group_idx = group_number - 1
+        if not (0 <= group_idx < len(scan_groups)):
+            raise ValueError(f"Invalid group number {group_number}. Valid range is 1-{len(scan_groups)}")
+        
+        removed_scans = []
+        group = scan_groups[group_idx]
+        
+        # Sort scan numbers in reverse order to maintain indices during removal
+        scan_numbers_in_group = [(scan_num, idx) for idx, scan_num in enumerate(group['scan_numbers']) 
+                                if scan_num in scan_numbers]
+        scan_numbers_in_group.sort(key=lambda x: x[1], reverse=True)
+        
+        for scan_number, file_idx in scan_numbers_in_group:
+            # Remove from group
+            filename = group['files'].pop(file_idx)
+            group['metadata'].pop(file_idx) if file_idx < len(group['metadata']) else None
+            group['trims'].pop(file_idx) if file_idx < len(group['trims']) else None
+            group['scan_numbers'].pop(file_idx)
+            
+            # Remove from registry
+            if scan_number in self.scan_registry:
+                del self.scan_registry[scan_number]
+            
+            removed_scans.append(scan_number)
+            print(f"Removed scan {scan_number} ({os.path.basename(filename)}) from group {group_number}")
+        
+        # Update indices
+        self._update_scan_indices(scan_groups)
+        
+        # Remove empty groups
+        scan_groups = self._remove_empty_groups(scan_groups)
+        
+        # Sort the group only if explicitly requested
+        if not scan_groups:  # Check if any groups remain
+            return scan_groups
+        
+        # Find the group again after potential removal of empty groups
+        updated_group_idx = None
+        for idx, grp in enumerate(scan_groups):
+            if grp is group:  # Same object reference
+                updated_group_idx = idx
+                break
+        
+        if updated_group_idx is not None:
+            if resort_group:
+                scan_groups[updated_group_idx] = self._sort_files_in_group(scan_groups[updated_group_idx], preserve_scan_numbers=False)
+            else:
+                scan_groups[updated_group_idx] = self._sort_files_in_group(scan_groups[updated_group_idx], preserve_scan_numbers=True)
+        
+        return scan_groups
+
     
-    def _add_scans_to_group(self, scan_groups, target_group, scan_numbers):
+    def _add_scans_to_group(self, scan_groups, target_group, scan_numbers, resort_group=False):
         """Add one or more scans to a target group"""
         if not isinstance(scan_numbers, list):
             scan_numbers = [scan_numbers]
@@ -1507,54 +1569,85 @@ class RSoXRProcessor:
         # Remove empty groups
         scan_groups = self._remove_empty_groups(scan_groups)
         
-        # Sort files within groups
+        # Sort files within groups - with new preserve_scan_numbers parameter
         for group in scan_groups:
             if hasattr(self, '_sort_files_in_group'):
-                group = self._sort_files_in_group(group)
+                group = self._sort_files_in_group(group, preserve_scan_numbers=not resort_group)
         
         if moved_scans:
             print(f"Moved scans {moved_scans} to group {target_group}")
         
         return scan_groups
-    
-    def _remove_scans_from_group(self, scan_groups, group_number, scan_numbers):
-        """Remove one or more scans from a specific group"""
-        if not isinstance(scan_numbers, list):
-            scan_numbers = [scan_numbers]
+
+    def remove_scan_from_group(self, scan_groups, group_index, file_index, resort_group=False):
+        """
+        Remove a specific scan from a group
         
-        group_idx = group_number - 1
-        if not (0 <= group_idx < len(scan_groups)):
-            raise ValueError(f"Invalid group number {group_number}. Valid range is 1-{len(scan_groups)}")
-        
-        removed_scans = []
-        group = scan_groups[group_idx]
-        
-        # Sort scan numbers in reverse order to maintain indices during removal
-        scan_numbers_in_group = [(scan_num, idx) for idx, scan_num in enumerate(group['scan_numbers']) 
-                                if scan_num in scan_numbers]
-        scan_numbers_in_group.sort(key=lambda x: x[1], reverse=True)
-        
-        for scan_number, file_idx in scan_numbers_in_group:
-            # Remove from group
-            filename = group['files'].pop(file_idx)
-            group['metadata'].pop(file_idx) if file_idx < len(group['metadata']) else None
-            group['trims'].pop(file_idx) if file_idx < len(group['trims']) else None
-            group['scan_numbers'].pop(file_idx)
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        group_index : int
+            Index of the group to modify (1-based, as displayed to user)
+        file_index : int
+            Index of the file within the group to remove (1-based, as displayed to user)
+        resort_group : bool
+            Whether to resort the group after removing the scan (default: False)
             
-            # Remove from registry
-            if scan_number in self.scan_registry:
-                del self.scan_registry[scan_number]
-            
-            removed_scans.append(scan_number)
-            print(f"Removed scan {scan_number} ({os.path.basename(filename)}) from group {group_number}")
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups
+        removed_info : dict
+            Information about the removed scan (filename, metadata, trim)
+        """
+        # Convert to 0-based indices
+        zero_based_group_index = group_index - 1
+        zero_based_file_index = file_index - 1
         
-        # Update indices
-        self._update_scan_indices(scan_groups)
+        if not (0 <= zero_based_group_index < len(scan_groups)):
+            print(f"Error: Invalid group number {group_index}. Valid range is 1-{len(scan_groups)}")
+            return scan_groups, None
         
-        # Remove empty groups
-        scan_groups = self._remove_empty_groups(scan_groups)
+        group = scan_groups[zero_based_group_index]
         
-        return scan_groups
+        if not (0 <= zero_based_file_index < len(group['files'])):
+            print(f"Error: Invalid file number {file_index}. Valid range is 1-{len(group['files'])}")
+            return scan_groups, None
+        
+        # Store information about the removed scan
+        removed_info = {
+            'filename': group['files'][zero_based_file_index],
+            'metadata': group['metadata'][zero_based_file_index] if zero_based_file_index < len(group['metadata']) else None,
+            'trim': group['trims'][zero_based_file_index] if zero_based_file_index < len(group['trims']) else (0, -1),
+            'scan_number': group['scan_numbers'][zero_based_file_index] if 'scan_numbers' in group and zero_based_file_index < len(group['scan_numbers']) else None
+        }
+        
+        # Remove from all lists
+        group['files'].pop(zero_based_file_index)
+        if zero_based_file_index < len(group['metadata']):
+            group['metadata'].pop(zero_based_file_index)
+        if zero_based_file_index < len(group['trims']):
+            group['trims'].pop(zero_based_file_index)
+        if 'scan_numbers' in group and zero_based_file_index < len(group['scan_numbers']):
+            group['scan_numbers'].pop(zero_based_file_index)
+        
+        # Check if group is now empty
+        if not group['files']:
+            print(f"Warning: Group {group_index} is now empty after removing scan")
+            # Optionally remove the empty group
+            scan_groups.pop(zero_based_group_index)
+            print(f"Removed empty group {group_index}")
+        else:
+            # Re-sort the group only if explicitly requested
+            if resort_group:
+                scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=False)
+            else:
+                scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=True)
+        
+        print(f"Removed {os.path.basename(removed_info['filename'])} from group {group_index}")
+        
+        return scan_groups, removed_info
     
     def _remove_group(self, scan_groups, group_number):
         """Remove an entire group"""
@@ -1881,7 +1974,106 @@ class RSoXRProcessor:
         print("=" * 115)
         
         return scan_groups
+    
+    def resort_group(self, scan_groups, group_index):
+        """
+        Explicitly resort a group by detector type and angle, allowing scan numbers to be reordered
         
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+        group_index : int
+            Index of the group to resort (1-based, as displayed to user)
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups with resorted group
+        """
+        zero_based_group_index = group_index - 1
+        
+        if not (0 <= zero_based_group_index < len(scan_groups)):
+            print(f"Error: Invalid group number {group_index}. Valid range is 1-{len(scan_groups)}")
+            return scan_groups
+        
+        group = scan_groups[zero_based_group_index]
+        scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=False)
+        
+        print(f"Resorted group {group_index} by detector type and angle")
+        
+        return scan_groups
+
+    def validate_scan_number_consistency(self, scan_groups):
+        """
+        Validate that scan numbers are consistent and warn about any issues
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups to validate
+            
+        Returns:
+        --------
+        bool : True if consistent, False if issues found
+        """
+        issues_found = False
+        all_scan_numbers = set()
+        
+        for group_idx, group in enumerate(scan_groups):
+            if 'scan_numbers' not in group:
+                print(f"Warning: Group {group_idx + 1} missing scan_numbers field")
+                issues_found = True
+                continue
+                
+            # Check for duplicates within this group
+            group_scan_numbers = group['scan_numbers']
+            if len(group_scan_numbers) != len(set(group_scan_numbers)):
+                print(f"Warning: Group {group_idx + 1} has duplicate scan numbers")
+                issues_found = True
+                
+            # Check for duplicates across groups
+            for scan_num in group_scan_numbers:
+                if scan_num in all_scan_numbers:
+                    print(f"Warning: Scan number {scan_num} appears in multiple groups")
+                    issues_found = True
+                all_scan_numbers.add(scan_num)
+                
+            # Check that scan_numbers list matches other lists in length
+            expected_length = len(group['files'])
+            if len(group_scan_numbers) != expected_length:
+                print(f"Warning: Group {group_idx + 1} scan_numbers length ({len(group_scan_numbers)}) "
+                    f"doesn't match files length ({expected_length})")
+                issues_found = True
+        
+        if not issues_found:
+            print("All scan number assignments are consistent")
+            
+        return not issues_found
+
+
+    def resort_all_groups(self, scan_groups):
+        """
+        Explicitly resort all groups by detector type and angle, allowing scan numbers to be reordered
+        
+        Parameters:
+        -----------
+        scan_groups : list of dicts
+            List of scan groups
+            
+        Returns:
+        --------
+        scan_groups : list of dicts
+            Updated list of scan groups with all groups resorted
+        """
+        for i in range(len(scan_groups)):
+            scan_groups[i] = self._sort_files_in_group(scan_groups[i], preserve_scan_numbers=False)
+        
+        print(f"Resorted all {len(scan_groups)} groups by detector type and angle")
+        
+        return scan_groups
+
+            
     def _determine_trims(self, filenames):
         """
         Automatically determine trim values for a list of files
@@ -2377,7 +2569,7 @@ class RSoXRProcessor:
 
     
     
-    def _sort_files_in_group(self, group):
+    def _sort_files_in_group(self, group, preserve_scan_numbers=True):
         """
         Sort files within a group by detector type and angle (same as initial grouping)
         
@@ -2385,6 +2577,9 @@ class RSoXRProcessor:
         -----------
         group : dict
             Scan group dictionary
+        preserve_scan_numbers : bool
+            If True, preserve original scan number assignments after sorting.
+            If False, allow scan numbers to be reordered with files (old behavior).
             
         Returns:
         --------
@@ -2393,6 +2588,11 @@ class RSoXRProcessor:
         """
         if not group.get('metadata'):
             return group
+        
+        # Store original scan numbers if they exist and we want to preserve them
+        original_scan_numbers = None
+        if preserve_scan_numbers and 'scan_numbers' in group:
+            original_scan_numbers = list(group['scan_numbers'])
         
         # Separate files by detector type
         photodiode_items = []
@@ -2404,7 +2604,8 @@ class RSoXRProcessor:
             item = {
                 'filename': group['files'][i],
                 'metadata': meta,
-                'trim': group['trims'][i] if i < len(group['trims']) else (0, -1)
+                'trim': group['trims'][i] if i < len(group['trims']) else (0, -1),
+                'scan_number': group['scan_numbers'][i] if 'scan_numbers' in group and i < len(group['scan_numbers']) else None
             }
             
             if "photodiode" in detector_str:
@@ -2425,6 +2626,15 @@ class RSoXRProcessor:
         group['files'] = [item['filename'] for item in sorted_items]
         group['metadata'] = [item['metadata'] for item in sorted_items]
         group['trims'] = [item['trim'] for item in sorted_items]
+        
+        # Handle scan numbers based on preserve_scan_numbers flag
+        if 'scan_numbers' in group:
+            if preserve_scan_numbers and original_scan_numbers:
+                # Keep original scan numbers unchanged
+                group['scan_numbers'] = original_scan_numbers
+            else:
+                # Allow scan numbers to be reordered with their files (old behavior)
+                group['scan_numbers'] = [item['scan_number'] for item in sorted_items if item['scan_number'] is not None]
         
         # Recalculate overall angle range
         overall_min_angle = float('inf')
@@ -2447,7 +2657,8 @@ class RSoXRProcessor:
         
         return group
 
-    def combine_groups(self, scan_groups, group_indices, new_sample_name=None):
+
+    def combine_groups(self, scan_groups, group_indices, new_sample_name=None, resort_combined_group=False):
         """
         Combine multiple groups into a single group
         
@@ -2459,6 +2670,8 @@ class RSoXRProcessor:
             Indices of groups to combine (1-based, as displayed to user)
         new_sample_name : str, optional
             Name for the combined group. If None, uses the first group's name
+        resort_combined_group : bool
+            Whether to resort the combined group by detector/angle (default: False)
             
         Returns:
         --------
@@ -2496,31 +2709,39 @@ class RSoXRProcessor:
         for idx in zero_based_indices[:-1]:  # Skip the base group
             group = scan_groups[idx]
             if abs(group['energy'] - base_energy) > energy_tolerance:
-                print(f"Warning: Energy mismatch between groups. Base: {base_energy:.1f} eV, "
-                    f"Group {idx+1}: {group['energy']:.1f} eV")
+                print(f"Warning: Energy mismatch between groups. "
+                        f"Base: {base_energy:.1f} eV, "
+                        f"Group {idx+1}: {group['energy']:.1f} eV")
         
-        # Combine all files, metadata, and trims
+        # Combine all files, metadata, trims, and scan numbers
         combined_files = list(base_group['files'])
         combined_metadata = list(base_group['metadata'])
         combined_trims = list(base_group['trims'])
+        combined_scan_numbers = list(base_group.get('scan_numbers', []))
         
         for idx in zero_based_indices[:-1]:  # Skip the base group
             group = scan_groups[idx]
             combined_files.extend(group['files'])
             combined_metadata.extend(group['metadata'])
             combined_trims.extend(group['trims'])
+            combined_scan_numbers.extend(group.get('scan_numbers', []))
         
         # Update the base group
         base_group['files'] = combined_files
         base_group['metadata'] = combined_metadata
         base_group['trims'] = combined_trims
+        if 'scan_numbers' in base_group or combined_scan_numbers:
+            base_group['scan_numbers'] = combined_scan_numbers
         
         # Update sample name if provided
         if new_sample_name:
             base_group['sample_name'] = new_sample_name
         
-        # Sort the combined group
-        base_group = self._sort_files_in_group(base_group)
+        # Sort the combined group only if explicitly requested
+        if resort_combined_group:
+            base_group = self._sort_files_in_group(base_group, preserve_scan_numbers=False)
+        else:
+            base_group = self._sort_files_in_group(base_group, preserve_scan_numbers=True)
         
         # Remove the other groups (in reverse order to maintain indices)
         new_scan_groups = list(scan_groups)
@@ -2542,7 +2763,9 @@ class RSoXRProcessor:
         
         return new_scan_groups
 
-    def remove_scan_from_group(self, scan_groups, group_index, file_index):
+
+
+    def remove_scan_from_group(self, scan_groups, group_index, file_index, resort_group=False):
         """
         Remove a specific scan from a group
         
@@ -2554,6 +2777,8 @@ class RSoXRProcessor:
             Index of the group to modify (1-based, as displayed to user)
         file_index : int
             Index of the file within the group to remove (1-based, as displayed to user)
+        resort_group : bool
+            Whether to resort the group after removing the scan (default: False)
             
         Returns:
         --------
@@ -2580,7 +2805,8 @@ class RSoXRProcessor:
         removed_info = {
             'filename': group['files'][zero_based_file_index],
             'metadata': group['metadata'][zero_based_file_index] if zero_based_file_index < len(group['metadata']) else None,
-            'trim': group['trims'][zero_based_file_index] if zero_based_file_index < len(group['trims']) else (0, -1)
+            'trim': group['trims'][zero_based_file_index] if zero_based_file_index < len(group['trims']) else (0, -1),
+            'scan_number': group['scan_numbers'][zero_based_file_index] if 'scan_numbers' in group and zero_based_file_index < len(group['scan_numbers']) else None
         }
         
         # Remove from all lists
@@ -2589,6 +2815,8 @@ class RSoXRProcessor:
             group['metadata'].pop(zero_based_file_index)
         if zero_based_file_index < len(group['trims']):
             group['trims'].pop(zero_based_file_index)
+        if 'scan_numbers' in group and zero_based_file_index < len(group['scan_numbers']):
+            group['scan_numbers'].pop(zero_based_file_index)
         
         # Check if group is now empty
         if not group['files']:
@@ -2597,8 +2825,11 @@ class RSoXRProcessor:
             scan_groups.pop(zero_based_group_index)
             print(f"Removed empty group {group_index}")
         else:
-            # Re-sort the group and update angle ranges
-            scan_groups[zero_based_group_index] = self._sort_files_in_group(group)
+            # Re-sort the group only if explicitly requested
+            if resort_group:
+                scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=False)
+            else:
+                scan_groups[zero_based_group_index] = self._sort_files_in_group(group, preserve_scan_numbers=True)
         
         print(f"Removed {os.path.basename(removed_info['filename'])} from group {group_index}")
         
@@ -2659,7 +2890,7 @@ class RSoXRProcessor:
         
         return updated_groups
 
-    def move_scan_to_existing_group(self, scan_groups, source_group_index, file_index, target_group_index):
+    def move_scan_to_existing_group(self, scan_groups, source_group_index, file_index, target_group_index, resort_groups=False):
         """
         Move a scan from one group to another existing group
         
@@ -2673,6 +2904,8 @@ class RSoXRProcessor:
             Index of the file within the source group to move (1-based, as displayed to user)
         target_group_index : int
             Index of the target group (1-based, as displayed to user)
+        resort_groups : bool
+            Whether to resort both groups after the move (default: False)
             
         Returns:
         --------
@@ -2691,7 +2924,7 @@ class RSoXRProcessor:
             return scan_groups
         
         # Remove the scan from the source group
-        updated_groups, removed_info = self.remove_scan_from_group(scan_groups, source_group_index, file_index)
+        updated_groups, removed_info = self.remove_scan_from_group(scan_groups, source_group_index, file_index, resort_group=resort_groups)
         
         if removed_info is None:
             return scan_groups
@@ -2711,9 +2944,14 @@ class RSoXRProcessor:
         if removed_info['metadata']:
             target_group['metadata'].append(removed_info['metadata'])
         target_group['trims'].append(removed_info['trim'])
+        if 'scan_numbers' in target_group and removed_info.get('scan_number'):
+            target_group['scan_numbers'].append(removed_info['scan_number'])
         
-        # Sort the target group
-        updated_groups[adjusted_target_index] = self._sort_files_in_group(target_group)
+        # Sort the target group only if explicitly requested
+        if resort_groups:
+            updated_groups[adjusted_target_index] = self._sort_files_in_group(target_group, preserve_scan_numbers=False)
+        else:
+            updated_groups[adjusted_target_index] = self._sort_files_in_group(target_group, preserve_scan_numbers=True)
         
         print(f"Moved {os.path.basename(removed_info['filename'])} to group {adjusted_target_index + 1}")
         
