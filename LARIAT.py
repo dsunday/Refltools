@@ -140,6 +140,331 @@ class LariatDataProcessor:
             energy_list.append(energy)
         return xr.DataArray(image_list, dims=['energy','pix_y','pix_x'], coords={'energy':energy_list}), metadata
     
+    def crop_image(self, crop_region=None, interactive=False, preview_energy=None, 
+               update_data=True, plot_preview=True, save_crop_info=False, 
+               save_path=None, crop_name='cropped_data'):
+        """
+        Crop the datacube to a specified region.
+        
+        Parameters:
+        -----------
+        crop_region : tuple, optional
+            (x_min, y_min, x_max, y_max) defining the crop region in pixel coordinates.
+            If None and interactive=False, will prompt for coordinates.
+        interactive : bool, optional
+            If True, display an image and allow interactive selection of crop region.
+            Default is False.
+        preview_energy : float, optional
+            Energy value to use for preview/interactive selection. 
+            If None, uses middle energy of dataset.
+        update_data : bool, optional
+            If True, update self.data with cropped version. If False, return cropped data.
+            Default is True.
+        plot_preview : bool, optional
+            If True, show before/after preview of the crop. Default is True.
+        save_crop_info : bool, optional
+            If True, save information about the crop operation.
+        save_path : str, optional
+            Directory to save crop information. If None, uses current directory.
+        crop_name : str, optional
+            Base name for saved crop files.
+            
+        Returns:
+        --------
+        cropped_data : xarray.DataArray
+            The cropped datacube
+        crop_info : dict
+            Information about the crop operation
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from matplotlib.widgets import RectangleSelector
+        import os
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        # Get original data dimensions
+        original_shape = self.data.shape
+        n_energies, n_y, n_x = original_shape
+        
+        print(f"Original image size: {n_x} x {n_y} pixels ({n_energies} energies)")
+        
+        # Select preview energy
+        if preview_energy is None:
+            mid_idx = len(self.data.energy) // 2
+            preview_energy = float(self.data.energy.isel(energy=mid_idx).values)
+        
+        preview_slice = self.data.sel(energy=preview_energy, method='nearest')
+        preview_image = preview_slice.values
+        actual_preview_energy = float(preview_slice.energy.values)
+        
+        # Interactive crop selection
+        if interactive:
+            print(f"Interactive crop selection at energy {actual_preview_energy:.2f} eV")
+            print("Instructions:")
+            print("1. Click and drag to select crop region")
+            print("2. Close the plot window when satisfied with selection")
+            print("3. The crop region will be applied automatically")
+            
+            # Enable interactive backend if needed
+            import matplotlib
+            backend = matplotlib.get_backend()
+            if 'inline' in backend.lower():
+                print("Note: Interactive selection works best with non-inline backends")
+                print("Try running: %matplotlib qt or %matplotlib tk in Jupyter")
+            
+            fig, ax = plt.subplots(figsize=(10, 8))
+            im = ax.imshow(preview_image, cmap='viridis', origin='lower')
+            ax.set_title(f'Click and Drag to Select Crop Region\nEnergy: {actual_preview_energy:.2f} eV')
+            ax.set_xlabel('Pixel X')
+            ax.set_ylabel('Pixel Y')
+            plt.colorbar(im, ax=ax, label='Intensity')
+            
+            # Variables to store selection
+            selection_coords = {'x_min': 0, 'y_min': 0, 'x_max': n_x, 'y_max': n_y}
+            selection_made = {'selected': False}
+            
+            def onselect(eclick, erelease):
+                """Callback function for rectangle selector"""
+                if eclick.xdata is None or erelease.xdata is None:
+                    return
+                if eclick.ydata is None or erelease.ydata is None:
+                    return
+                    
+                x_min = int(round(min(eclick.xdata, erelease.xdata)))
+                x_max = int(round(max(eclick.xdata, erelease.xdata)))
+                y_min = int(round(min(eclick.ydata, erelease.ydata)))
+                y_max = int(round(max(eclick.ydata, erelease.ydata)))
+                
+                # Ensure coordinates are within bounds
+                x_min = max(0, x_min)
+                x_max = min(n_x, x_max)
+                y_min = max(0, y_min)
+                y_max = min(n_y, y_max)
+                
+                # Ensure minimum size
+                if x_max - x_min < 5:
+                    x_max = min(n_x, x_min + 5)
+                if y_max - y_min < 5:
+                    y_max = min(n_y, y_min + 5)
+                
+                selection_coords.update({
+                    'x_min': x_min, 'y_min': y_min, 
+                    'x_max': x_max, 'y_max': y_max
+                })
+                selection_made['selected'] = True
+                
+                crop_width = x_max - x_min
+                crop_height = y_max - y_min
+                print(f"Selected region: ({x_min}, {y_min}, {x_max}, {y_max})")
+                print(f"Crop size: {crop_width} x {crop_height} pixels")
+            
+            # Create rectangle selector with simpler configuration
+            try:
+                selector = RectangleSelector(ax, onselect, 
+                                        button=[1],  # Only left mouse button
+                                        minspanx=5, minspany=5,
+                                        spancoords='pixels',
+                                        interactive=True,
+                                        useblit=False)  # Disable blitting for better compatibility
+                
+                # Add instruction text to the plot
+                ax.text(0.02, 0.98, 'Click and drag to select region\nClose window when done', 
+                    transform=ax.transAxes, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8),
+                    fontsize=10)
+                
+                plt.show()
+                
+                # Check if a selection was made
+                if not selection_made['selected']:
+                    print("No selection made. Using fallback method...")
+                    # Fallback to manual input
+                    print(f"Current image size: {n_x} x {n_y} pixels")
+                    try:
+                        x_min = int(input(f"Enter x_min (0 to {n_x-1}): ") or "0")
+                        y_min = int(input(f"Enter y_min (0 to {n_y-1}): ") or "0")
+                        x_max = int(input(f"Enter x_max ({x_min+1} to {n_x}): ") or str(n_x))
+                        y_max = int(input(f"Enter y_max ({y_min+1} to {n_y}): ") or str(n_y))
+                        selection_coords.update({
+                            'x_min': x_min, 'y_min': y_min, 
+                            'x_max': x_max, 'y_max': y_max
+                        })
+                    except (ValueError, KeyboardInterrupt):
+                        print("Using full image (no crop)")
+                        selection_coords = {'x_min': 0, 'y_min': 0, 'x_max': n_x, 'y_max': n_y}
+                
+            except Exception as e:
+                print(f"Interactive selection failed: {e}")
+                print("Falling back to manual input...")
+                print(f"Current image size: {n_x} x {n_y} pixels")
+                try:
+                    x_min = int(input(f"Enter x_min (0 to {n_x-1}): ") or "0")
+                    y_min = int(input(f"Enter y_min (0 to {n_y-1}): ") or "0")
+                    x_max = int(input(f"Enter x_max ({x_min+1} to {n_x}): ") or str(n_x))
+                    y_max = int(input(f"Enter y_max ({y_min+1} to {n_y}): ") or str(n_y))
+                    selection_coords.update({
+                        'x_min': x_min, 'y_min': y_min, 
+                        'x_max': x_max, 'y_max': y_max
+                    })
+                except (ValueError, KeyboardInterrupt):
+                    print("Using full image (no crop)")
+                    selection_coords = {'x_min': 0, 'y_min': 0, 'x_max': n_x, 'y_max': n_y}
+            
+            # Extract crop region from interactive selection
+            crop_region = (selection_coords['x_min'], selection_coords['y_min'],
+                        selection_coords['x_max'], selection_coords['y_max'])
+            
+            print(f"Final crop region: {crop_region}")
+        
+        # If no crop region specified and not interactive, prompt user
+        elif crop_region is None:
+            print(f"Current image size: {n_x} x {n_y} pixels")
+            print("Please specify crop region as (x_min, y_min, x_max, y_max)")
+            
+            try:
+                x_min = int(input(f"Enter x_min (0 to {n_x-1}): "))
+                y_min = int(input(f"Enter y_min (0 to {n_y-1}): "))
+                x_max = int(input(f"Enter x_max ({x_min+1} to {n_x}): "))
+                y_max = int(input(f"Enter y_max ({y_min+1} to {n_y}): "))
+                crop_region = (x_min, y_min, x_max, y_max)
+            except (ValueError, KeyboardInterrupt):
+                print("Invalid input or operation cancelled.")
+                return None, None
+        
+        # Validate crop region
+        x_min, y_min, x_max, y_max = crop_region
+        
+        if not (0 <= x_min < x_max <= n_x and 0 <= y_min < y_max <= n_y):
+            raise ValueError(f"Invalid crop region {crop_region}. Must be within image bounds "
+                            f"(0, 0, {n_x}, {n_y}) and x_min < x_max, y_min < y_max")
+        
+        crop_width = x_max - x_min
+        crop_height = y_max - y_min
+        
+        print(f"Cropping to region: ({x_min}, {y_min}, {x_max}, {y_max})")
+        print(f"New size: {crop_width} x {crop_height} pixels")
+        print(f"Reduction: {original_shape[2] * original_shape[1]:,} -> {crop_width * crop_height:,} pixels "
+            f"({(1 - (crop_width * crop_height) / (original_shape[2] * original_shape[1])) * 100:.1f}% smaller)")
+        
+        # Perform the crop
+        cropped_data = self.data.isel(pix_x=slice(x_min, x_max), pix_y=slice(y_min, y_max))
+        
+        # Update coordinates to reflect the crop (optional - keeps original pixel coordinates)
+        # If you want to reset coordinates to start from 0:
+        # new_x_coords = np.arange(crop_width)
+        # new_y_coords = np.arange(crop_height)
+        # cropped_data = cropped_data.assign_coords(pix_x=new_x_coords, pix_y=new_y_coords)
+        
+        # Store crop information
+        crop_info = {
+            'original_shape': original_shape,
+            'crop_region': crop_region,
+            'cropped_shape': cropped_data.shape,
+            'crop_size': (crop_width, crop_height),
+            'pixels_removed': original_shape[1] * original_shape[2] - crop_width * crop_height,
+            'size_reduction_percent': (1 - (crop_width * crop_height) / (original_shape[2] * original_shape[1])) * 100,
+            'preview_energy': actual_preview_energy
+        }
+        
+        # Update attributes
+        cropped_data.attrs = self.data.attrs.copy()
+        cropped_data.attrs['cropped'] = True
+        cropped_data.attrs['crop_region'] = str(crop_region)
+        cropped_data.attrs['original_shape'] = str(original_shape)
+        
+        # Show preview if requested
+        if plot_preview:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Original image with crop region highlighted
+            im1 = ax1.imshow(preview_image, cmap='viridis', origin='lower')
+            ax1.add_patch(plt.Rectangle((x_min, y_min), crop_width, crop_height, 
+                                    fill=False, edgecolor='red', linewidth=2))
+            ax1.set_title(f'Original Image ({n_x} x {n_y})\nEnergy: {actual_preview_energy:.2f} eV')
+            ax1.set_xlabel('Pixel X')
+            ax1.set_ylabel('Pixel Y')
+            plt.colorbar(im1, ax=ax1, label='Intensity')
+            
+            # Cropped image
+            cropped_preview = cropped_data.sel(energy=actual_preview_energy, method='nearest')
+            im2 = ax2.imshow(cropped_preview.values, cmap='viridis', origin='lower')
+            ax2.set_title(f'Cropped Image ({crop_width} x {crop_height})\nEnergy: {actual_preview_energy:.2f} eV')
+            ax2.set_xlabel('Pixel X (cropped coordinates)')
+            ax2.set_ylabel('Pixel Y (cropped coordinates)')
+            plt.colorbar(im2, ax=ax2, label='Intensity')
+            
+            # Add crop information as text
+            info_text = f"""Crop Information:
+    Original: {original_shape[2]} x {original_shape[1]} pixels
+    Cropped: {crop_width} x {crop_height} pixels
+    Region: ({x_min}, {y_min}, {x_max}, {y_max})
+    Size reduction: {crop_info['size_reduction_percent']:.1f}%
+    Pixels removed: {crop_info['pixels_removed']:,}"""
+            
+            fig.text(0.02, 0.02, info_text, fontsize=10, 
+                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8),
+                    verticalalignment='bottom')
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Save crop information if requested
+        if save_crop_info:
+            if save_path is None:
+                save_path = os.getcwd()
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Save cropped data
+            crop_filename = f"{crop_name}.nc"
+            crop_filepath = os.path.join(save_path, crop_filename)
+            cropped_data.to_netcdf(crop_filepath)
+            
+            # Save crop information
+            info_filename = f"{crop_name}_info.txt"
+            info_filepath = os.path.join(save_path, info_filename)
+            with open(info_filepath, 'w') as f:
+                f.write("Image Crop Information\n")
+                f.write("=" * 30 + "\n")
+                f.write(f"Original shape: {original_shape[2]} x {original_shape[1]} x {original_shape[0]} (x, y, energy)\n")
+                f.write(f"Crop region: ({x_min}, {y_min}, {x_max}, {y_max})\n")
+                f.write(f"Cropped shape: {crop_width} x {crop_height} x {original_shape[0]} (x, y, energy)\n")
+                f.write(f"Pixels removed: {crop_info['pixels_removed']:,}\n")
+                f.write(f"Size reduction: {crop_info['size_reduction_percent']:.1f}%\n")
+                f.write(f"Preview energy: {actual_preview_energy:.3f} eV\n")
+                
+                if self.metadata:
+                    f.write(f"\nOriginal metadata preserved in cropped data\n")
+            
+            print(f"Cropped data saved to {crop_filepath}")
+            print(f"Crop info saved to {info_filepath}")
+        
+        # Create new processor object with cropped data
+        cropped_processor = LariatDataProcessor()
+        cropped_processor.data = cropped_data
+        cropped_processor.metadata = self.metadata.copy() if self.metadata else None
+        cropped_processor.filepath = None  # No longer corresponds to original file
+        
+        # Update metadata if it exists
+        if cropped_processor.metadata:
+            cropped_processor.metadata['cropped'] = True
+            cropped_processor.metadata['crop_region'] = crop_region
+            cropped_processor.metadata['original_shape'] = original_shape
+        
+        # Update self.data if requested
+        if update_data:
+            print("Updating self.data with cropped version")
+            self.data = cropped_data
+            if self.metadata:
+                self.metadata['cropped'] = True
+                self.metadata['crop_region'] = crop_region
+                self.metadata['original_shape'] = original_shape
+            print("Note: Original data has been replaced. Reload from file if you need the full image.")
+        
+        return cropped_processor, crop_info
+    
+    
     def load_hdf5_data(self, filename, path):
         """
         Load data from a specific path in an HDF5 file.
