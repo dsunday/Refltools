@@ -2113,7 +2113,8 @@ class LariatDataProcessor:
         return organized_data, comparison_summary
 
     def create_spectral_animation(self, spectrum_np=None, roi=None, output_filename='spectrum_animation.gif', 
-                                dpi=100, total_time=10.0, energy_range=None, contrast_percentiles=(5, 95)):
+                                dpi=100, total_time=10.0, energy_range=None, contrast_percentiles=(5, 95),
+                                max_fps=30):
         """
         Create an animation showing the xarray data at each energy alongside the spectrum.
         A vertical line moves through the spectrum to indicate the current energy.
@@ -2136,6 +2137,9 @@ class LariatDataProcessor:
             (min_energy, max_energy) to limit the animation to a specific energy range
         contrast_percentiles : tuple, optional
             (low, high) percentiles for dynamic contrast adjustment. Default is (5, 95)
+        max_fps : int, optional
+            Maximum fps for animation. If needed fps exceeds this, energy points will be subsampled.
+            Default is 30.
             
         Returns:
         --------
@@ -2146,6 +2150,7 @@ class LariatDataProcessor:
         import matplotlib.pyplot as plt
         import matplotlib.animation as animation
         from matplotlib.patches import Rectangle
+        from scipy.interpolate import interp1d
         
         if self.data is None:
             raise ValueError("No data loaded. Please load data first using load_data().")
@@ -2176,28 +2181,53 @@ class LariatDataProcessor:
             print(f"Animation limited to energy range: {energy_range[0]:.2f} - {energy_range[1]:.2f} eV")
         
         # Extract energy values from filtered data
-        energies = data_to_use.energy.values
-        n_frames = len(energies)
+        all_energies = data_to_use.energy.values
+        n_total_energies = len(all_energies)
         
-        if n_frames == 0:
+        if n_total_energies == 0:
             raise ValueError("No energy points found in the specified range.")
         
-        # Calculate fps from total time and number of frames
-        fps = n_frames / total_time
-        interval_ms = 1000 / fps  # Convert to milliseconds for matplotlib
+        # Calculate target fps and determine if subsampling is needed
+        target_fps = n_total_energies / total_time
         
-        print(f"Creating animation with {n_frames} frames over {total_time:.1f} seconds")
-        print(f"Calculated fps: {fps:.2f}, interval: {interval_ms:.1f} ms per frame")
-        print(f"Energy range: {energies[0]:.2f} to {energies[-1]:.2f} eV")
+        if target_fps > max_fps:
+            # Subsample energy points to achieve desired timing
+            actual_fps = max_fps
+            n_animation_frames = int(total_time * actual_fps)
+            
+            # Ensure we don't exceed available energy points
+            n_animation_frames = min(n_animation_frames, n_total_energies)
+            
+            # Select evenly spaced energy indices for animation
+            animation_indices = np.linspace(0, n_total_energies - 1, n_animation_frames, dtype=int)
+            animation_energies = all_energies[animation_indices]
+            
+            print(f"Subsampling: Using {n_animation_frames} of {n_total_energies} energy points")
+            print(f"Energy step size: {(all_energies[-1] - all_energies[0]) / (n_animation_frames - 1):.3f} eV")
+        else:
+            # Use all energy points
+            actual_fps = target_fps
+            n_animation_frames = n_total_energies
+            animation_indices = np.arange(n_total_energies)
+            animation_energies = all_energies
+            print(f"Using all {n_total_energies} energy points")
+        
+        # Calculate interval for matplotlib (in milliseconds)
+        interval_ms = 1000 / actual_fps
+        actual_total_time = n_animation_frames / actual_fps
+        
+        print(f"Creating animation with {n_animation_frames} frames over {actual_total_time:.1f} seconds")
+        print(f"FPS: {actual_fps:.2f}, interval: {interval_ms:.1f} ms per frame")
+        print(f"Animation energy range: {animation_energies[0]:.2f} to {animation_energies[-1]:.2f} eV")
         
         # Set up the figure with two subplots
         fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=(15, 5),
                                             gridspec_kw={'width_ratios': [1, 2]})
         
-        # Initialize the image plot
-        img_data = data_to_use.isel(energy=0)
+        # Initialize the image plot with first animation frame
+        img_data = data_to_use.isel(energy=animation_indices[0])
         img = ax_img.imshow(img_data, cmap='viridis', origin='lower')
-        img_title = ax_img.set_title(f'Energy: {energies[0]:.2f} eV')
+        img_title = ax_img.set_title(f'Energy: {animation_energies[0]:.2f} eV')
         plt.colorbar(img, ax=ax_img, label='Intensity')
         ax_img.set_xlabel('Pixel X')
         ax_img.set_ylabel('Pixel Y')
@@ -2212,8 +2242,9 @@ class LariatDataProcessor:
             ax_img.text(x_min + width/2, y_min + height + 2, 'ROI', 
                     color='red', fontweight='bold', ha='center')
         
-        # Plot the spectrum
-        ax_spec.plot(spectrum_np[:, 0], spectrum_np[:, 1], 'o-', markersize=3, linewidth=1)
+        # Plot the FULL spectrum (not subsampled)
+        ax_spec.plot(spectrum_np[:, 0], spectrum_np[:, 1], 'o-', markersize=2, linewidth=1, 
+                    color='blue', alpha=0.7, label='Full Spectrum')
         ax_spec.set_xlabel('Energy (eV)')
         ax_spec.set_ylabel('Intensity')
         ax_spec.set_title('Spectrum')
@@ -2224,21 +2255,32 @@ class LariatDataProcessor:
         ax_spec.set_ylim(np.min(spectrum_np[:, 1]) * 0.95, np.max(spectrum_np[:, 1]) * 1.05)
         
         # Add a vertical line to indicate the current energy
-        energy_line = ax_spec.axvline(x=energies[0], color='red', linestyle='-', linewidth=2, alpha=0.8)
+        energy_line = ax_spec.axvline(x=animation_energies[0], color='red', linestyle='-', 
+                                    linewidth=3, alpha=0.8, label='Current Energy')
+        
+        # Add legend
+        ax_spec.legend(loc='upper right')
         
         # Add energy text and animation info on the spectrum plot
-        energy_text = ax_spec.text(0.02, 0.98, f'Current: {energies[0]:.2f} eV', 
+        energy_text = ax_spec.text(0.02, 0.98, f'Current: {animation_energies[0]:.2f} eV', 
                                 transform=ax_spec.transAxes, verticalalignment='top',
                                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
-        time_text = ax_spec.text(0.02, 0.90, f'Time: {total_time:.1f}s | FPS: {fps:.1f}', 
+        info_text = (f'Duration: {actual_total_time:.1f}s | FPS: {actual_fps:.1f}\n'
+                    f'Frames: {n_animation_frames}/{n_total_energies}')
+        time_text = ax_spec.text(0.02, 0.88, info_text, 
                                 transform=ax_spec.transAxes, verticalalignment='top',
-                                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+                                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
+                                fontsize=9)
         
         # Function to update the animation for each frame
         def update_frame(frame):
+            # Get the actual energy index for this animation frame
+            energy_idx = animation_indices[frame]
+            current_energy = animation_energies[frame]
+            
             # Update the image data
-            img_data = data_to_use.isel(energy=frame)
+            img_data = data_to_use.isel(energy=energy_idx)
             img.set_array(img_data)
             
             # Adjust contrast dynamically using percentiles
@@ -2246,7 +2288,6 @@ class LariatDataProcessor:
             img.set_clim(vmin, vmax)
             
             # Update the image title
-            current_energy = energies[frame]
             img_title.set_text(f'Energy: {current_energy:.2f} eV')
             
             # Update the vertical line position
@@ -2257,41 +2298,48 @@ class LariatDataProcessor:
             
             return img, img_title, energy_line, energy_text
         
-        # Create the animation
-        anim = animation.FuncAnimation(fig, update_frame, frames=n_frames, 
+        # Create the animation with calculated interval
+        anim = animation.FuncAnimation(fig, update_frame, frames=n_animation_frames, 
                                     interval=interval_ms, blit=True, repeat=True)
         
-        # Try to save the animation with fallbacks
+        # Try to save the animation with proper fps settings
         try:
             # If output file is .mp4, try to save using FFmpeg
             if output_filename.endswith('.mp4'):
                 try:
                     from matplotlib.animation import FFMpegWriter
-                    writer = FFMpegWriter(fps=fps, bitrate=5000, codec='h264')
+                    # Use the calculated fps explicitly in the writer
+                    writer = FFMpegWriter(fps=actual_fps, bitrate=5000, codec='h264')
                     anim.save(output_filename, writer=writer, dpi=dpi)
                     print(f"Animation saved to {output_filename}")
-                except (FileNotFoundError, RuntimeError):
-                    print("FFmpeg not found or failed. Falling back to GIF format.")
+                    print(f"Final video duration: {actual_total_time:.1f} seconds at {actual_fps:.1f} fps")
+                except (FileNotFoundError, RuntimeError) as e:
+                    print(f"FFmpeg failed: {e}")
+                    print("Falling back to GIF format.")
                     output_filename = output_filename.replace('.mp4', '.gif')
                     from matplotlib.animation import PillowWriter
-                    writer = PillowWriter(fps=fps)
+                    writer = PillowWriter(fps=actual_fps)
                     anim.save(output_filename, writer=writer, dpi=dpi)
                     print(f"Animation saved to {output_filename}")
+                    print(f"Final GIF duration: {actual_total_time:.1f} seconds at {actual_fps:.1f} fps")
             
             # If output file is .gif, use PillowWriter
             elif output_filename.endswith('.gif'):
                 from matplotlib.animation import PillowWriter
-                writer = PillowWriter(fps=fps)
+                # Use the calculated fps explicitly in the writer
+                writer = PillowWriter(fps=actual_fps)
                 anim.save(output_filename, writer=writer, dpi=dpi)
                 print(f"Animation saved to {output_filename}")
+                print(f"Final GIF duration: {actual_total_time:.1f} seconds at {actual_fps:.1f} fps")
             
             else:
                 print("Warning: Output filename must end with .mp4 or .gif. Saving as GIF.")
                 output_filename = output_filename.split('.')[0] + '.gif'
                 from matplotlib.animation import PillowWriter
-                writer = PillowWriter(fps=fps)
+                writer = PillowWriter(fps=actual_fps)
                 anim.save(output_filename, writer=writer, dpi=dpi)
                 print(f"Animation saved to {output_filename}")
+                print(f"Final GIF duration: {actual_total_time:.1f} seconds at {actual_fps:.1f} fps")
         
         except Exception as e:
             print(f"Error saving animation: {e}")
@@ -3961,3 +4009,436 @@ class LariatDataProcessor:
             processed_processor.metadata['pixels_processed'] = pixels_processed
         
         return processed_processor, processing_info
+    
+    
+    def extract_processed_roi_spectra(self, roi_list, roi_labels=None, plot=True, 
+                                  save_spectra=False, save_path=None, save_name='processed_roi_spectra',
+                                  plot_style='individual', figsize=None, energy_range=None,
+                                  normalize_for_display=False, show_image=True, image_energy=None,
+                                  image_contrast_percentiles=(2, 98)):
+        """
+        Extract and plot spectra from one or more ROIs using already processed data.
+        This function does NOT perform any spectral processing - it works on data that
+        has already been processed (e.g., by process_image_pixel_by_pixel).
+        
+        Parameters:
+        -----------
+        roi_list : list of tuples or single tuple
+            ROI(s) to extract spectra from. Each ROI as (x_min, y_min, x_max, y_max).
+            Can also be a single tuple for one ROI.
+        roi_labels : list of str, optional
+            Labels for each ROI. If None, will use "ROI 1", "ROI 2", etc.
+        plot : bool, optional
+            If True, plot the extracted spectra. Default is True.
+        save_spectra : bool, optional
+            If True, save the extracted spectra to files. Default is False.
+        save_path : str, optional
+            Directory to save spectra. If None, uses current directory.
+        save_name : str, optional
+            Base name for saved files.
+        plot_style : str, optional
+            'individual' for separate subplots, 'overlay' for single plot with all spectra.
+            Default is 'individual'.
+        figsize : tuple, optional
+            Figure size as (width, height). If None, uses appropriate default.
+        energy_range : tuple, optional
+            (min_energy, max_energy) to limit the plot range. If None, uses full range.
+        normalize_for_display : bool, optional
+            If True, normalize each spectrum to its maximum for comparison. Default is False.
+        show_image : bool, optional
+            If True, include an image showing ROI locations. Default is True.
+        image_energy : float, optional
+            Energy value to use for the ROI location image. If None, uses middle energy.
+        image_contrast_percentiles : tuple, optional
+            (low, high) percentiles for image contrast. Default is (2, 98).
+            
+        Returns:
+        --------
+        spectra_dict : dict
+            Dictionary with ROI labels as keys and spectrum arrays as values.
+            Each spectrum array has shape (n_energies, 2) with columns [Energy, Intensity].
+        roi_info : dict
+            Information about each ROI including statistics and processing info.
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import os
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first.")
+        
+        # Handle single ROI input
+        if isinstance(roi_list, tuple) and len(roi_list) == 4:
+            roi_list = [roi_list]
+        
+        # Validate ROI list
+        for i, roi in enumerate(roi_list):
+            if len(roi) != 4:
+                raise ValueError(f"ROI {i+1} must be (x_min, y_min, x_max, y_max)")
+        
+        # Set default labels
+        if roi_labels is None:
+            roi_labels = [f"ROI {i+1}" for i in range(len(roi_list))]
+        
+        if len(roi_labels) != len(roi_list):
+            raise ValueError("Number of ROI labels must match number of ROIs")
+        
+        # Get energy coordinates and data dimensions
+        energies = self.data.energy.values
+        n_energies, n_y, n_x = self.data.shape
+        
+        print(f"Extracting spectra from {len(roi_list)} ROI(s) from processed data")
+        print(f"Data shape: {n_x} x {n_y} pixels, {n_energies} energies")
+        
+        # Check if data appears to be processed
+        is_processed = self.data.attrs.get('pixel_by_pixel_processing', False)
+        if is_processed:
+            print("Data appears to be pixel-by-pixel processed")
+        else:
+            print("Warning: Data may not be processed. This function is designed for processed data.")
+        
+        # Extract spectra for each ROI
+        spectra_dict = {}
+        roi_info = {}
+        
+        for roi, label in zip(roi_list, roi_labels):
+            x_min, y_min, x_max, y_max = roi
+            
+            # Validate ROI bounds
+            if (x_min < 0 or y_min < 0 or x_max > n_x or y_max > n_y or 
+                x_min >= x_max or y_min >= y_max):
+                print(f"Warning: ROI {label} ({x_min}, {y_min}, {x_max}, {y_max}) is outside bounds or invalid")
+                print(f"Image bounds: (0, 0, {n_x}, {n_y})")
+                continue
+            
+            # Extract ROI data
+            roi_data = self.data.isel(pix_x=slice(x_min, x_max), pix_y=slice(y_min, y_max))
+            
+            # Calculate average spectrum over the ROI
+            avg_spectrum = roi_data.mean(dim=['pix_x', 'pix_y'])
+            
+            # Create spectrum array [Energy, Intensity]
+            spectrum_array = np.column_stack((energies, avg_spectrum.values))
+            
+            # Apply energy range filter if specified
+            if energy_range is not None:
+                energy_mask = (energies >= energy_range[0]) & (energies <= energy_range[1])
+                spectrum_array = spectrum_array[energy_mask]
+            
+            # Normalize for display if requested
+            if normalize_for_display:
+                max_intensity = np.max(spectrum_array[:, 1])
+                if max_intensity > 0:
+                    spectrum_array[:, 1] = spectrum_array[:, 1] / max_intensity
+            
+            # Store spectrum
+            spectra_dict[label] = spectrum_array
+            
+            # Calculate ROI statistics
+            roi_stats = {
+                'roi_bounds': roi,
+                'roi_size': ((x_max - x_min), (y_max - y_min)),
+                'n_pixels': (x_max - x_min) * (y_max - y_min),
+                'intensity_mean': float(np.mean(spectrum_array[:, 1])),
+                'intensity_std': float(np.std(spectrum_array[:, 1])),
+                'intensity_min': float(np.min(spectrum_array[:, 1])),
+                'intensity_max': float(np.max(spectrum_array[:, 1])),
+                'energy_range': (float(spectrum_array[0, 0]), float(spectrum_array[-1, 0])),
+                'n_energy_points': len(spectrum_array),
+                'normalized_for_display': normalize_for_display
+            }
+            roi_info[label] = roi_stats
+            
+            print(f"  {label}: {roi_stats['roi_size'][0]}x{roi_stats['roi_size'][1]} pixels, "
+                f"intensity range: {roi_stats['intensity_min']:.3f} - {roi_stats['intensity_max']:.3f}")
+        
+        if not spectra_dict:
+            raise ValueError("No valid ROIs found")
+        
+        # Plot spectra if requested
+        if plot:
+            # Select energy for ROI location image
+            if image_energy is None:
+                mid_idx = len(energies) // 2
+                image_energy = energies[mid_idx]
+            
+            # Get image data for ROI visualization
+            image_slice = self.data.sel(energy=image_energy, method='nearest')
+            image_data = image_slice.values
+            actual_image_energy = float(image_slice.energy.values)
+            
+            # Calculate image contrast
+            img_vmin, img_vmax = np.nanpercentile(image_data, image_contrast_percentiles)
+            
+            if plot_style == 'individual':
+                # Individual subplots for each ROI with image
+                n_rois = len(spectra_dict)
+                
+                if show_image:
+                    # Layout: image on left, then individual spectrum plots
+                    n_cols = min(4, n_rois + 1)  # Image + up to 3 spectra per row
+                    n_rows = int(np.ceil((n_rois + 1) / n_cols))
+                    
+                    if figsize is None:
+                        figsize = (5 * n_cols, 4 * n_rows)
+                    
+                    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+                    if n_rows == 1 and n_cols == 1:
+                        axes = [axes]
+                    elif n_rows == 1 or n_cols == 1:
+                        axes = axes.flatten()
+                    else:
+                        axes = axes.flatten()
+                    
+                    # Plot image with ROI overlays in first subplot
+                    ax_img = axes[0]
+                    im = ax_img.imshow(image_data, cmap='viridis', origin='lower', 
+                                    vmin=img_vmin, vmax=img_vmax)
+                    ax_img.set_title(f'ROI Locations\nEnergy: {actual_image_energy:.2f} eV')
+                    ax_img.set_xlabel('Pixel X')
+                    ax_img.set_ylabel('Pixel Y')
+                    plt.colorbar(im, ax=ax_img, fraction=0.046, pad=0.04, label='Intensity')
+                    
+                    # Add ROI rectangles with different colors
+                    colors = plt.cm.tab10(np.linspace(0, 1, len(roi_list)))
+                    for i, (roi, label) in enumerate(zip(roi_list, roi_labels)):
+                        x_min, y_min, x_max, y_max = roi
+                        width = x_max - x_min
+                        height = y_max - y_min
+                        
+                        from matplotlib.patches import Rectangle
+                        rect = Rectangle((x_min, y_min), width, height, 
+                                    edgecolor=colors[i], facecolor='none', linewidth=2)
+                        ax_img.add_patch(rect)
+                        
+                        # Add label
+                        ax_img.text(x_min + width/2, y_min + height + 2, label, 
+                                color=colors[i], fontweight='bold', ha='center',
+                                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+                    
+                    # Plot individual spectra starting from second subplot
+                    spectrum_start_idx = 1
+                else:
+                    # No image, just spectra
+                    n_cols = min(3, n_rois)
+                    n_rows = int(np.ceil(n_rois / n_cols))
+                    
+                    if figsize is None:
+                        figsize = (5 * n_cols, 4 * n_rows)
+                    
+                    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+                    if n_rois == 1:
+                        axes = [axes]
+                    elif n_rows == 1:
+                        axes = axes.flatten() if n_cols > 1 else [axes]
+                    else:
+                        axes = axes.flatten()
+                    
+                    spectrum_start_idx = 0
+                    colors = plt.cm.tab10(np.linspace(0, 1, len(spectra_dict)))
+                
+                # Plot individual spectra
+                colors = plt.cm.tab10(np.linspace(0, 1, len(spectra_dict)))
+                for i, (label, spectrum_data) in enumerate(spectra_dict.items()):
+                    ax_idx = spectrum_start_idx + i
+                    if ax_idx >= len(axes):
+                        break
+                        
+                    ax = axes[ax_idx]
+                    energy_vals = spectrum_data[:, 0]
+                    intensity_vals = spectrum_data[:, 1]
+                    
+                    ax.plot(energy_vals, intensity_vals, 'o-', color=colors[i], 
+                        markersize=3, linewidth=1.5, label=label)
+                    
+                    ax.set_title(f'{label}\n({roi_info[label]["roi_size"][0]}x{roi_info[label]["roi_size"][1]} pixels)')
+                    ax.set_xlabel('Energy (eV)')
+                    if normalize_for_display:
+                        ax.set_ylabel('Normalized Intensity')
+                    else:
+                        ax.set_ylabel('Intensity')
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Add reference lines for processed data
+                    if is_processed:
+                        ax.axhline(y=0, color='red', linestyle='--', alpha=0.5, linewidth=1)
+                        if normalize_for_display:
+                            ax.axhline(y=1, color='purple', linestyle='--', alpha=0.5, linewidth=1)
+                        elif not normalize_for_display:
+                            # Try to detect if post-edge normalized (values around 1)
+                            if np.max(intensity_vals) < 5 and np.max(intensity_vals) > 0.5:
+                                ax.axhline(y=1, color='purple', linestyle='--', alpha=0.5, linewidth=1)
+                
+                # Hide unused subplots
+                start_hide = spectrum_start_idx + len(spectra_dict)
+                for i in range(start_hide, len(axes)):
+                    axes[i].set_visible(False)
+                
+                title_suffix = " (Normalized)" if normalize_for_display else ""
+                fig.suptitle(f'Processed ROI Spectra{title_suffix}', fontsize=14)
+                
+            elif plot_style == 'overlay':
+                # Single plot with all spectra overlaid, optionally with image
+                if show_image:
+                    if figsize is None:
+                        figsize = (16, 6)
+                    
+                    fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=figsize)
+                    
+                    # Plot image with ROI overlays
+                    im = ax_img.imshow(image_data, cmap='viridis', origin='lower', 
+                                    vmin=img_vmin, vmax=img_vmax)
+                    ax_img.set_title(f'ROI Locations\nEnergy: {actual_image_energy:.2f} eV')
+                    ax_img.set_xlabel('Pixel X')
+                    ax_img.set_ylabel('Pixel Y')
+                    plt.colorbar(im, ax=ax_img, fraction=0.046, pad=0.04, label='Intensity')
+                    
+                    # Add ROI rectangles
+                    colors = plt.cm.tab10(np.linspace(0, 1, len(roi_list)))
+                    for i, (roi, label) in enumerate(zip(roi_list, roi_labels)):
+                        x_min, y_min, x_max, y_max = roi
+                        width = x_max - x_min
+                        height = y_max - y_min
+                        
+                        from matplotlib.patches import Rectangle
+                        rect = Rectangle((x_min, y_min), width, height, 
+                                    edgecolor=colors[i], facecolor='none', linewidth=2)
+                        ax_img.add_patch(rect)
+                        
+                        # Add label
+                        ax_img.text(x_min + width/2, y_min + height + 2, label, 
+                                color=colors[i], fontweight='bold', ha='center',
+                                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+                    
+                    # Plot overlaid spectra in second subplot
+                    ax = ax_spec
+                else:
+                    # No image, just overlay plot
+                    if figsize is None:
+                        figsize = (10, 6)
+                    
+                    fig, ax = plt.subplots(figsize=figsize)
+                    colors = plt.cm.tab10(np.linspace(0, 1, len(spectra_dict)))
+                
+                # Plot all spectra overlaid
+                colors = plt.cm.tab10(np.linspace(0, 1, len(spectra_dict)))
+                for i, (label, spectrum_data) in enumerate(spectra_dict.items()):
+                    energy_vals = spectrum_data[:, 0]
+                    intensity_vals = spectrum_data[:, 1]
+                    
+                    ax.plot(energy_vals, intensity_vals, 'o-', color=colors[i], 
+                        markersize=3, linewidth=1.5, label=label)
+                
+                ax.set_xlabel('Energy (eV)')
+                if normalize_for_display:
+                    ax.set_ylabel('Normalized Intensity')
+                    ax.set_title('Processed ROI Spectra (Normalized)')
+                else:
+                    ax.set_ylabel('Intensity')
+                    ax.set_title('Processed ROI Spectra')
+                
+                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                ax.grid(True, alpha=0.3)
+                
+                # Add reference lines for processed data
+                if is_processed:
+                    ax.axhline(y=0, color='red', linestyle='--', alpha=0.5, linewidth=1, label='Pre-edge Level')
+                    if normalize_for_display:
+                        ax.axhline(y=1, color='purple', linestyle='--', alpha=0.5, linewidth=1, label='Normalized Level')
+                    else:
+                        # Check if data looks post-edge normalized
+                        max_intensities = [np.max(spec[:, 1]) for spec in spectra_dict.values()]
+                        if all(0.5 < max_int < 5 for max_int in max_intensities):
+                            ax.axhline(y=1, color='purple', linestyle='--', alpha=0.5, linewidth=1, label='Post-edge Level')
+            
+            else:
+                raise ValueError("plot_style must be 'individual' or 'overlay'")
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Save spectra if requested
+        if save_spectra:
+            if save_path is None:
+                save_path = os.getcwd()
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Save individual spectrum files
+            for label, spectrum_data in spectra_dict.items():
+                # Clean label for filename
+                clean_label = "".join(c for c in label if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                clean_label = clean_label.replace(' ', '_')
+                
+                # Save spectrum data
+                spectrum_filename = f"{save_name}_{clean_label}.csv"
+                spectrum_filepath = os.path.join(save_path, spectrum_filename)
+                
+                header = 'Energy,Intensity'
+                if normalize_for_display:
+                    header = 'Energy,Normalized_Intensity'
+                
+                np.savetxt(spectrum_filepath, spectrum_data, delimiter=',', 
+                        header=header, comments='')
+            
+            # Save combined file with all spectra
+            if len(spectra_dict) > 1:
+                # Find common energy grid (use first spectrum's energies)
+                reference_energy = list(spectra_dict.values())[0][:, 0]
+                
+                # Create combined array
+                combined_data = [reference_energy]
+                header_parts = ['Energy']
+                
+                for label, spectrum_data in spectra_dict.items():
+                    # Check if energies match
+                    if np.array_equal(spectrum_data[:, 0], reference_energy):
+                        combined_data.append(spectrum_data[:, 1])
+                    else:
+                        # Interpolate to common grid if needed
+                        from scipy.interpolate import interp1d
+                        f_interp = interp1d(spectrum_data[:, 0], spectrum_data[:, 1], 
+                                        kind='linear', bounds_error=False, fill_value=np.nan)
+                        interpolated_intensity = f_interp(reference_energy)
+                        combined_data.append(interpolated_intensity)
+                    
+                    clean_label = "".join(c for c in label if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                    clean_label = clean_label.replace(' ', '_')
+                    header_parts.append(clean_label)
+                
+                combined_array = np.column_stack(combined_data)
+                combined_filename = f"{save_name}_all_rois.csv"
+                combined_filepath = os.path.join(save_path, combined_filename)
+                
+                np.savetxt(combined_filepath, combined_array, delimiter=',', 
+                        header=','.join(header_parts), comments='')
+            
+            # Save ROI information
+            info_filename = f"{save_name}_roi_info.txt"
+            info_filepath = os.path.join(save_path, info_filename)
+            
+            with open(info_filepath, 'w') as f:
+                f.write("Processed ROI Spectra Information\n")
+                f.write("=" * 40 + "\n")
+                f.write(f"Number of ROIs: {len(roi_list)}\n")
+                f.write(f"Data shape: {n_x} x {n_y} pixels, {n_energies} energies\n")
+                f.write(f"Processed data: {is_processed}\n")
+                f.write(f"Normalized for display: {normalize_for_display}\n")
+                if energy_range:
+                    f.write(f"Energy range filter: {energy_range[0]} - {energy_range[1]} eV\n")
+                f.write("\n")
+                
+                for label, stats in roi_info.items():
+                    f.write(f"ROI: {label}\n")
+                    f.write(f"  Bounds: {stats['roi_bounds']}\n")
+                    f.write(f"  Size: {stats['roi_size'][0]} x {stats['roi_size'][1]} pixels\n")
+                    f.write(f"  Total pixels: {stats['n_pixels']}\n")
+                    f.write(f"  Intensity range: {stats['intensity_min']:.6f} - {stats['intensity_max']:.6f}\n")
+                    f.write(f"  Intensity mean ± std: {stats['intensity_mean']:.6f} ± {stats['intensity_std']:.6f}\n")
+                    f.write(f"  Energy range: {stats['energy_range'][0]:.3f} - {stats['energy_range'][1]:.3f} eV\n")
+                    f.write(f"  Energy points: {stats['n_energy_points']}\n")
+                    f.write("\n")
+            
+            print(f"Spectra saved to {save_path}")
+            print(f"ROI information saved to {info_filepath}")
+        
+        return spectra_dict, roi_info
