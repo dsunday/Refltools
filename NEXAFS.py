@@ -301,6 +301,604 @@ def binary_contrast_numpy(n1_array, n2_array=None, plot=False, title=None, save_
     
     return result
 
+import numpy as np
+from scipy import interpolate, special
+from scipy.optimize import minimize
+import math
+import matplotlib.pyplot as plt
+
+def erf(x):
+    """
+    Error function wrapper for numpy's error function.
+    """
+    return special.erf(x)
+
+def edge_bl_func(x, location, height, width, decay):
+    """
+    Python equivalent of the Igor Pro Edge_BLFunc function with explicit parameters.
+    
+    Parameters:
+    x : float or numpy array
+        The x values at which to evaluate the function
+    location : float
+        The location parameter (equivalent to s.cwave[0] in Igor)
+    height : float
+        The height parameter (equivalent to s.cwave[1] in Igor)
+    width : float
+        The width parameter (equivalent to s.cwave[2] in Igor)
+    decay : float
+        The decay parameter (equivalent to s.cwave[3] in Igor)
+    
+    Returns:
+    float or numpy array
+        The function value(s) at x
+    """
+    # Determine step (1 if x >= location + width, 0 otherwise)
+    step = np.where(x >= location + width, 1, 0)
+    
+    # Calculate the error function component
+    erf_component = (1 + erf((x - location) * 2 * math.log(2) / width))
+    
+    # Calculate the decay component
+    decay_component = (1 + step * (np.exp(-decay * (x - location - width)) - 1))
+    
+    # Calculate the final result
+    result = (height / 2) * erf_component * decay_component
+    
+    return result
+
+def gaussian(x, height, center, width):
+    """
+    Calculate a Gaussian peak.
+    
+    Parameters:
+    x : numpy array
+        Energy values
+    height : float
+        Peak height
+    center : float
+        Peak center energy
+    width : float
+        Peak width (FWHM)
+    
+    Returns:
+    numpy array
+        Gaussian peak values
+    """
+    sigma = width / (2 * np.sqrt(2 * np.log(2)))  # Convert FWHM to sigma
+    return height * np.exp(-0.5 * ((x - center) / sigma) ** 2)
+
+def parse_peak_params(peak_params: Dict) -> Tuple[Dict, Dict]:
+    """
+    Parse the peak parameters dictionary to separate values from bounds/fit flags.
+    
+    Parameters:
+    peak_params : dict
+        Dictionary containing peak parameters in the format:
+        {"peak_1_width": 10, "peak_1_width_bounds": (5,15,True), ...}
+    
+    Returns:
+    tuple
+        (values_dict, bounds_dict) where values_dict contains the parameter values
+        and bounds_dict contains bounds and fit flags
+    """
+    values = {}
+    bounds = {}
+    
+    for key, value in peak_params.items():
+        if key.endswith('_bounds'):
+            # This is a bounds specification
+            param_name = key[:-7]  # Remove '_bounds' suffix
+            bounds[param_name] = value
+        else:
+            # This is a parameter value
+            values[key] = value
+    
+    return values, bounds
+
+def get_peak_names(peak_params: Dict) -> list:
+    """
+    Extract unique peak names from the parameter dictionary.
+    
+    Parameters:
+    peak_params : dict
+        Dictionary containing peak parameters
+    
+    Returns:
+    list
+        List of peak names (e.g., ['peak_1', 'peak_2', ...])
+    """
+    peak_names = set()
+    for key in peak_params.keys():
+        if not key.endswith('_bounds'):
+            # Extract peak name (everything before the last underscore)
+            parts = key.split('_')
+            if len(parts) >= 3:  # peak_X_parameter format
+                peak_name = '_'.join(parts[:-1])
+                peak_names.add(peak_name)
+    
+    return sorted(list(peak_names))
+
+def validate_peak_params(peak_params: Dict) -> bool:
+    """
+    Validate that all required parameters are present for each peak.
+    
+    Parameters:
+    peak_params : dict
+        Dictionary containing peak parameters
+    
+    Returns:
+    bool
+        True if valid, raises ValueError if invalid
+    """
+    peak_names = get_peak_names(peak_params)
+    required_params = ['width', 'height', 'energy']
+    
+    for peak_name in peak_names:
+        for param in required_params:
+            param_key = f"{peak_name}_{param}"
+            if param_key not in peak_params:
+                raise ValueError(f"Missing required parameter: {param_key}")
+    
+    return True
+
+def simulate_nexafs_spectrum(x: np.ndarray, 
+                           peak_params: Dict,
+                           edge_params: Optional[Dict] = None,
+                           baseline: float = 0.0) -> np.ndarray:
+    """
+    Simulate a NEXAFS spectrum with Gaussian peaks and optional step edge.
+    
+    Parameters:
+    x : numpy array
+        Energy values at which to calculate the spectrum
+    peak_params : dict
+        Dictionary containing peak parameters in the format:
+        {"peak_1_width": 10, "peak_1_width_bounds": (5,15,True), 
+         "peak_1_height": 1, "peak_1_height_bounds": (0.5,1.5,True),
+         "peak_1_energy": 285, "peak_1_energy_bounds": (284,286,False), ...}
+    edge_params : dict, optional
+        Dictionary containing edge parameters:
+        {"location": 280, "height": 0.5, "width": 2.0, "decay": 0.1}
+        If None, no edge is included
+    baseline : float, optional
+        Constant baseline to add to the spectrum (default: 0.0)
+    
+    Returns:
+    numpy array
+        Simulated spectrum values
+    """
+    # Validate input parameters
+    validate_peak_params(peak_params)
+    
+    # Parse peak parameters
+    values, bounds = parse_peak_params(peak_params)
+    peak_names = get_peak_names(peak_params)
+    
+    # Initialize spectrum with baseline
+    spectrum = np.full_like(x, baseline, dtype=float)
+    
+    # Add step edge if provided
+    if edge_params is not None:
+        required_edge_params = ['location', 'height', 'width', 'decay']
+        for param in required_edge_params:
+            if param not in edge_params:
+                raise ValueError(f"Missing required edge parameter: {param}")
+        
+        edge_contribution = edge_bl_func(x, 
+                                       edge_params['location'],
+                                       edge_params['height'], 
+                                       edge_params['width'],
+                                       edge_params['decay'])
+        spectrum += edge_contribution
+    
+    # Add Gaussian peaks
+    for peak_name in peak_names:
+        width = values[f"{peak_name}_width"]
+        height = values[f"{peak_name}_height"]
+        energy = values[f"{peak_name}_energy"]
+        
+        # Add Gaussian peak to spectrum
+        peak_contribution = gaussian(x, height, energy, width)
+        spectrum += peak_contribution
+    
+    return spectrum
+
+def get_fit_parameters(peak_params: Dict, edge_params: Optional[Dict] = None) -> Dict:
+    """
+    Extract parameters that should be fitted (where bounds indicate fit=True).
+    
+    Parameters:
+    peak_params : dict
+        Dictionary containing peak parameters
+    edge_params : dict, optional
+        Dictionary containing edge parameters with bounds
+    
+    Returns:
+    dict
+        Dictionary of parameters to fit with their current values and bounds
+    """
+    values, bounds = parse_peak_params(peak_params)
+    fit_params = {}
+    
+    # Check peak parameters
+    for param_name, bound_info in bounds.items():
+        if len(bound_info) >= 3 and bound_info[2]:  # Third element is fit flag
+            if param_name in values:
+                fit_params[param_name] = {
+                    'value': values[param_name],
+                    'bounds': (bound_info[0], bound_info[1]),
+                    'fit': True
+                }
+    
+    # Check edge parameters if provided
+    if edge_params is not None:
+        for param_name, param_value in edge_params.items():
+            if param_name.endswith('_bounds'):
+                base_param = param_name[:-7]
+                if isinstance(param_value, tuple) and len(param_value) >= 3 and param_value[2]:
+                    if base_param in edge_params:
+                        fit_params[f"edge_{base_param}"] = {
+                            'value': edge_params[base_param],
+                            'bounds': (param_value[0], param_value[1]),
+                            'fit': True
+                        }
+    
+    return fit_params
+
+def fit_spectra_with_edge(target_spectrum, spectrum1, spectrum2, 
+                         initial_guess=None, include_edge=True,
+                         bounds=None):
+    """
+    Fits a linear combination of two spectra plus an optional step edge 
+    to match a target spectrum.
+    
+    Parameters:
+    -----------
+    target_spectrum : ndarray, shape (n, 2)
+        Target spectrum with columns [Energy, Intensity]
+    spectrum1 : ndarray, shape (m, 2)
+        First input spectrum with columns [Energy, Intensity]
+    spectrum2 : ndarray, shape (k, 2)
+        Second input spectrum with columns [Energy, Intensity]
+    initial_guess : list or None, optional
+        Initial guess for parameters:
+        [fraction, edge_location, edge_height, edge_width, edge_decay]
+        If None, defaults to [0.5, (energy_range_mid), 0.1, 1.0, 0.5]
+    include_edge : bool, optional
+        Whether to include the step edge in the fit
+    bounds : list of tuples or None, optional
+        Bounds for parameters as [(min_frac, max_frac), 
+        (min_loc, max_loc), (min_height, max_height), 
+        (min_width, max_width), (min_decay, max_decay)]
+        If None, uses default bounds
+        
+    Returns:
+    --------
+    params : list
+        The optimal parameters [fraction, edge_location, edge_height, edge_width, edge_decay]
+        (if include_edge=False, the edge parameters will be zeros)
+    combined_spectrum : ndarray, shape (n, 2)
+        The optimal combination of spectrum1, spectrum2, and edge
+    components : dict
+        Dictionary with separate components: 
+        {'spec1_contrib', 'spec2_contrib', 'edge_contrib'}
+    """
+    # Get common energy grid (use target's energy grid)
+    target_energies = target_spectrum[:, 0]
+    
+    # Set default initial guess if not provided
+    if initial_guess is None:
+        energy_mid = (target_energies.min() + target_energies.max()) / 2
+        initial_guess = [0.5, energy_mid, 0.1, 1.0, 0.5]
+    
+    # Create interpolation functions for both input spectra
+    interp1 = interpolate.interp1d(spectrum1[:, 0], spectrum1[:, 1], 
+                                  bounds_error=False, fill_value=0)
+    interp2 = interpolate.interp1d(spectrum2[:, 0], spectrum2[:, 1], 
+                                  bounds_error=False, fill_value=0)
+    
+    # Interpolate input spectra onto target energy grid
+    intensity1 = interp1(target_energies)
+    intensity2 = interp2(target_energies)
+    
+    # Define objective function to minimize (sum of squared differences)
+    if include_edge:
+        def objective(params):
+            fraction, edge_loc, edge_height, edge_width, edge_decay = params
+            # Calculate linear combination of spectra
+            spec_combined = fraction * intensity1 + (1 - fraction) * intensity2
+            # Add edge function
+            edge_contribution = edge_bl_func(target_energies, edge_loc, edge_height, edge_width, edge_decay)
+            combined_intensity = spec_combined + edge_contribution
+            # Return sum of squared differences
+            return np.sum((combined_intensity - target_spectrum[:, 1])**2)
+        
+        # Set default bounds if not provided
+        if bounds is None:
+            energy_min, energy_max = target_energies.min(), target_energies.max()
+            bounds = [
+                (0, 1),                     # fraction between 0 and 1
+                (energy_min, energy_max),   # edge location within energy range
+                (0, 1),                     # edge height between 0 and 1
+                (0.1, 10),                  # edge width (reasonable range)
+                (0, 10)                     # edge decay (reasonable range)
+            ]
+    else:
+        # Simplified objective function without edge
+        def objective(params):
+            fraction = params[0]
+            combined_intensity = fraction * intensity1 + (1 - fraction) * intensity2
+            return np.sum((combined_intensity - target_spectrum[:, 1])**2)
+        
+        # Use only the first parameter if no edge
+        initial_guess = [initial_guess[0]]
+        if bounds is None:
+            bounds = [(0, 1)]  # Just the fraction bound
+    
+    # Perform optimization
+    result = minimize(objective, initial_guess, bounds=bounds)
+    optimal_params = result.x
+    
+    # Ensure we return a consistent parameter list format
+    if not include_edge:
+        optimal_params = np.append(optimal_params, [0, 0, 0, 0])
+    
+    # Calculate final combined spectrum and components
+    fraction = optimal_params[0]
+    spec1_contrib = fraction * intensity1
+    spec2_contrib = (1 - fraction) * intensity2
+    
+    if include_edge:
+        edge_loc, edge_height, edge_width, edge_decay = optimal_params[1:5]
+        edge_contrib = edge_bl_func(target_energies, edge_loc, edge_height, edge_width, edge_decay)
+    else:
+        edge_contrib = np.zeros_like(target_energies)
+    
+    combined_intensity = spec1_contrib + spec2_contrib + edge_contrib
+    combined_spectrum = np.column_stack((target_energies, combined_intensity))
+    
+    # Create components dictionary
+    components = {
+        'spec1_contrib': np.column_stack((target_energies, spec1_contrib)),
+        'spec2_contrib': np.column_stack((target_energies, spec2_contrib)),
+        'edge_contrib': np.column_stack((target_energies, edge_contrib))
+    }
+    
+    return optimal_params, combined_spectrum, components
+
+
+
+def plot_spectral_fit_with_edge(target_spectrum, spectrum1, spectrum2, 
+                              optimal_params, combined_spectrum, components,
+                              labels=None, title=None, figsize=(12, 8)):
+    """
+    Creates a comprehensive plot showing the fit results with the edge function component.
+    
+    Parameters:
+    -----------
+    target_spectrum : ndarray, shape (n, 2)
+        Target spectrum with columns [Energy, Intensity]
+    spectrum1 : ndarray, shape (m, 2)
+        First input spectrum with columns [Energy, Intensity]
+    spectrum2 : ndarray, shape (k, 2)
+        Second input spectrum with columns [Energy, Intensity]
+    optimal_params : list
+        The optimal parameters [fraction, edge_location, edge_height, edge_width, edge_decay]
+    combined_spectrum : ndarray, shape (n, 2)
+        The optimal combination of spectrum1, spectrum2, and edge
+    components : dict
+        Dictionary with separate components: 
+        {'spec1_contrib', 'spec2_contrib', 'edge_contrib'}
+    labels : list, optional
+        List of labels for the spectra in the order [target, spectrum1, spectrum2, edge]
+        Default: ['Target', 'Spectrum 1', 'Spectrum 2', 'Edge']
+    title : str, optional
+        Title for the figure
+    figsize : tuple, optional
+        Figure size as (width, height)
+        
+    Returns:
+    --------
+    fig : matplotlib.figure.Figure
+        The created figure
+    axes : list of matplotlib.axes.Axes
+        The axes objects
+    """
+    if labels is None:
+        labels = ['Target', 'Spectrum 1', 'Spectrum 2', 'Edge']
+    
+    # Extract parameters
+    fraction = optimal_params[0]
+    has_edge = np.any(components['edge_contrib'][:, 1] != 0)
+    
+    # Calculate the fit quality
+    residuals = target_spectrum[:, 1] - combined_spectrum[:, 1]
+    rmse = np.sqrt(np.mean(residuals**2))
+    
+    # Set up the figure
+    if has_edge:
+        fig, axes = plt.subplots(2, 2, figsize=figsize, 
+                                 gridspec_kw={'height_ratios': [3, 1.5]})
+        axes = axes.flatten()
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        axes = [axes[0], axes[1], None, None]
+    
+    # Left top plot: Reference spectra
+    axes[0].plot(spectrum1[:, 0], spectrum1[:, 1], 'b-', label=labels[1])
+    axes[0].plot(spectrum2[:, 0], spectrum2[:, 1], 'g-', label=labels[2])
+    axes[0].set_xlabel('Energy')
+    axes[0].set_ylabel('Intensity')
+    axes[0].set_title('Reference Spectra')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Right top plot: Target vs. Fitted
+    axes[1].plot(target_spectrum[:, 0], target_spectrum[:, 1], 'k-', label=labels[0])
+    axes[1].plot(combined_spectrum[:, 0], combined_spectrum[:, 1], 'r--', 
+                label=f'Fit (RMSE: {rmse:.5f})')
+    
+    # Add fit parameters to the legend
+    edge_text = ''
+    if has_edge:
+        edge_loc, edge_height, edge_width, edge_decay = optimal_params[1:5]
+        edge_text = f'\nEdge: loc={edge_loc:.2f}, h={edge_height:.2f}, w={edge_width:.2f}, d={edge_decay:.2f}'
+    
+    axes[1].text(0.02, 0.02, 
+                f'Fraction: {fraction:.3f} × {labels[1]} + {1-fraction:.3f} × {labels[2]}{edge_text}',
+                transform=axes[1].transAxes, fontsize=9,
+                bbox=dict(facecolor='white', alpha=0.7))
+    
+    axes[1].set_xlabel('Energy')
+    axes[1].set_ylabel('Intensity')
+    axes[1].set_title('Target vs. Fitted Spectrum')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    if has_edge:
+        # Left bottom plot: Component contributions
+        axes[2].plot(components['spec1_contrib'][:, 0], components['spec1_contrib'][:, 1], 'b-', 
+                    label=f'{fraction:.3f} × {labels[1]}')
+        axes[2].plot(components['spec2_contrib'][:, 0], components['spec2_contrib'][:, 1], 'g-', 
+                    label=f'{1-fraction:.3f} × {labels[2]}')
+        axes[2].plot(components['edge_contrib'][:, 0], components['edge_contrib'][:, 1], 'm-', 
+                    label=f'{labels[3]}')
+        axes[2].set_xlabel('Energy')
+        axes[2].set_ylabel('Intensity')
+        axes[2].set_title('Component Contributions')
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+        
+        # Right bottom plot: Residuals
+        axes[3].plot(target_spectrum[:, 0], residuals, 'k-')
+        axes[3].axhline(y=0, color='r', linestyle='--', alpha=0.5)
+        axes[3].set_xlabel('Energy')
+        axes[3].set_ylabel('Residuals')
+        axes[3].set_title('Fit Residuals')
+        axes[3].grid(True, alpha=0.3)
+    
+    # Adjust layout and add overall title if provided
+    plt.tight_layout()
+    if title:
+        fig.suptitle(title, fontsize=14)
+        fig.subplots_adjust(top=0.9)
+    
+    return fig, axes
+
+def plot_spectra_with_fixed_params(target_spectrum, spectrum1, spectrum2, 
+                                  params, include_edge=True,
+                                  labels=None, title=None, figsize=(10, 6)):
+    """
+    Plots the target spectrum against a linear combination with user-specified parameters.
+    
+    Parameters:
+    -----------
+    target_spectrum : ndarray, shape (n, 2)
+        Target spectrum with columns [Energy, Intensity]
+    spectrum1 : ndarray, shape (m, 2)
+        First input spectrum with columns [Energy, Intensity]
+    spectrum2 : ndarray, shape (k, 2)
+        Second input spectrum with columns [Energy, Intensity]
+    params : list
+        The parameters [fraction, edge_location, edge_height, edge_width, edge_decay]
+    include_edge : bool, optional
+        Whether to include the step edge in the plot
+    labels : list, optional
+        List of labels for the spectra in the order [target, spectrum1, spectrum2, edge]
+        Default: ['Target', 'Spectrum 1', 'Spectrum 2', 'Edge']
+    title : str, optional
+        Title for the figure
+    figsize : tuple, optional
+        Figure size as (width, height)
+        
+    Returns:
+    --------
+    fig : matplotlib.figure.Figure
+        The created figure
+    ax : matplotlib.axes.Axes
+        The axes object
+    rmse : float
+        Root mean square error between target and calculated intensities
+    """
+    if labels is None:
+        labels = ['Target', 'Spectrum 1', 'Spectrum 2', 'Edge']
+        
+    # Get target energy grid
+    target_energies = target_spectrum[:, 0]
+    
+    # Create interpolation functions for both input spectra
+    interp1 = interpolate.interp1d(spectrum1[:, 0], spectrum1[:, 1], 
+                                   bounds_error=False, fill_value=0)
+    interp2 = interpolate.interp1d(spectrum2[:, 0], spectrum2[:, 1], 
+                                   bounds_error=False, fill_value=0)
+    
+    # Interpolate input spectra onto target energy grid
+    intensity1 = interp1(target_energies)
+    intensity2 = interp2(target_energies)
+    
+    # Extract the parameters
+    fraction = params[0]
+    spec1_contrib = fraction * intensity1
+    spec2_contrib = (1 - fraction) * intensity2
+    
+    # Calculate edge contribution if included
+    if include_edge and len(params) >= 5:
+        edge_loc, edge_height, edge_width, edge_decay = params[1:5]
+        edge_contrib = edge_bl_func(target_energies, edge_loc, edge_height, edge_width, edge_decay)
+    else:
+        edge_contrib = np.zeros_like(target_energies)
+        
+    # Calculate combined intensity
+    combined_intensity = spec1_contrib + spec2_contrib + edge_contrib
+    
+    # Calculate residuals and RMSE
+    residuals = target_spectrum[:, 1] - combined_intensity
+    rmse = np.sqrt(np.mean(residuals**2))
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Plot the spectra
+    ax.plot(target_spectrum[:, 0], target_spectrum[:, 1], 'k-', label=labels[0])
+    ax.plot(target_energies, combined_intensity, 'r--', 
+            label=f'Calculated (RMSE: {rmse:.5f})')
+    
+    # Add component spectra
+    ax.plot(target_energies, spec1_contrib, 'b-', alpha=0.4, 
+            label=f'{fraction:.3f} × {labels[1]}')
+    ax.plot(target_energies, spec2_contrib, 'g-', alpha=0.4, 
+            label=f'{1-fraction:.3f} × {labels[2]}')
+    
+    if include_edge and np.any(edge_contrib != 0):
+        ax.plot(target_energies, edge_contrib, 'm-', alpha=0.4, 
+                label=f'{labels[3]} (loc={params[1]:.2f}, h={params[2]:.2f})')
+    
+    # Add parameter text box
+    param_text = f'Fraction: {fraction:.3f}'
+    if include_edge and len(params) >= 5:
+        param_text += f'\nEdge: loc={params[1]:.2f}, h={params[2]:.2f}, w={params[3]:.2f}, d={params[4]:.2f}'
+    
+    ax.text(0.02, 0.02, param_text, transform=ax.transAxes, fontsize=9,
+            bbox=dict(facecolor='white', alpha=0.7))
+    
+    ax.set_xlabel('Energy')
+    ax.set_ylabel('Intensity')
+    if title:
+        ax.set_title(title)
+    else:
+        ax.set_title('Spectra Comparison with Fixed Parameters')
+    
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    return fig, ax, rmse
+
+
+
+
 class NEXAFSDatabase:
     """
     A database for storing NEXAFS spectrum data and associated SLD calculations.
