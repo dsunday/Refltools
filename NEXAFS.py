@@ -1077,6 +1077,346 @@ def estimate_parameter_uncertainties(fitting_func, energy_exp, intensity_exp,
     
     return uncertainties
 
+def plot_nexafs_spectrum(energy: np.ndarray,
+                        intensity: np.ndarray,
+                        peak_params: Dict,
+                        edge_params: Optional[Dict] = None,
+                        baseline: float = 0.0,
+                        figsize: Tuple[float, float] = (12, 8),
+                        peak_alpha: float = 0.3,
+                        peak_colors: Optional[List[str]] = None,
+                        title: str = "NEXAFS Spectrum",
+                        save_path: Optional[str] = None,
+                        dpi: int = 300) -> plt.Figure:
+    """
+    Plot NEXAFS spectrum with peak decomposition - works with either initial or fitted parameters.
+    
+    This general function can plot:
+    - Initial spectrum with starting parameter guesses
+    - Fitted spectrum with optimized parameters
+    - Any spectrum with given peak and edge parameters
+    
+    Parameters:
+    energy : numpy array
+        Energy values
+    intensity : numpy array
+        Intensity values (experimental data or simulated spectrum)
+    peak_params : dict
+        Peak parameters dictionary (either initial guesses or fitted values)
+        Format: {"peak_1_width": 1.5, "peak_1_height": 2.0, "peak_1_energy": 285.0, ...}
+    edge_params : dict, optional
+        Edge parameters dictionary (either initial guesses or fitted values)
+        Format: {"location": 284.0, "height": 1.0, "width": 2.0, "decay": 0.1}
+    baseline : float
+        Baseline value
+    figsize : tuple
+        Figure size (width, height)
+    peak_alpha : float
+        Transparency for peak fill areas (0-1)
+    peak_colors : list, optional
+        List of colors for peaks. If None, uses default colormap
+    title : str
+        Plot title
+    save_path : str, optional
+        Path to save the figure
+    dpi : int
+        Resolution for saved figure
+        
+    Returns:
+    matplotlib.figure.Figure
+        The created figure object
+    """
+    
+    # Create figure
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    
+    # Get peak names and set up colors
+    peak_names = get_peak_names(peak_params)
+    n_peaks = len(peak_names)
+    
+    if peak_colors is None:
+        # Use a colormap to generate distinct colors
+        if n_peaks <= 10:
+            colors = plt.cm.tab10(np.linspace(0, 1, max(n_peaks, 3)))
+        else:
+            colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
+        peak_colors = [mcolors.to_hex(color) for color in colors]
+    
+    # Plot experimental/input data
+    ax.plot(energy, intensity, 'ko', markersize=3, alpha=0.7, 
+             label='Data', zorder=1)
+    
+    # Calculate and plot total spectrum
+    total_spectrum = simulate_nexafs_spectrum(energy, peak_params, edge_params, baseline)
+    ax.plot(energy, total_spectrum, 'r-', linewidth=2, 
+             label='Total Spectrum', zorder=5)
+    
+    # Plot baseline if non-zero
+    if baseline != 0:
+        ax.axhline(y=baseline, color='gray', linestyle='--', alpha=0.7, 
+                   label=f'Baseline = {baseline:.3f}', zorder=2)
+    
+    # Plot step edge if present
+    if edge_params is not None:
+        edge_spectrum = edge_bl_func(energy, 
+                                   edge_params['location'],
+                                   edge_params['height'],
+                                   edge_params['width'], 
+                                   edge_params['decay'])
+        edge_spectrum += baseline
+        ax.plot(energy, edge_spectrum, 'b-', linewidth=2, alpha=0.8,
+                 label='Step Edge', zorder=3)
+    
+    # Plot individual peaks
+    peak_total = np.full_like(energy, baseline)
+    if edge_params is not None:
+        peak_total += edge_bl_func(energy,
+                                 edge_params['location'],
+                                 edge_params['height'],
+                                 edge_params['width'],
+                                 edge_params['decay'])
+    
+    for i, peak_name in enumerate(peak_names):
+        # Get peak parameters
+        width = peak_params[f"{peak_name}_width"]
+        height = peak_params[f"{peak_name}_height"]  
+        peak_energy = peak_params[f"{peak_name}_energy"]
+        
+        # Calculate individual peak
+        peak_spectrum = gaussian(energy, height, peak_energy, width)
+        peak_spectrum_with_baseline = peak_spectrum + peak_total
+        
+        # Plot peak line
+        color = peak_colors[i % len(peak_colors)]
+        peak_label = f'{peak_name.replace("_", " ").title()}'
+        ax.plot(energy, peak_spectrum_with_baseline, '-', 
+                 color=color, linewidth=1.5, label=peak_label, zorder=4)
+        
+        # Fill area under peak
+        ax.fill_between(energy, peak_total, peak_spectrum_with_baseline,
+                        color=color, alpha=peak_alpha, zorder=2)
+        
+        # Add peak info text
+        peak_center_idx = np.argmin(np.abs(energy - peak_energy))
+        peak_y = peak_spectrum_with_baseline[peak_center_idx]
+        ax.annotate(f'{peak_energy:.1f} eV\nFWHM: {width:.2f}', 
+                    xy=(peak_energy, peak_y), xytext=(5, 10),
+                    textcoords='offset points', fontsize=8,
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor=color, alpha=0.7),
+                    ha='left', va='bottom')
+    
+    # Formatting
+    ax.set_xlabel('Energy (eV)', fontsize=12)
+    ax.set_ylabel('Intensity (arb. units)', fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save figure if path provided
+    if save_path is not None:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+    
+    return fig
+
+def plot_nexafs_fit(results: Dict, 
+                   peak_params: Dict,
+                   edge_params: Optional[Dict] = None,
+                   baseline: float = 0.0,
+                   figsize: Tuple[float, float] = (12, 8),
+                   show_residuals: bool = True,
+                   peak_alpha: float = 0.3,
+                   peak_colors: Optional[List[str]] = None,
+                   save_path: Optional[str] = None,
+                   dpi: int = 300) -> plt.Figure:
+    """
+    Plot NEXAFS spectrum fitting results with individual peak components.
+    
+    Parameters:
+    results : dict
+        Results dictionary from fit_nexafs_spectrum containing:
+        - 'experimental_energy': Energy values
+        - 'experimental_intensity': Intensity values
+        - 'fitted_spectrum': Fitted spectrum
+        - 'residuals': Residuals (data - fit)
+        - 'fitted_peak_params': Fitted peak parameters
+        - 'fitted_edge_params': Fitted edge parameters
+        - 'r_squared': R-squared value
+        - 'rmse': Root mean square error
+        - 'fit_result': Dictionary with algorithm info
+    peak_params : dict
+        Peak parameters dictionary (used if fitted params not available)
+    edge_params : dict, optional
+        Edge parameters dictionary (used if fitted params not available)
+    baseline : float
+        Baseline value
+    figsize : tuple
+        Figure size (width, height)
+    show_residuals : bool
+        Whether to show residuals subplot
+    peak_alpha : float
+        Transparency for peak fill areas (0-1)
+    peak_colors : list, optional
+        List of colors for peaks. If None, uses default colormap
+    save_path : str, optional
+        Path to save the figure
+    dpi : int
+        Resolution for saved figure
+        
+    Returns:
+    matplotlib.figure.Figure
+        The created figure object
+    """
+    
+    # Extract data from results
+    energy_exp = results['experimental_energy']
+    intensity_exp = results['experimental_intensity']
+    fitted_spectrum = results['fitted_spectrum']
+    residuals = results['residuals']
+    
+    # Use fitted parameters if available, otherwise use input parameters
+    if results.get('fitted_peak_params') is not None:
+        plot_peak_params = results['fitted_peak_params']
+    else:
+        plot_peak_params = peak_params
+        
+    if results.get('fitted_edge_params') is not None:
+        plot_edge_params = results['fitted_edge_params']
+    else:
+        plot_edge_params = edge_params
+    
+    # Create figure and subplots
+    if show_residuals:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, 
+                                      gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.1})
+    else:
+        fig, ax1 = plt.subplots(1, 1, figsize=figsize)
+        ax2 = None
+    
+    # Get peak names and set up colors
+    peak_names = get_peak_names(plot_peak_params)
+    n_peaks = len(peak_names)
+    
+    if peak_colors is None:
+        # Use a colormap to generate distinct colors
+        if n_peaks <= 10:
+            colors = plt.cm.tab10(np.linspace(0, 1, max(n_peaks, 3)))
+        else:
+            colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
+        peak_colors = [mcolors.to_hex(color) for color in colors]
+    
+    # Plot experimental data
+    ax1.plot(energy_exp, intensity_exp, 'ko', markersize=3, alpha=0.7, 
+             label='Experimental Data', zorder=1)
+    
+    # Plot fitted spectrum
+    if fitted_spectrum is not None:
+        ax1.plot(energy_exp, fitted_spectrum, 'r-', linewidth=2, 
+                 label='Fitted Spectrum', zorder=5)
+    
+    # Plot baseline if non-zero
+    if baseline != 0:
+        ax1.axhline(y=baseline, color='gray', linestyle='--', alpha=0.7, 
+                   label=f'Baseline = {baseline:.3f}', zorder=2)
+    
+    # Plot step edge if present
+    if plot_edge_params is not None:
+        edge_spectrum = edge_bl_func(energy_exp, 
+                                   plot_edge_params['location'],
+                                   plot_edge_params['height'],
+                                   plot_edge_params['width'], 
+                                   plot_edge_params['decay'])
+        edge_spectrum += baseline
+        ax1.plot(energy_exp, edge_spectrum, 'b-', linewidth=2, alpha=0.8,
+                 label='Step Edge', zorder=3)
+    
+    # Plot individual peaks
+    peak_total = np.full_like(energy_exp, baseline)
+    if plot_edge_params is not None:
+        peak_total += edge_bl_func(energy_exp,
+                                 plot_edge_params['location'],
+                                 plot_edge_params['height'],
+                                 plot_edge_params['width'],
+                                 plot_edge_params['decay'])
+    
+    for i, peak_name in enumerate(peak_names):
+        # Get peak parameters
+        width = plot_peak_params[f"{peak_name}_width"]
+        height = plot_peak_params[f"{peak_name}_height"]  
+        energy = plot_peak_params[f"{peak_name}_energy"]
+        
+        # Calculate individual peak
+        peak_spectrum = gaussian(energy_exp, height, energy, width)
+        peak_spectrum_with_baseline = peak_spectrum + peak_total
+        
+        # Plot peak line
+        color = peak_colors[i % len(peak_colors)]
+        peak_label = f'{peak_name.replace("_", " ").title()}'
+        ax1.plot(energy_exp, peak_spectrum_with_baseline, '-', 
+                 color=color, linewidth=1.5, label=peak_label, zorder=4)
+        
+        # Fill area under peak
+        ax1.fill_between(energy_exp, peak_total, peak_spectrum_with_baseline,
+                        color=color, alpha=peak_alpha, zorder=2)
+        
+        # Add peak info text
+        peak_center_idx = np.argmin(np.abs(energy_exp - energy))
+        peak_y = peak_spectrum_with_baseline[peak_center_idx]
+        ax1.annotate(f'{energy:.1f} eV\nFWHM: {width:.2f}', 
+                    xy=(energy, peak_y), xytext=(5, 10),
+                    textcoords='offset points', fontsize=8,
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor=color, alpha=0.7),
+                    ha='left', va='bottom')
+    
+    # Formatting for main plot
+    ax1.set_xlabel('Energy (eV)', fontsize=12)
+    ax1.set_ylabel('Intensity (arb. units)', fontsize=12)
+    ax1.set_title('NEXAFS Spectrum Fitting Results', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+    
+    # Add fitting statistics as text box
+    if 'r_squared' in results:
+        r_squared = results['r_squared']
+        rmse = results['rmse']
+        algorithm = results.get('fit_result', {}).get('algorithm', 'N/A')
+        
+        stats_text = f'R² = {r_squared:.4f}\nRMSE = {rmse:.4f}\nAlgorithm: {algorithm}'
+        ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, 
+                fontsize=10, verticalalignment='top',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8))
+    
+    # Plot residuals if requested
+    if show_residuals and ax2 is not None and residuals is not None:
+        ax2.plot(energy_exp, residuals, 'ko-', markersize=2, linewidth=0.5, alpha=0.7)
+        ax2.axhline(y=0, color='red', linestyle='-', alpha=0.7)
+        ax2.set_xlabel('Energy (eV)', fontsize=12)
+        ax2.set_ylabel('Residuals', fontsize=10)
+        ax2.grid(True, alpha=0.3)
+        ax2.set_title('Fit Residuals', fontsize=12)
+        
+        # Calculate and display residual statistics
+        if len(residuals) > 0:
+            res_std = np.std(residuals)
+            res_mean = np.mean(residuals)
+            ax2.axhline(y=res_mean + 2*res_std, color='orange', linestyle='--', alpha=0.7, label='±2σ')
+            ax2.axhline(y=res_mean - 2*res_std, color='orange', linestyle='--', alpha=0.7)
+            ax2.text(0.02, 0.95, f'σ = {res_std:.4f}', transform=ax2.transAxes,
+                    fontsize=9, verticalalignment='top',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save figure if path provided
+    if save_path is not None:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+    
+    return fig
 
 def print_fit_results(results: Dict):
     """
