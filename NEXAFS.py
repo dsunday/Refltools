@@ -700,9 +700,11 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
                        baseline: float = 0.0,
                        method: str = 'lm',
                        max_iterations: int = 1000,
-                       tolerance: float = 1e-8) -> Dict:
+                       tolerance: float = 1e-8,
+                       algorithm: str = 'curve_fit',
+                       global_opt_params: Optional[Dict] = None) -> Dict:
     """
-    Fit NEXAFS spectrum parameters to experimental data.
+    Fit NEXAFS spectrum parameters to experimental data with multiple optimization algorithms.
     
     Parameters:
     data : str, numpy array, or pandas DataFrame
@@ -714,21 +716,35 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
     baseline : float
         Baseline value (can be fitted if included in parameters)
     method : str
-        Fitting method ('lm' for Levenberg-Marquardt, 'trf' for Trust Region)
+        Fitting method for curve_fit ('lm', 'trf', 'dogbox')
     max_iterations : int
         Maximum number of fitting iterations
     tolerance : float
         Fitting tolerance
+    algorithm : str
+        Optimization algorithm to use:
+        - 'curve_fit': scipy.optimize.curve_fit (Levenberg-Marquardt or Trust Region)
+        - 'least_squares': scipy.optimize.least_squares (more robust)
+        - 'minimize': scipy.optimize.minimize (general optimization)
+        - 'differential_evolution': Global optimization using differential evolution
+        - 'dual_annealing': Global optimization using dual annealing
+    global_opt_params : dict, optional
+        Additional parameters for global optimization algorithms:
+        - For differential_evolution: {'popsize': 15, 'seed': None, 'workers': 1}
+        - For dual_annealing: {'initial_temp': 5230., 'restart_temp_ratio': 2e-05, 'seed': None}
     
     Returns:
     dict
-        Dictionary containing:
-        - 'fitted_params': Updated parameter dictionaries
+        Dictionary containing fitting results with keys:
+        - 'fitted_peak_params': Updated peak parameters
+        - 'fitted_edge_params': Updated edge parameters  
         - 'fit_result': Detailed fitting results
         - 'fitted_spectrum': Calculated spectrum with fitted parameters
         - 'residuals': Residuals (data - fit)
         - 'r_squared': R-squared value
         - 'rmse': Root mean square error
+        - 'experimental_energy': Original energy data
+        - 'experimental_intensity': Original intensity data
     """
     
     # Load experimental data
@@ -758,25 +774,164 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
             raise ValueError(f"Parameter {param_name} not found in fit parameters")
     
     initial_values = np.array(initial_values)
-    bounds = (lower_bounds, upper_bounds)
+    
+    # Set default global optimization parameters
+    if global_opt_params is None:
+        global_opt_params = {}
     
     try:
-        # Perform fitting using scipy.optimize.curve_fit
-        popt, pcov = curve_fit(
-            fitting_func, 
-            energy_exp, 
-            intensity_exp,
-            p0=initial_values,
-            bounds=bounds,
-            method=method,
-            maxfev=max_iterations,
-            gtol=tolerance,
-            ftol=tolerance,
-            xtol=tolerance
-        )
-        
-        # Calculate fitted spectrum
-        fitted_spectrum = fitting_func(energy_exp, *popt)
+        if algorithm == 'curve_fit':
+            # Use scipy.optimize.curve_fit (Levenberg-Marquardt or Trust Region)
+            bounds = (lower_bounds, upper_bounds)
+            
+            popt, pcov = curve_fit(
+                fitting_func, 
+                energy_exp, 
+                intensity_exp,
+                p0=initial_values,
+                bounds=bounds,
+                method=method,
+                maxfev=max_iterations,
+                gtol=tolerance,
+                ftol=tolerance,
+                xtol=tolerance
+            )
+            
+            # Calculate fitted spectrum
+            fitted_spectrum = fitting_func(energy_exp, *popt)
+            fit_success = True
+            
+        elif algorithm == 'least_squares':
+            # Use scipy.optimize.least_squares (more robust for bounded problems)
+            def residual_func(params):
+                return intensity_exp - fitting_func(energy_exp, *params)
+            
+            bounds = (lower_bounds, upper_bounds)
+            
+            result = least_squares(
+                residual_func,
+                initial_values,
+                bounds=bounds,
+                method=method if method in ['trf', 'dogbox'] else 'trf',
+                max_nfev=max_iterations,
+                gtol=tolerance,
+                ftol=tolerance,
+                xtol=tolerance
+            )
+            
+            popt = result.x
+            pcov = None  # least_squares doesn't directly provide covariance
+            fitted_spectrum = fitting_func(energy_exp, *popt)
+            fit_success = result.success
+            
+            # Calculate covariance matrix if possible
+            try:
+                if hasattr(result, 'jac'):
+                    # Calculate covariance from Jacobian
+                    jac = result.jac
+                    pcov = np.linalg.inv(jac.T @ jac) * np.var(result.fun)
+            except:
+                pcov = None
+                
+        elif algorithm == 'differential_evolution':
+            # Use scipy.optimize.differential_evolution (global optimization)
+            def objective_func(params):
+                try:
+                    predicted = fitting_func(energy_exp, *params)
+                    return np.sum((intensity_exp - predicted)**2)
+                except:
+                    return np.inf
+            
+            bounds = list(zip(lower_bounds, upper_bounds))
+            
+            # Set default differential evolution parameters
+            de_params = {
+                'popsize': 15,
+                'maxiter': max_iterations,
+                'tol': tolerance,
+                'seed': None,
+                'workers': 1
+            }
+            de_params.update(global_opt_params)
+            
+            result = differential_evolution(
+                objective_func,
+                bounds,
+                **de_params
+            )
+            
+            popt = result.x
+            pcov = None  # DE doesn't provide covariance matrix
+            fitted_spectrum = fitting_func(energy_exp, *popt)
+            fit_success = result.success
+            
+        elif algorithm == 'dual_annealing':
+            # Use scipy.optimize.dual_annealing (global optimization)
+            def objective_func(params):
+                try:
+                    predicted = fitting_func(energy_exp, *params)
+                    return np.sum((intensity_exp - predicted)**2)
+                except:
+                    return np.inf
+            
+            bounds = list(zip(lower_bounds, upper_bounds))
+            
+            # Set default dual annealing parameters
+            da_params = {
+                'maxiter': max_iterations,
+                'initial_temp': 5230.0,
+                'restart_temp_ratio': 2e-05,
+                'visit': 2.62,
+                'accept': -5.0,
+                'maxfun': 1e7,
+                'seed': None,
+                'no_local_search': False,
+                'callback': None,
+                'x0': initial_values
+            }
+            da_params.update(global_opt_params)
+            
+            result = dual_annealing(
+                objective_func,
+                bounds,
+                **da_params
+            )
+            
+            popt = result.x
+            pcov = None  # DA doesn't provide covariance matrix
+            fitted_spectrum = fitting_func(energy_exp, *popt)
+            fit_success = result.success
+            
+        elif algorithm == 'minimize':
+            # Use scipy.optimize.minimize (general optimization)
+            def objective_func(params):
+                try:
+                    predicted = fitting_func(energy_exp, *params)
+                    return np.sum((intensity_exp - predicted)**2)
+                except:
+                    return np.inf
+            
+            bounds = list(zip(lower_bounds, upper_bounds))
+            
+            result = minimize(
+                objective_func,
+                initial_values,
+                bounds=bounds,
+                method='L-BFGS-B',
+                options={
+                    'maxiter': max_iterations,
+                    'gtol': tolerance,
+                    'ftol': tolerance
+                }
+            )
+            
+            popt = result.x
+            pcov = None  # minimize doesn't provide covariance matrix
+            fitted_spectrum = fitting_func(energy_exp, *popt)
+            fit_success = result.success
+            
+        else:
+            raise ValueError(f"Unknown algorithm: {algorithm}")
         
         # Calculate residuals and statistics
         residuals = intensity_exp - fitted_spectrum
@@ -803,10 +958,22 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
             param_errors = np.sqrt(np.diag(pcov))
             for i, param_name in enumerate(fit_param_names):
                 param_uncertainties[param_name] = param_errors[i]
+        else:
+            # For algorithms without covariance, use finite differences to estimate uncertainties
+            if algorithm in ['differential_evolution', 'dual_annealing', 'minimize']:
+                try:
+                    param_uncertainties = estimate_parameter_uncertainties(
+                        fitting_func, energy_exp, intensity_exp, popt, fit_param_names
+                    )
+                except:
+                    # If uncertainty estimation fails, set to zero
+                    for param_name in fit_param_names:
+                        param_uncertainties[param_name] = 0.0
         
         # Prepare results dictionary
         fit_result = {
-            'success': True,
+            'success': fit_success,
+            'algorithm': algorithm,
             'fitted_values': dict(zip(fit_param_names, popt)),
             'parameter_uncertainties': param_uncertainties,
             'covariance_matrix': pcov,
@@ -837,6 +1004,7 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
             'fitted_edge_params': edge_params,
             'fit_result': {
                 'success': False,
+                'algorithm': algorithm,
                 'error_message': str(e),
                 'fitted_values': {},
                 'parameter_uncertainties': {},
@@ -853,6 +1021,62 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
         
         print(f"Fitting failed: {e}")
         return results
+
+def estimate_parameter_uncertainties(fitting_func, energy_exp, intensity_exp, 
+                                   popt, param_names, delta_frac=0.01):
+    """
+    Estimate parameter uncertainties using finite differences for algorithms
+    that don't provide covariance matrices.
+    
+    Parameters:
+    fitting_func : function
+        The fitting function
+    energy_exp : array
+        Experimental energy values
+    intensity_exp : array  
+        Experimental intensity values
+    popt : array
+        Optimized parameter values
+    param_names : list
+        List of parameter names
+    delta_frac : float
+        Fractional change for finite difference calculation
+    
+    Returns:
+    dict
+        Dictionary of parameter uncertainties
+    """
+    uncertainties = {}
+    
+    # Calculate baseline residual
+    fitted_spectrum = fitting_func(energy_exp, *popt)
+    base_residual = np.sum((intensity_exp - fitted_spectrum)**2)
+    
+    for i, param_name in enumerate(param_names):
+        # Calculate finite difference
+        delta = abs(popt[i] * delta_frac) if popt[i] != 0 else delta_frac
+        
+        # Perturb parameter up
+        popt_up = popt.copy()
+        popt_up[i] += delta
+        
+        try:
+            fitted_up = fitting_func(energy_exp, *popt_up)
+            residual_up = np.sum((intensity_exp - fitted_up)**2)
+            
+            # Estimate uncertainty from change in residual
+            # This is a rough approximation
+            sensitivity = abs(residual_up - base_residual) / delta
+            if sensitivity > 0:
+                uncertainties[param_name] = np.sqrt(2 * base_residual / len(energy_exp)) / np.sqrt(sensitivity)
+            else:
+                uncertainties[param_name] = 0.0
+                
+        except:
+            uncertainties[param_name] = 0.0
+    
+    return uncertainties
+
 
 def print_fit_results(results: Dict):
     """
