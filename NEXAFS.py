@@ -533,18 +533,352 @@ def get_fit_parameters(peak_params: Dict, edge_params: Optional[Dict] = None) ->
     
     # Check edge parameters if provided
     if edge_params is not None:
-        for param_name, param_value in edge_params.items():
-            if param_name.endswith('_bounds'):
-                base_param = param_name[:-7]
-                if isinstance(param_value, tuple) and len(param_value) >= 3 and param_value[2]:
-                    if base_param in edge_params:
-                        fit_params[f"edge_{base_param}"] = {
-                            'value': edge_params[base_param],
-                            'bounds': (param_value[0], param_value[1]),
-                            'fit': True
-                        }
+        edge_values, edge_bounds = parse_edge_params(edge_params)
+        for param_name, bound_info in edge_bounds.items():
+            if len(bound_info) >= 3 and bound_info[2]:  # Third element is fit flag
+                if param_name in edge_values:
+                    fit_params[f"edge_{param_name}"] = {
+                        'value': edge_values[param_name],
+                        'bounds': (bound_info[0], bound_info[1]),
+                        'fit': True
+                    }
     
     return fit_params
+
+def parse_edge_params(edge_params: Dict) -> Tuple[Dict, Dict]:
+    """
+    Parse edge parameters dictionary to separate values from bounds/fit flags.
+    
+    Parameters:
+    edge_params : dict
+        Dictionary containing edge parameters and bounds
+    
+    Returns:
+    tuple
+        (values_dict, bounds_dict)
+    """
+    values = {}
+    bounds = {}
+    
+    for key, value in edge_params.items():
+        if key.endswith('_bounds'):
+            # This is a bounds specification
+            param_name = key[:-7]  # Remove '_bounds' suffix
+            bounds[param_name] = value
+        else:
+            # This is a parameter value
+            values[key] = value
+    
+    return values, bounds
+
+def create_fitting_function(peak_params: Dict, edge_params: Optional[Dict] = None, 
+                          baseline: float = 0.0):
+    """
+    Create a fitting function for scipy.optimize with the current parameter structure.
+    
+    Parameters:
+    peak_params : dict
+        Dictionary containing all peak parameters
+    edge_params : dict, optional
+        Dictionary containing all edge parameters
+    baseline : float
+        Baseline value
+    
+    Returns:
+    function
+        Fitting function that takes (x, *fit_params) and returns spectrum
+    """
+    # Get all parameter dictionaries
+    peak_values, peak_bounds = parse_peak_params(peak_params)
+    edge_values = {}
+    edge_bounds = {}
+    
+    if edge_params is not None:
+        edge_values, edge_bounds = parse_edge_params(edge_params)
+    
+    # Get list of parameters to fit
+    fit_param_names = []
+    
+    # Peak parameters to fit
+    for param_name, bound_info in peak_bounds.items():
+        if len(bound_info) >= 3 and bound_info[2]:  # fit flag is True
+            fit_param_names.append(param_name)
+    
+    # Edge parameters to fit
+    for param_name, bound_info in edge_bounds.items():
+        if len(bound_info) >= 3 and bound_info[2]:  # fit flag is True
+            fit_param_names.append(f"edge_{param_name}")
+    
+    def fitting_function(x, *fit_values):
+        """
+        Function that scipy.optimize will call during fitting.
+        
+        Parameters:
+        x : array
+            Energy values
+        *fit_values : tuple
+            Values for the parameters being fitted
+        
+        Returns:
+        array
+            Calculated spectrum
+        """
+        # Create copies of parameter dictionaries
+        current_peak_params = peak_params.copy()
+        current_edge_params = edge_params.copy() if edge_params is not None else None
+        
+        # Update with fitted values
+        for i, param_name in enumerate(fit_param_names):
+            if param_name.startswith('edge_'):
+                # This is an edge parameter
+                edge_param = param_name[5:]  # Remove 'edge_' prefix
+                if current_edge_params is not None:
+                    current_edge_params[edge_param] = fit_values[i]
+            else:
+                # This is a peak parameter
+                current_peak_params[param_name] = fit_values[i]
+        
+        # Calculate spectrum
+        return simulate_nexafs_spectrum(x, current_peak_params, 
+                                      current_edge_params, baseline)
+    
+    return fitting_function, fit_param_names
+
+def load_spectrum_data(data: Union[str, np.ndarray, pd.DataFrame]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load spectrum data from various formats.
+    
+    Parameters:
+    data : str, numpy array, or pandas DataFrame
+        - str: filepath to load data from
+        - numpy array: 2D array with columns [energy, intensity]
+        - pandas DataFrame: DataFrame with energy and intensity columns
+    
+    Returns:
+    tuple
+        (energy_array, intensity_array)
+    """
+    if isinstance(data, str):
+        # Try to load from file
+        try:
+            # Try pandas first (handles various formats)
+            df = pd.read_csv(data, sep=None, engine='python')
+            if df.shape[1] >= 2:
+                energy = df.iloc[:, 0].values
+                intensity = df.iloc[:, 1].values
+            else:
+                raise ValueError("Data file must have at least 2 columns")
+        except:
+            # Fallback to numpy
+            arr = np.loadtxt(data)
+            if arr.ndim != 2 or arr.shape[1] < 2:
+                raise ValueError("Data must have shape (n_points, 2) with energy and intensity")
+            energy = arr[:, 0]
+            intensity = arr[:, 1]
+    
+    elif isinstance(data, pd.DataFrame):
+        if data.shape[1] >= 2:
+            energy = data.iloc[:, 0].values
+            intensity = data.iloc[:, 1].values
+        else:
+            raise ValueError("DataFrame must have at least 2 columns")
+    
+    elif isinstance(data, np.ndarray):
+        if data.ndim != 2 or data.shape[1] < 2:
+            raise ValueError("Data must have shape (n_points, 2) with energy and intensity")
+        energy = data[:, 0]
+        intensity = data[:, 1]
+    
+    else:
+        raise ValueError("Data must be filepath, numpy array, or pandas DataFrame")
+    
+    return energy, intensity
+
+def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
+                       peak_params: Dict,
+                       edge_params: Optional[Dict] = None,
+                       baseline: float = 0.0,
+                       method: str = 'lm',
+                       max_iterations: int = 1000,
+                       tolerance: float = 1e-8) -> Dict:
+    """
+    Fit NEXAFS spectrum parameters to experimental data.
+    
+    Parameters:
+    data : str, numpy array, or pandas DataFrame
+        Experimental data with columns [energy, intensity]
+    peak_params : dict
+        Dictionary containing peak parameters with bounds and fit flags
+    edge_params : dict, optional
+        Dictionary containing edge parameters with bounds and fit flags
+    baseline : float
+        Baseline value (can be fitted if included in parameters)
+    method : str
+        Fitting method ('lm' for Levenberg-Marquardt, 'trf' for Trust Region)
+    max_iterations : int
+        Maximum number of fitting iterations
+    tolerance : float
+        Fitting tolerance
+    
+    Returns:
+    dict
+        Dictionary containing:
+        - 'fitted_params': Updated parameter dictionaries
+        - 'fit_result': Detailed fitting results
+        - 'fitted_spectrum': Calculated spectrum with fitted parameters
+        - 'residuals': Residuals (data - fit)
+        - 'r_squared': R-squared value
+        - 'rmse': Root mean square error
+    """
+    
+    # Load experimental data
+    energy_exp, intensity_exp = load_spectrum_data(data)
+    
+    # Create fitting function
+    fitting_func, fit_param_names = create_fitting_function(peak_params, edge_params, baseline)
+    
+    # Get initial values and bounds for fitting parameters
+    fit_params_info = get_fit_parameters(peak_params, edge_params)
+    
+    if len(fit_params_info) == 0:
+        raise ValueError("No parameters marked for fitting (set fit flag to True)")
+    
+    # Prepare initial values and bounds
+    initial_values = []
+    lower_bounds = []
+    upper_bounds = []
+    
+    for param_name in fit_param_names:
+        if param_name in fit_params_info:
+            initial_values.append(fit_params_info[param_name]['value'])
+            bounds = fit_params_info[param_name]['bounds']
+            lower_bounds.append(bounds[0])
+            upper_bounds.append(bounds[1])
+        else:
+            raise ValueError(f"Parameter {param_name} not found in fit parameters")
+    
+    initial_values = np.array(initial_values)
+    bounds = (lower_bounds, upper_bounds)
+    
+    try:
+        # Perform fitting using scipy.optimize.curve_fit
+        popt, pcov = curve_fit(
+            fitting_func, 
+            energy_exp, 
+            intensity_exp,
+            p0=initial_values,
+            bounds=bounds,
+            method=method,
+            maxfev=max_iterations,
+            gtol=tolerance,
+            ftol=tolerance,
+            xtol=tolerance
+        )
+        
+        # Calculate fitted spectrum
+        fitted_spectrum = fitting_func(energy_exp, *popt)
+        
+        # Calculate residuals and statistics
+        residuals = intensity_exp - fitted_spectrum
+        ss_res = np.sum(residuals**2)
+        ss_tot = np.sum((intensity_exp - np.mean(intensity_exp))**2)
+        r_squared = 1 - (ss_res / ss_tot)
+        rmse = np.sqrt(np.mean(residuals**2))
+        
+        # Update parameter dictionaries with fitted values
+        fitted_peak_params = peak_params.copy()
+        fitted_edge_params = edge_params.copy() if edge_params is not None else None
+        
+        for i, param_name in enumerate(fit_param_names):
+            if param_name.startswith('edge_'):
+                edge_param = param_name[5:]
+                if fitted_edge_params is not None:
+                    fitted_edge_params[edge_param] = popt[i]
+            else:
+                fitted_peak_params[param_name] = popt[i]
+        
+        # Calculate parameter uncertainties from covariance matrix
+        param_uncertainties = {}
+        if pcov is not None:
+            param_errors = np.sqrt(np.diag(pcov))
+            for i, param_name in enumerate(fit_param_names):
+                param_uncertainties[param_name] = param_errors[i]
+        
+        # Prepare results dictionary
+        fit_result = {
+            'success': True,
+            'fitted_values': dict(zip(fit_param_names, popt)),
+            'parameter_uncertainties': param_uncertainties,
+            'covariance_matrix': pcov,
+            'r_squared': r_squared,
+            'rmse': rmse,
+            'residual_sum_squares': ss_res,
+            'degrees_of_freedom': len(energy_exp) - len(popt)
+        }
+        
+        results = {
+            'fitted_peak_params': fitted_peak_params,
+            'fitted_edge_params': fitted_edge_params,
+            'fit_result': fit_result,
+            'fitted_spectrum': fitted_spectrum,
+            'residuals': residuals,
+            'r_squared': r_squared,
+            'rmse': rmse,
+            'experimental_energy': energy_exp,
+            'experimental_intensity': intensity_exp
+        }
+        
+        return results
+        
+    except Exception as e:
+        # Return error information
+        results = {
+            'fitted_peak_params': peak_params,
+            'fitted_edge_params': edge_params,
+            'fit_result': {
+                'success': False,
+                'error_message': str(e),
+                'fitted_values': {},
+                'parameter_uncertainties': {},
+                'r_squared': 0,
+                'rmse': np.inf
+            },
+            'fitted_spectrum': None,
+            'residuals': None,
+            'r_squared': 0,
+            'rmse': np.inf,
+            'experimental_energy': energy_exp,
+            'experimental_intensity': intensity_exp
+        }
+        
+        print(f"Fitting failed: {e}")
+        return results
+
+def print_fit_results(results: Dict):
+    """
+    Print a summary of fitting results.
+    
+    Parameters:
+    results : dict
+        Results dictionary from fit_nexafs_spectrum
+    """
+    fit_result = results['fit_result']
+    
+    if fit_result['success']:
+        print("=== NEXAFS Fitting Results ===")
+        print(f"R-squared: {results['r_squared']:.6f}")
+        print(f"RMSE: {results['rmse']:.6f}")
+        print(f"Degrees of freedom: {fit_result['degrees_of_freedom']}")
+        print("\nFitted Parameters:")
+        print("-" * 50)
+        
+        for param_name, value in fit_result['fitted_values'].items():
+            uncertainty = fit_result['parameter_uncertainties'].get(param_name, 0)
+            print(f"{param_name:25s}: {value:10.4f} ± {uncertainty:8.4f}")
+            
+    else:
+        print("=== Fitting Failed ===")
+        print(f"Error: {fit_result['error_message']}")
 
 def fit_spectra_with_edge(target_spectrum, spectrum1, spectrum2, 
                          initial_guess=None, include_edge=True,
