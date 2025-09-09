@@ -1238,7 +1238,7 @@ class RSoXRProcessor:
             
             # Plot 2: Final combined data
             ax2.plot(final_data[:, 0], final_data[:, 1], 'b-', linewidth=2, label='Combined Data')
-            ax2.set_xlabel('Angle (degrees)')
+            ax2.set_xlabel('Q (Å⁻¹)')
             ax2.set_ylabel('Intensity')
             ax2.set_title(f'Final Combined Data - {energy:.1f} eV')
             ax2.legend()
@@ -3512,14 +3512,19 @@ class RSoXRProcessor:
 
 
     def reduce_data_with_open_beam_option(self, scans, trims, backgrounds, energy, 
-                                normalize=True, plot=False, convert_to_photons=False,
-                                output_dir=None, plot_prefix=None,
-                                smooth_data=False, savgol_window=None, savgol_order=2,
-                                remove_zeros=True, use_open_beam=None):
+                            normalize=True, plot=False, convert_to_photons=False,
+                            output_dir=None, plot_prefix=None,
+                            smooth_data=False, savgol_window=None, savgol_order=2,
+                            remove_zeros=True, use_open_beam=None):
         """
         Enhanced version of reduce_data_with_backgrounds that supports open beam normalization
         CORRECTED to match preview stitching exactly: scaling is done on background-corrected data (NOT open beam corrected)
+        UPDATED: Now includes Q conversion at the end to match standard processing
         """
+        from scipy.signal import savgol_filter
+        from copy import deepcopy
+        import numpy as np
+        
         # Temporarily set open beam normalization if override provided
         original_setting = getattr(self, 'use_open_beam_normalization', False)
         if use_open_beam is not None:
@@ -3673,10 +3678,10 @@ class RSoXRProcessor:
             elif apply_open_beam:
                 print("Open beam normalization already applied to individual scans")
             
-            # Store raw result
-            raw_refl_q = deepcopy(refl)
+            # Store raw result (still in angle space at this point)
+            raw_refl_angle = deepcopy(refl)
             
-            # Apply smoothing if requested
+            # Apply smoothing if requested (still in angle space)
             if smooth_data:
                 if savgol_window is None:
                     savgol_window = min(15, len(refl) // 4)
@@ -3687,25 +3692,56 @@ class RSoXRProcessor:
                         
                 if len(refl) < savgol_window:
                     print(f"Warning: Not enough data points ({len(refl)}) for smoothing window ({savgol_window}). Skipping smoothing.")
-                    refl_smooth = deepcopy(raw_refl_q)
+                    refl_smooth = deepcopy(raw_refl_angle)
                 else:
                     print(f"Applying Savitzky-Golay smoothing: window={savgol_window}, order={savgol_order}")
                     smoothed_intensity = savgol_filter(refl[:,1], savgol_window, savgol_order)
                     refl_smooth = deepcopy(refl)
                     refl_smooth[:,1] = smoothed_intensity
             else:
-                refl_smooth = deepcopy(raw_refl_q)
+                refl_smooth = deepcopy(raw_refl_angle)
             
-            # Sort final data by angle
+            # ===== NEW: CONVERT FROM ANGLE SPACE TO Q SPACE =====
+            
+            # Convert raw data to Q (momentum transfer)
+            wavelength_nm = 1239.9 / energy  # eV to nm
+            wavelength_angstrom = wavelength_nm * 10  # nm to Å
+            Q_raw = 4 * np.pi * np.sin(np.radians(raw_refl_angle[:,0])) / wavelength_angstrom  # Q in Å^-1
+            
+            # Create output array for raw data in Q space
+            raw_refl_q = np.zeros([Q_raw.size, 3])
+            raw_refl_q[:,0] = Q_raw
+            raw_refl_q[:,1] = raw_refl_angle[:,1]  # Keep same intensities
+            raw_refl_q[:,2] = raw_refl_angle[:,1] * 0.01  # 1% error
+            
+            # Sort by Q
             raw_refl_q = raw_refl_q[raw_refl_q[:, 0].argsort()]
-            refl_smooth = refl_smooth[refl_smooth[:, 0].argsort()]
             
-            # Generate plots if requested
+            # If smoothing was applied, also convert smoothed data to Q
+            if smooth_data:
+                # Convert smoothed data to Q
+                Q_smooth = 4 * np.pi * np.sin(np.radians(refl_smooth[:,0])) / wavelength_angstrom  # Q in Å^-1
+                
+                # Create output array for smoothed data in Q space
+                refl_smooth_q = np.zeros([Q_smooth.size, 3])
+                refl_smooth_q[:,0] = Q_smooth
+                refl_smooth_q[:,1] = refl_smooth[:,1]  # Keep same intensities
+                refl_smooth_q[:,2] = refl_smooth[:,1] * 0.01  # 1% error
+                
+                # Sort by Q
+                refl_smooth_q = refl_smooth_q[refl_smooth_q[:, 0].argsort()]
+                
+                # Update the smoothed data variable
+                refl_smooth = refl_smooth_q
+            
+            # ===== END OF Q CONVERSION =====
+            
+            # Generate plots if requested (plots will now show Q vs Intensity)
             if plot and plot_prefix:
                 self._plot_processed_data_with_open_beam_info(all_scans, refl_smooth if smooth_data else raw_refl_q, 
                                                             backgrounds, energy, plot_prefix, output_dir)
             
-            # Return processed data
+            # Return processed data (now in Q space)
             if smooth_data:
                 return refl_smooth, raw_refl_q
             else:
@@ -3763,7 +3799,7 @@ class RSoXRProcessor:
             norm_type = "Open Beam Normalized" if use_open_beam else "Standard Normalized"
             
             ax2.plot(final_data[:, 0], final_data[:, 1], 'b-', linewidth=2, label=f'Combined Data')
-            ax2.set_xlabel('Angle (degrees)')
+            ax2.set_xlabel('Q (Å⁻¹)')
             ax2.set_ylabel('Normalized Intensity')
             ax2.set_title(f'Final Combined Data ({norm_type}) - {energy:.1f} eV')
             ax2.legend()
@@ -3886,13 +3922,13 @@ class RSoXRProcessor:
                 if smooth_data and isinstance(result, tuple):
                     # Save smoothed data
                     np.savetxt(output_path, result[0], delimiter='\t',
-                            header='Angle(deg)\tIntensity\tError', comments='')
+                            header='Q(Å⁻¹)\tIntensity\tError', comments='')
                     print(f"Saved smoothed data to {output_path}")
                 else:
                     # Save regular data  
                     data_to_save = result[0] if isinstance(result, tuple) else result
                     np.savetxt(output_path, data_to_save, delimiter='\t',
-                            header='Angle(deg)\tIntensity\tError', comments='')
+                            header='Q(Å⁻¹)\tIntensity\tError', comments='')
                     print(f"Saved processed data to {output_path}")
                     
             except Exception as e:
