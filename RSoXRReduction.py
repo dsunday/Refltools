@@ -3512,13 +3512,13 @@ class RSoXRProcessor:
 
 
     def reduce_data_with_open_beam_option(self, scans, trims, backgrounds, energy, 
-                                    normalize=True, plot=False, convert_to_photons=False,
-                                    output_dir=None, plot_prefix=None,
-                                    smooth_data=False, savgol_window=None, savgol_order=2,
-                                    remove_zeros=True, use_open_beam=None):
+                                normalize=True, plot=False, convert_to_photons=False,
+                                output_dir=None, plot_prefix=None,
+                                smooth_data=False, savgol_window=None, savgol_order=2,
+                                remove_zeros=True, use_open_beam=None):
         """
         Enhanced version of reduce_data_with_backgrounds that supports open beam normalization
-        UPDATED to include proper plotting functionality
+        CORRECTED to match preview stitching exactly: scaling is done on background-corrected data (NOT open beam corrected)
         """
         # Temporarily set open beam normalization if override provided
         original_setting = getattr(self, 'use_open_beam_normalization', False)
@@ -3535,116 +3535,172 @@ class RSoXRProcessor:
                 print(f"Warning: Not enough trim values provided. Adding default trims for {len(scans) - len(trims)} scans.")
                 trims.extend([(0, -1)] * (len(scans) - len(trims)))
             
-            # Process the first scan
-            refl = deepcopy(scans[0][trims[0][0]:(len(scans[0][:,0])+trims[0][1]), 0:2])
+            # Determine if we should apply open beam correction
+            apply_open_beam = (use_open_beam and hasattr(self, 'open_beam_data') and 
+                            self.open_beam_data is not None and len(self.open_beam_data) > 0)
             
-            # Apply background subtraction to first scan
+            open_beam_intensity = None
+            if apply_open_beam:
+                open_beam_intensity = self.get_open_beam_intensity(energy)
+                if open_beam_intensity is None or open_beam_intensity <= 0:
+                    print(f"Warning: Invalid open beam intensity at {energy:.1f} eV. Disabling open beam correction.")
+                    apply_open_beam = False
+            
+            # Process the first scan - CORRECT ORDER matching preview
+            trim_start, trim_end = trims[0]
+            data = scans[0]
+            
+            # 1. Apply trimming (same logic as preview)
+            end_idx = len(data) + trim_end if trim_end < 0 else trim_end
+            refl = deepcopy(data[trim_start:end_idx, 0:2])
+            
+            # 2. Apply background subtraction
             if backgrounds[0] != 0.0:
                 refl[:, 1] = refl[:, 1] - backgrounds[0]
                 print(f"Applied background subtraction to scan 1: -{backgrounds[0]:.3f}")
             
-            # Remove zeros if requested
+            # 3. Store background-corrected data for scaling (CRITICAL: this is what preview uses for scaling)
+            background_corrected_refl = deepcopy(refl)
+            
+            # 4. Apply open beam correction (for display/final data, but NOT for scaling)
+            if apply_open_beam:
+                refl[:, 1] = refl[:, 1] / open_beam_intensity
+                print(f"Applied open beam correction to scan 1: I0 = {open_beam_intensity:.3e}")
+            
+            # 5. Remove zeros if requested
             if remove_zeros:
                 non_zero_mask = refl[:,1] > 0
+                background_corrected_non_zero_mask = background_corrected_refl[:,1] > 0
+                
                 if not all(non_zero_mask):
                     print(f"Removing {len(refl) - np.sum(non_zero_mask)} zero data points from first scan")
                     refl = refl[non_zero_mask]
+                    background_corrected_refl = background_corrected_refl[background_corrected_non_zero_mask]
             
-            # Convert to photon flux if requested
+            # 6. Convert to photon flux if requested
             if convert_to_photons and hasattr(self, 'calibration_data') and self.calibration_data is not None:
                 refl[:,1] = self.amp_to_photon_flux(refl[:,1], energy)
+                background_corrected_refl[:,1] = self.amp_to_photon_flux(background_corrected_refl[:,1], energy)
             
-            # Store all raw scans for combined plotting (IMPORTANT FOR PLOTTING)
+            # Store all processed scans for plotting
             all_scans = [deepcopy(refl)]
             
-            # Process additional scans (similar logic to existing methods)
+            # Process additional scans - CORRECT ORDER matching preview
             for i in range(1, len(scans)):
-                scan = scans[i][trims[i][0]:(len(scans[i][:,0])+trims[i][1]), 0:2]
+                trim_start, trim_end = trims[i]
+                data = scans[i]
                 
-                # Apply background subtraction
+                # 1. Apply trimming (same logic as preview)
+                end_idx = len(data) + trim_end if trim_end < 0 else trim_end
+                scan = data[trim_start:end_idx, 0:2].copy()
+                
+                # 2. Apply background subtraction
                 if backgrounds[i] != 0.0:
                     scan[:, 1] = scan[:, 1] - backgrounds[i]
                     print(f"Applied background subtraction to scan {i+1}: -{backgrounds[i]:.3f}")
                 
-                # Remove zeros if requested
+                # 3. Store background-corrected data for scaling calculations
+                background_corrected_scan = deepcopy(scan)
+                
+                # 4. Apply open beam correction (for display/final data, but NOT for scaling)
+                if apply_open_beam:
+                    scan[:, 1] = scan[:, 1] / open_beam_intensity
+                    print(f"Applied open beam correction to scan {i+1}: I0 = {open_beam_intensity:.3e}")
+                
+                # 5. Remove zeros if requested
                 if remove_zeros:
                     non_zero_mask = scan[:,1] > 0
+                    background_corrected_non_zero_mask = background_corrected_scan[:,1] > 0
+                    
                     if not all(non_zero_mask):
                         print(f"Removing {len(scan) - np.sum(non_zero_mask)} zero data points from scan {i+1}")
                         scan = scan[non_zero_mask]
+                        background_corrected_scan = background_corrected_scan[background_corrected_non_zero_mask]
                 
-                # Convert to photon flux if requested
+                # 6. Convert to photon flux if requested
                 if convert_to_photons and hasattr(self, 'calibration_data') and self.calibration_data is not None:
                     scan[:,1] = self.amp_to_photon_flux(scan[:,1], energy)
+                    background_corrected_scan[:,1] = self.amp_to_photon_flux(background_corrected_scan[:,1], energy)
                 
-                # Find overlap and scale (use existing logic from your processor)
-                idx, val = self.find_nearest(scan[:,0], refl[-1,0])
+                # 7. CRITICAL: Use EXACT same scaling algorithm as preview stitching
+                prev_max_angle = background_corrected_refl[:, 0].max()
+                curr_min_angle = background_corrected_scan[:, 0].min()
                 
-                # Check for valid overlap
-                if idx <= 0 or np.isnan(val):
-                    print(f"Warning: No overlap found for scan {i+1}. Appending without scaling.")
-                    scale = 1.0
-                else:
-                    # Calculate scaling factor
-                    scale = refl[-1, 1] / scan[idx, 1] if scan[idx, 1] != 0 else 1.0
-                    scan[:, 1] = scan[:, 1] * scale
-                    print(f"Scaling scan {i+1} by factor {scale:.3f}")
+                # Calculate scaling factor if there's overlap (SAME LOGIC AS PREVIEW)
+                scale_factor = 1.0
+                if curr_min_angle <= prev_max_angle:
+                    # There's overlap - calculate scaling factor using PREVIEW ALGORITHM
+                    overlap_mask_combined = background_corrected_refl[:, 0] >= curr_min_angle
+                    overlap_mask_scan = background_corrected_scan[:, 0] <= prev_max_angle
+                    
+                    if np.any(overlap_mask_combined) and np.any(overlap_mask_scan):
+                        overlap_combined = background_corrected_refl[overlap_mask_combined]
+                        overlap_scan = background_corrected_scan[overlap_mask_scan]
+                        
+                        if len(overlap_combined) > 0 and len(overlap_scan) > 0:
+                            # Use median ratio for robust scaling (SAME AS PREVIEW)
+                            ratios = []
+                            for angle in overlap_scan[:, 0]:
+                                # Find closest angle in combined data
+                                idx_combined = np.argmin(np.abs(overlap_combined[:, 0] - angle))
+                                idx_scan = np.argmin(np.abs(overlap_scan[:, 0] - angle))
+                                if (overlap_combined[idx_combined, 1] > 0 and 
+                                    overlap_scan[idx_scan, 1] > 0):  # Avoid division by zero
+                                    ratios.append(overlap_combined[idx_combined, 1] / overlap_scan[idx_scan, 1])
+                            
+                            if len(ratios) > 0:
+                                scale_factor = np.median(ratios)  # MEDIAN same as preview
                 
-                # Store processed scan for plotting
-                all_scans.append(deepcopy(scan))
+                print(f"Scan {i+1}: scaling factor = {scale_factor:.3f} (using preview algorithm)")
                 
-                # Combine with existing data
+                # Apply the same scaling factor to both datasets
+                scan[:,1] *= scale_factor
+                background_corrected_scan[:,1] *= scale_factor
+                
+                # Combine with existing data (SAME AS PREVIEW)
                 refl = np.concatenate((refl, scan))
-            
-            # Apply smoothing if requested
-            if smooth_data and len(refl) > 0:
-                # Validate smoothing parameters
-                if savgol_window is None:
-                    window_size = max(min(25, len(refl) // 10 * 2 + 1), 5)
-                    if window_size % 2 == 0:
-                        window_size += 1
-                else:
-                    window_size = savgol_window
-                    if window_size % 2 == 0:
-                        window_size += 1
-                    window_size = max(window_size, 5)
+                background_corrected_refl = np.concatenate((background_corrected_refl, background_corrected_scan))
                 
-                polynomial_order = min(savgol_order, window_size - 1)
-                polynomial_order = max(polynomial_order, 1)
-                
-                if len(refl) >= window_size:
-                    from scipy.signal import savgol_filter
-                    refl_smooth = deepcopy(refl)
-                    refl_smooth[:, 1] = savgol_filter(refl[:, 1], window_size, polynomial_order)
-                    print(f"Applied Savitzky-Golay smoothing (window={window_size}, order={polynomial_order})")
-                else:
-                    print(f"Warning: Not enough data points ({len(refl)}) for smoothing. Returning unsmoothed data.")
-                    refl_smooth = deepcopy(refl)
-            else:
-                refl_smooth = deepcopy(refl)
+                # Store this processed scan for plotting
+                all_scans.append(deepcopy(scan))
             
-            # Store raw data copy
+            # Final normalization is NOT needed since open beam correction was already applied per-scan
+            # (or standard normalization is not typically applied after open beam correction)
+            if normalize and not apply_open_beam:
+                # Only apply standard normalization if open beam wasn't already applied
+                refl[:,1] = refl[:,1] / np.max(refl[:,1])
+                print("Applied standard normalization")
+            elif apply_open_beam:
+                print("Open beam normalization already applied to individual scans")
+            
+            # Store raw result
             raw_refl_q = deepcopy(refl)
             
-            # Apply normalization using the new method
-            if normalize:
-                # Apply normalization (open beam or standard based on current setting)
-                refl_smooth[:, 1] = self.apply_normalization(refl_smooth[:, 1], energy)
-                raw_refl_q[:, 1] = self.apply_normalization(raw_refl_q[:, 1], energy)
-                
-                # Add error column (1% error assumption)
-                refl_smooth = np.column_stack((refl_smooth, refl_smooth[:, 1] * 0.01))
-                raw_refl_q = np.column_stack((raw_refl_q, raw_refl_q[:, 1] * 0.01))
+            # Apply smoothing if requested
+            if smooth_data:
+                if savgol_window is None:
+                    savgol_window = min(15, len(refl) // 4)
+                    if savgol_window % 2 == 0:
+                        savgol_window += 1
+                    if savgol_window < 5:
+                        savgol_window = 5
+                        
+                if len(refl) < savgol_window:
+                    print(f"Warning: Not enough data points ({len(refl)}) for smoothing window ({savgol_window}). Skipping smoothing.")
+                    refl_smooth = deepcopy(raw_refl_q)
+                else:
+                    print(f"Applying Savitzky-Golay smoothing: window={savgol_window}, order={savgol_order}")
+                    smoothed_intensity = savgol_filter(refl[:,1], savgol_window, savgol_order)
+                    refl_smooth = deepcopy(refl)
+                    refl_smooth[:,1] = smoothed_intensity
             else:
-                # Add error column without normalization
-                refl_smooth = np.column_stack((refl_smooth, refl_smooth[:, 1] * 0.01))
-                raw_refl_q = np.column_stack((raw_refl_q, raw_refl_q[:, 1] * 0.01))
+                refl_smooth = deepcopy(raw_refl_q)
             
-            # IMPORTANT: Sort by Q values for final output (THIS WAS MISSING!)
+            # Sort final data by angle
             raw_refl_q = raw_refl_q[raw_refl_q[:, 0].argsort()]
             refl_smooth = refl_smooth[refl_smooth[:, 0].argsort()]
             
-            # Generate plots if requested (THIS IS THE KEY PART THAT WAS MISSING)
+            # Generate plots if requested
             if plot and plot_prefix:
                 self._plot_processed_data_with_open_beam_info(all_scans, refl_smooth if smooth_data else raw_refl_q, 
                                                             backgrounds, energy, plot_prefix, output_dir)
