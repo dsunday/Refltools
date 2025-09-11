@@ -1666,7 +1666,7 @@ class RSoXRTrimWidget:
                 ax1.legend()
                 ax1.grid(True, which="both", ls="--", alpha=0.3)
                 
-                ax2.set_xlabel('Angle (degrees)')
+                ax2.set_xlabel('Q (Å⁻¹)')
                 ax2.set_ylabel('Intensity' + (' / I₀' if use_open_beam else ''))
                 title_suffix = ' (Open Beam Corrected)' if use_open_beam else ''
                 if not is_within_range and use_open_beam:
@@ -1933,7 +1933,7 @@ class RSoXRTrimWidget:
                         if use_open_beam:
                             open_beam_intensity = self.processor.get_open_beam_intensity(group['energy'])
                             header += f"\n# Open beam I0: {open_beam_intensity:.3e}"
-                        header += "\n# Columns: Angle(deg), Reflectivity"
+                        header += "\n# Columns: Q(Å⁻¹), Intensity, Error"
                         
                         # Add background information to header
                         bg_info = [f"Scan #{scan_num}: -{bg:.3f}" for scan_num, bg in zip(group['scan_numbers'], group['backgrounds']) if bg != 0.0]
