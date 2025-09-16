@@ -3987,3 +3987,477 @@ class RSoXRProcessor:
             
         except Exception as e:
             print(f"Warning: Could not save metadata: {str(e)}")
+
+
+    def reduce_group_with_scaling(self, group_number=None, scans=None, trims=None, 
+                              backgrounds=None, scaling_factors=None, energy=None,
+                              normalize=True, plot=True, convert_to_photons=False,
+                              smooth_data=False, savgol_window=None, savgol_order=2,
+                              remove_zeros=True, output_dir=None, plot_prefix=None,
+                              log_scale=True, use_open_beam=None):
+        """
+        Reduce one RSoXR scan group with manual scaling factors.
+        
+        This method includes all the capabilities from the RSoXR trim widget:
+        - Trim any scan to specified ranges
+        - Subtract background from photodiode data
+        - Apply manual scaling factors between scans (instead of automatic determination)
+        - Generate the same plots as the "Process Group" button
+        
+        Can be used in two ways:
+        1. Provide a group_number to use an existing group from auto_group_scans
+        2. Provide individual parameters (scans, trims, backgrounds, scaling_factors, energy)
+        
+        Parameters:
+        -----------
+        group_number : int, optional
+            Group number (1-based) from self.scan_groups to process
+            If provided, other scan parameters will be taken from the group
+        scans : list of numpy arrays or list of str, optional
+            List of loaded scan data (angle, intensity) or file paths to load
+            Required if group_number is not provided
+        trims : list of tuples, optional
+            List of (start, end) trim indices for each scan
+            Use (0, -1) for no trimming. Required if group_number is not provided
+        backgrounds : list of floats, optional
+            List of background values to subtract from each scan
+            Use 0.0 for no background subtraction. Required if group_number is not provided
+        scaling_factors : list of floats
+            List of scaling factors to apply to each scan
+            First scan typically uses 1.0, subsequent scans use calculated values
+            REQUIRED in all cases - this is the key difference from automatic determination
+        energy : float, optional
+            Photon energy in eV. Required if group_number is not provided
+        normalize : bool, optional
+            Whether to normalize the final reflectivity (default: True)
+        plot : bool, optional
+            Whether to generate plots during processing (default: True)
+        convert_to_photons : bool, optional
+            Whether to convert photodiode current to photon flux (default: False)
+        smooth_data : bool, optional
+            Whether to apply Savitzky-Golay smoothing (default: False)
+        savgol_window : int, optional
+            Window size for smoothing filter (must be odd and >= 5)
+        savgol_order : int, optional
+            Polynomial order for smoothing filter (default: 2)
+        remove_zeros : bool, optional
+            Whether to remove zero intensity points (default: True)
+        output_dir : str, optional
+            Directory to save plots
+        plot_prefix : str, optional
+            Prefix for plot filenames
+        log_scale : bool, optional
+            Whether to use log scale for y-axis in plots (default: True)
+        use_open_beam : bool, optional
+            Whether to use open beam normalization (if None, uses processor default)
+        
+        Returns:
+        --------
+        If smooth_data is True:
+            (smoothed_data, raw_data) : tuple of numpy arrays
+        Else:
+            processed_data : numpy array
+        
+        Examples:
+        --------
+        # Using a group number from auto_group_scans
+        result = processor.reduce_group_with_scaling(
+            group_number=3,  # Process group 3 from processor.scan_groups
+            scaling_factors=[1.0, 1.25, 0.98],  # Manual scaling factors
+            plot=True
+        )
+        
+        # Basic usage with manual parameters
+        result = processor.reduce_group_with_scaling(
+            scans=[scan1_data, scan2_data, scan3_data],
+            trims=[(0, -1), (10, -5), (0, -1)],  # Trim 10 points from start and 5 from end of scan2
+            backgrounds=[0.0, 0.002, 0.001],     # Subtract backgrounds from scans 2 and 3
+            scaling_factors=[1.0, 1.25, 0.98],   # Manual scaling factors
+            energy=285.0,
+            plot=True
+        )
+        
+        # Override group parameters
+        result = processor.reduce_group_with_scaling(
+            group_number=2,                    # Process group 2  
+            scaling_factors=[1.0, 1.12, 0.95], # Manual scaling
+            backgrounds=[0.001, 0.003, 0.002], # Override backgrounds
+            trims=[(5, -3), (0, -10), (15, -1)], # Override trims
+            smooth_data=True,
+            savgol_window=11
+        )
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import os
+        from copy import deepcopy
+        from scipy.signal import savgol_filter
+        
+        # Check if using group number or individual parameters
+        if group_number is not None:
+            # Using group number - extract parameters from self.scan_groups
+            if not hasattr(self, 'scan_groups') or self.scan_groups is None:
+                raise ValueError("No scan groups available. Run self.auto_group_scans() first.")
+            
+            if not (1 <= group_number <= len(self.scan_groups)):
+                raise ValueError(f"Invalid group number {group_number}. Valid range is 1-{len(self.scan_groups)}")
+            
+            # Get the group (convert to 0-based indexing)
+            group = self.scan_groups[group_number - 1]
+            
+            # Extract parameters from the group
+            scans = group['files']  # Will be loaded as file paths
+            energy = group['energy']
+            
+            # Use provided trims/backgrounds if specified, otherwise use group defaults
+            if trims is None:
+                trims = group.get('trims', [(0, -1)] * len(scans))
+            if backgrounds is None:
+                backgrounds = group.get('backgrounds', [0.0] * len(scans))
+            
+            # Scaling factors must still be provided
+            if scaling_factors is None:
+                raise ValueError("scaling_factors must be provided even when using group_number")
+            
+            # Set plot prefix if not provided
+            if plot_prefix is None:
+                plot_prefix = f"{group['sample_name']}_{energy:.1f}eV"
+            
+            print(f"Using group {group_number}: {group['sample_name']} at {energy:.1f} eV")
+            print(f"Scan numbers: {group.get('scan_numbers', 'N/A')}")
+            
+            # Show if parameters were overridden
+            if trims != group.get('trims', [(0, -1)] * len(scans)):
+                print(f"Overriding group trims with: {trims}")
+            if backgrounds != group.get('backgrounds', [0.0] * len(scans)):
+                print(f"Overriding group backgrounds with: {backgrounds}")
+            
+        else:
+            # Using individual parameters - validate that all required parameters are provided
+            if scans is None:
+                raise ValueError("scans must be provided when not using group_number")
+            if trims is None:
+                raise ValueError("trims must be provided when not using group_number")
+            if backgrounds is None:
+                raise ValueError("backgrounds must be provided when not using group_number")
+            if scaling_factors is None:
+                raise ValueError("scaling_factors must be provided")
+            if energy is None:
+                raise ValueError("energy must be provided when not using group_number")
+        
+        # Input validation
+        if len(scans) != len(trims) or len(scans) != len(backgrounds) or len(scans) != len(scaling_factors):
+            raise ValueError(f"Mismatch in input lengths: scans ({len(scans)}), trims ({len(trims)}), "
+                            f"backgrounds ({len(backgrounds)}), scaling_factors ({len(scaling_factors)})")
+        
+        if len(scans) == 0:
+            raise ValueError("At least one scan is required")
+        
+        # Load data if file paths were provided
+        loaded_scans = []
+        for i, scan in enumerate(scans):
+            if isinstance(scan, str):
+                # File path provided
+                try:
+                    data = self.load_data_file(scan)
+                    loaded_scans.append(data)
+                    print(f"Loaded file: {scan}")
+                except Exception as e:
+                    raise ValueError(f"Error loading file {scan}: {str(e)}")
+            elif isinstance(scan, np.ndarray):
+                # Data array provided
+                loaded_scans.append(scan.copy())
+            else:
+                raise TypeError(f"Scan {i} must be either a file path (str) or numpy array")
+        
+        scans = loaded_scans
+        
+        # Validate smoothing parameters if smoothing is enabled
+        if smooth_data:
+            if savgol_window is None:
+                savgol_window = 15
+            if savgol_window < 5 or savgol_window % 2 == 0:
+                raise ValueError(f"Savitzky-Golay window size must be odd and >= 5, got {savgol_window}")
+            if savgol_order >= savgol_window:
+                raise ValueError(f"Polynomial order ({savgol_order}) must be less than window size ({savgol_window})")
+        
+        # Determine open beam setting
+        if use_open_beam is None:
+            use_open_beam = getattr(self, 'use_open_beam_normalization', False)
+        
+        # Check if open beam data is available
+        if use_open_beam:
+            if not hasattr(self, 'open_beam_data') or self.open_beam_data is None:
+                print("Warning: Open beam normalization requested but no open beam data available")
+                use_open_beam = False
+        
+        # Get open beam intensity if available
+        open_beam_intensity = None
+        if use_open_beam:
+            try:
+                open_beam_intensity = self.get_open_beam_intensity(energy)
+                if open_beam_intensity is None:
+                    print(f"Warning: Could not get open beam intensity at {energy:.1f} eV")
+                    use_open_beam = False
+            except Exception as e:
+                print(f"Warning: Error getting open beam intensity: {str(e)}")
+                use_open_beam = False
+        
+        print(f"Processing {len(scans)} scans at {energy:.1f} eV")
+        print(f"Trims: {trims}")
+        print(f"Backgrounds: {backgrounds}")
+        print(f"Scaling factors: {scaling_factors}")
+        if use_open_beam and open_beam_intensity:
+            print(f"Open beam normalization: ENABLED (I₀ = {open_beam_intensity:.3e})")
+        else:
+            print("Open beam normalization: DISABLED")
+        
+        # Process first scan
+        trim_start, trim_end = trims[0]
+        end_idx = len(scans[0]) + trim_end if trim_end < 0 else trim_end
+        refl = scans[0][trim_start:end_idx, 0:2].copy()
+        
+        # Apply background subtraction to first scan
+        if backgrounds[0] != 0.0:
+            refl[:, 1] = refl[:, 1] - backgrounds[0]
+            print(f"Applied background subtraction to scan 1: -{backgrounds[0]:.3f}")
+        
+        # Store background-corrected data for scaling calculations (before other corrections)
+        background_corrected_refl = deepcopy(refl)
+        
+        # Apply open beam correction to display data (not used for scaling)
+        if use_open_beam and open_beam_intensity:
+            refl[:, 1] = refl[:, 1] / open_beam_intensity
+            print(f"Applied open beam correction to scan 1: I₀ = {open_beam_intensity:.3e}")
+        
+        # Apply manual scaling to first scan
+        refl[:, 1] = refl[:, 1] * scaling_factors[0]
+        if scaling_factors[0] != 1.0:
+            print(f"Applied scaling factor to scan 1: {scaling_factors[0]:.3f}")
+        
+        # Remove zeros if requested
+        if remove_zeros:
+            non_zero_mask = refl[:, 1] > 0
+            background_corrected_non_zero_mask = background_corrected_refl[:, 1] > 0
+            
+            if not np.all(non_zero_mask):
+                print(f"Removing {len(refl) - np.sum(non_zero_mask)} zero data points from scan 1")
+                refl = refl[non_zero_mask]
+                background_corrected_refl = background_corrected_refl[background_corrected_non_zero_mask]
+        
+        # Convert to photon flux if requested
+        if convert_to_photons and hasattr(self, 'calibration_data') and self.calibration_data is not None:
+            refl[:, 1] = self.amp_to_photon_flux(refl[:, 1], energy)
+            background_corrected_refl[:, 1] = self.amp_to_photon_flux(background_corrected_refl[:, 1], energy)
+            print("Applied photon flux conversion to scan 1")
+        
+        # Store all processed scans for plotting
+        all_scans = [deepcopy(refl)]
+        
+        # Process additional scans
+        for i in range(1, len(scans)):
+            trim_start, trim_end = trims[i]
+            data = scans[i]
+            
+            # Apply trimming
+            end_idx = len(data) + trim_end if trim_end < 0 else trim_end
+            scan = data[trim_start:end_idx, 0:2].copy()
+            
+            # Apply background subtraction
+            if backgrounds[i] != 0.0:
+                scan[:, 1] = scan[:, 1] - backgrounds[i]
+                print(f"Applied background subtraction to scan {i+1}: -{backgrounds[i]:.3f}")
+            
+            # Store background-corrected data for scaling calculations
+            background_corrected_scan = deepcopy(scan)
+            
+            # Apply open beam correction (for display/final data)
+            if use_open_beam and open_beam_intensity:
+                scan[:, 1] = scan[:, 1] / open_beam_intensity
+                print(f"Applied open beam correction to scan {i+1}: I₀ = {open_beam_intensity:.3e}")
+            
+            # Apply manual scaling factor
+            scan[:, 1] = scan[:, 1] * scaling_factors[i]
+            print(f"Applied scaling factor to scan {i+1}: {scaling_factors[i]:.3f}")
+            
+            # Remove zeros if requested
+            if remove_zeros:
+                non_zero_mask = scan[:, 1] > 0
+                background_corrected_non_zero_mask = background_corrected_scan[:, 1] > 0
+                
+                if not np.all(non_zero_mask):
+                    print(f"Removing {len(scan) - np.sum(non_zero_mask)} zero data points from scan {i+1}")
+                    scan = scan[non_zero_mask]
+                    background_corrected_scan = background_corrected_scan[background_corrected_non_zero_mask]
+            
+            # Convert to photon flux if requested
+            if convert_to_photons and hasattr(self, 'calibration_data') and self.calibration_data is not None:
+                scan[:, 1] = self.amp_to_photon_flux(scan[:, 1], energy)
+                background_corrected_scan[:, 1] = self.amp_to_photon_flux(background_corrected_scan[:, 1], energy)
+                print(f"Applied photon flux conversion to scan {i+1}")
+            
+            # Store processed scan
+            all_scans.append(deepcopy(scan))
+            
+            # Combine with existing reflectivity data
+            refl = np.concatenate((refl, scan))
+        
+        # Sort by angle
+        sort_indices = refl[:, 0].argsort()
+        refl = refl[sort_indices]
+        
+        # Apply normalization if requested
+        if normalize:
+            refl[:, 1] = self.apply_normalization(refl[:, 1], energy)
+            print("Applied energy normalization")
+        
+        # Store raw data before smoothing
+        raw_refl = deepcopy(refl)
+        
+        # Apply smoothing if requested
+        if smooth_data:
+            if len(refl) >= savgol_window:
+                print(f"Applying Savitzky-Golay smoothing: window={savgol_window}, order={savgol_order}")
+                smoothed_intensity = savgol_filter(refl[:, 1], savgol_window, savgol_order)
+                refl_smooth = deepcopy(refl)
+                refl_smooth[:, 1] = smoothed_intensity
+            else:
+                print(f"Warning: Data length ({len(refl)}) < window size ({savgol_window}). Skipping smoothing.")
+                refl_smooth = deepcopy(raw_refl)
+        
+        # Generate plots if requested
+        if plot:
+            self._plot_group_processing_results(all_scans, refl_smooth if smooth_data else raw_refl, 
+                                            backgrounds, energy, scaling_factors, 
+                                            output_dir=output_dir, plot_prefix=plot_prefix, 
+                                            log_scale=log_scale, use_open_beam=use_open_beam,
+                                            open_beam_intensity=open_beam_intensity)
+        
+        # Return processed data
+        if smooth_data:
+            return refl_smooth, raw_refl
+        else:
+            return raw_refl
+
+
+    def _plot_group_processing_results(self, all_scans, final_data, backgrounds, energy, scaling_factors,
+                                    output_dir=None, plot_prefix=None, log_scale=True, 
+                                    use_open_beam=False, open_beam_intensity=None):
+        """
+        Generate plots showing individual scans and final stitched result.
+        
+        This replicates the plots produced after hitting the "Process Group" button,
+        showing individual scans on the left and the fully processed scan on the right.
+        """
+        try:
+            # Create figure with subplots
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Plot 1: Individual scans (after background subtraction and scaling)
+            for i, (scan, bg, scale) in enumerate(zip(all_scans, backgrounds, scaling_factors)):
+                label = f'Scan {i+1}'
+                if bg != 0.0:
+                    label += f' (BG: -{bg:.3f})'
+                if scale != 1.0:
+                    label += f' (×{scale:.3f})'
+                ax1.plot(scan[:, 0], scan[:, 1], 'o-', alpha=0.7, markersize=3, label=label)
+            
+            ax1.set_xlabel('Angle (degrees)')
+            if use_open_beam:
+                ax1.set_ylabel('Intensity / I₀')
+            else:
+                ax1.set_ylabel('Intensity')
+            ax1.set_title(f'Individual Scans (Processed) - {energy:.1f} eV')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            if log_scale:
+                ax1.set_yscale('log')
+            
+            # Plot 2: Final combined data
+            ax2.plot(final_data[:, 0], final_data[:, 1], 'b-', linewidth=2, label='Combined Data')
+            ax2.set_xlabel('Angle (degrees)')
+            if use_open_beam:
+                ax2.set_ylabel('Normalized Intensity / I₀')
+            else:
+                ax2.set_ylabel('Normalized Intensity')
+            
+            title_suffix = ''
+            if use_open_beam:
+                title_suffix = ' (Open Beam Corrected)'
+            ax2.set_title(f'Final Combined Data{title_suffix} - {energy:.1f} eV')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            if log_scale:
+                ax2.set_yscale('log')
+            
+            # Add open beam info if available
+            if use_open_beam and open_beam_intensity:
+                ax2.text(0.05, 0.95, f'I₀({energy:.1f} eV) = {open_beam_intensity:.3e}', 
+                        transform=ax2.transAxes, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            plt.tight_layout()
+            
+            # Save plot if output directory is specified
+            if output_dir and plot_prefix:
+                os.makedirs(output_dir, exist_ok=True)
+                plot_filename = f"{plot_prefix}_processing_results.png"
+                plot_path = os.path.join(output_dir, plot_filename)
+                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+                print(f"Plot saved to {plot_path}")
+            
+            plt.show()
+            
+            # Print summary information
+            print("\nProcessing Summary:")
+            print(f"• Energy: {energy:.1f} eV")
+            print(f"• Number of scans combined: {len(all_scans)}")
+            print(f"• Background subtractions applied: {sum(1 for bg in backgrounds if bg != 0.0)}")
+            print(f"• Manual scaling factors: {scaling_factors}")
+            print(f"• Final data points: {len(final_data)}")
+            print(f"• Angle range: {final_data[:, 0].min():.3f}° to {final_data[:, 0].max():.3f}°")
+            if use_open_beam:
+                print(f"• Open beam normalization applied (I₀ = {open_beam_intensity:.3e})")
+            
+        except Exception as e:
+            print(f"Warning: Could not generate plots: {str(e)}")
+
+
+    def get_group_info(self, group_number):
+        """
+        Get information about a specific group.
+        
+        Parameters:
+        -----------
+        group_number : int
+            Group number (1-based)
+            
+        Returns:
+        --------
+        group_info : dict
+            Dictionary containing group information
+        """
+        if not hasattr(self, 'scan_groups') or self.scan_groups is None:
+            raise ValueError("No scan groups available. Run self.auto_group_scans() first.")
+        
+        if not (1 <= group_number <= len(self.scan_groups)):
+            raise ValueError(f"Invalid group number {group_number}. Valid range is 1-{len(self.scan_groups)}")
+        
+        group = self.scan_groups[group_number - 1]
+        
+        print(f"\nGroup {group_number} Information:")
+        print(f"Sample Name: {group['sample_name']}")
+        print(f"Energy: {group['energy']:.1f} eV")
+        print(f"Position: ({group['x']:.2f}, {group['y']:.2f})")
+        print(f"Number of scans: {len(group['files'])}")
+        
+        if 'scan_numbers' in group:
+            print(f"Scan numbers: {group['scan_numbers']}")
+        
+        print(f"Files:")
+        for i, filename in enumerate(group['files']):
+            trim_info = group['trims'][i] if i < len(group.get('trims', [])) else (0, -1)
+            bg_info = group['backgrounds'][i] if 'backgrounds' in group and i < len(group['backgrounds']) else 0.0
+            print(f"  {i+1}: {os.path.basename(filename)} (trim: {trim_info}, bg: {bg_info})")
+        
+        return group
