@@ -4333,6 +4333,124 @@ def get_batch_results_info(file_path):
         print(f"Error reading batch results info: {str(e)}")
         raise
 
+def save_material_sld(sld_df, material_name, filename, save_dir=None, include_header=True):
+    """
+    Save SLD data for a specific material with columns: Energy, SLD_Real, SLD_Imag
+    
+    Args:
+        sld_df (pandas.DataFrame): SLD DataFrame from extract_sld_from_objectives
+        material_name (str): Name of the material to save
+        filename (str): Name of the file to save (without extension)
+        save_dir (str, optional): Directory to save the file
+        include_header (bool): Whether to include column headers in the CSV
+        
+    Returns:
+        str: Full path to the saved file
+    """
+    import os
+    
+    # Filter data for the specified material
+    material_data = sld_df[sld_df['Material'] == material_name].copy()
+    
+    if material_data.empty:
+        available_materials = sorted(sld_df['Material'].unique())
+        raise ValueError(f"Material '{material_name}' not found in DataFrame. "
+                        f"Available materials: {available_materials}")
+    
+    # Create the output DataFrame with the requested columns
+    output_df = pd.DataFrame({
+        'Energy': material_data['Energy'],
+        'SLD_Real': material_data['SLD_Real'], 
+        'SLD_Imag': material_data['SLD_Imag']
+    })
+    
+    # Sort by energy
+    output_df = output_df.sort_values('Energy').reset_index(drop=True)
+    
+    # Prepare the filename with .csv extension
+    if not filename.endswith('.csv'):
+        filename = f"{filename}.csv"
+    
+    # Determine full file path
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        file_path = os.path.join(save_dir, filename)
+    else:
+        file_path = filename
+    
+    # Save the DataFrame
+    try:
+        output_df.to_csv(file_path, index=False, header=include_header)
+        
+        print(f"Saved {material_name} SLD data to: {file_path}")
+        print(f"Data contains {len(output_df)} energy points")
+        print(f"Energy range: {output_df['Energy'].min():.1f} - {output_df['Energy'].max():.1f} eV")
+        print(f"Columns: Energy, SLD_Real, SLD_Imag")
+        
+        return file_path
+        
+    except Exception as e:
+        print(f"Error saving material SLD data: {str(e)}")
+        raise
+    
+def load_material_sld_array(file_path, has_header=True, verbose=True):
+    """
+    Load saved material SLD data into a numpy array.
+    
+    Args:
+        file_path (str): Path to the saved SLD CSV file
+        has_header (bool): Whether the file has a header row (default: True)
+        verbose (bool): Whether to print loading information
+        
+    Returns:
+        numpy.ndarray: Array with shape (n_points, 3) containing [Energy, SLD_Real, SLD_Imag]
+    """
+    
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    
+    try:
+        # Load the CSV file
+        if has_header:
+            # Skip header row
+            sld_array = np.loadtxt(file_path, delimiter=',', skiprows=1)
+        else:
+            # No header row
+            sld_array = np.loadtxt(file_path, delimiter=',')
+        
+        # Validate the array shape
+        if sld_array.ndim == 1:
+            # Single row case
+            if len(sld_array) != 3:
+                raise ValueError(f"Expected 3 columns (Energy, SLD_Real, SLD_Imag), got {len(sld_array)}")
+            sld_array = sld_array.reshape(1, -1)
+        elif sld_array.ndim == 2:
+            if sld_array.shape[1] != 3:
+                raise ValueError(f"Expected 3 columns (Energy, SLD_Real, SLD_Imag), got {sld_array.shape[1]}")
+        else:
+            raise ValueError(f"Unexpected array dimensions: {sld_array.shape}")
+        
+        if verbose:
+            print(f"Successfully loaded SLD data from: {file_path}")
+            print(f"Array shape: {sld_array.shape}")
+            print(f"Energy range: {sld_array[:, 0].min():.1f} - {sld_array[:, 0].max():.1f} eV")
+            print(f"Real SLD range: {sld_array[:, 1].min():.6e} - {sld_array[:, 1].max():.6e}")
+            print(f"Imag SLD range: {sld_array[:, 2].min():.6e} - {sld_array[:, 2].max():.6e}")
+        
+        return sld_array
+        
+    except Exception as e:
+        print(f"Error loading SLD data from {file_path}: {str(e)}")
+        raise
+
+
+
+
+
+
+
+
+
 
 
 def create_interactive_fit_explorer(batch_results, figsize=(16, 12), default_material=None, fitted_only=False):
