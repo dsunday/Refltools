@@ -3440,3 +3440,250 @@ def load_global_scan_results(scan_dir, csv_filename="global_scan_results.csv"):
     except Exception as e:
         print(f"Error loading scan results: {str(e)}")
         return None
+    
+    
+def plot_global_scan_best_fit_with_uncertainty(scan_results, scan_dir, 
+                                              scanned_params=None,
+                                              uncertainty_percent=10,
+                                              figure_size=(16, 12), 
+                                              zoom_xlim=None, 
+                                              zoom_ylim=None,
+                                              sld_xlim=None, 
+                                              profile_shift=0, 
+                                              save_path=None):
+    """
+    Plot the best fit reflectivity curve and SLD profile with shading to indicate
+    uncertainty corresponding to a specified percent change in goodness of fit
+    from a global parameter scan.
+    
+    This function adapts plot_best_fit_with_uncertainty for global scans where
+    multiple parameters are varied simultaneously.
+    
+    Args:
+        scan_results: DataFrame from load_global_scan_results
+        scan_dir: Directory where objective pickle files are saved
+        scanned_params: List of parameter names that were scanned (auto-detected if None)
+        uncertainty_percent: Percent change in goodness of fit to use for uncertainty (default: 10)
+        figure_size: Size of the figure as (width, height)
+        zoom_xlim: X-axis limits for zoomed reflectivity plot as (min, max)
+        zoom_ylim: Y-axis limits for zoomed reflectivity plot as (min, max)
+        sld_xlim: X-axis limits for SLD profile plot as (min, max)
+        profile_shift: Shift applied to depth profiles
+        save_path: Path to save the figure (None to skip saving)
+        
+    Returns:
+        matplotlib figure and axes
+    """
+    
+    # Auto-detect scanned parameters if not provided
+    if scanned_params is None:
+        scanned_params = []
+        for col in scan_results.columns:
+            if col not in ['model_name', 'goodness_of_fit', 'repeat'] and \
+               not col.endswith('_value') and not col.endswith('_error'):
+                scanned_params.append(col)
+    
+    # Find the best fit
+    best_idx = scan_results['goodness_of_fit'].idxmin()
+    best_result = scan_results.loc[best_idx]
+    best_model_name = best_result['model_name']
+    best_gof = best_result['goodness_of_fit']
+    
+    print(f"Best fit: χ² = {best_gof:.4f}")
+    for param in scanned_params:
+        print(f"  {param}: {best_result[param]:.4f}")
+    
+    # Calculate the threshold for uncertainty
+    gof_threshold = best_gof * (1 + uncertainty_percent/100)
+    
+    # Find all results within the threshold
+    within_threshold = scan_results[scan_results['goodness_of_fit'] <= gof_threshold]
+    print(f"\nFound {len(within_threshold)} fits within {uncertainty_percent}% GOF threshold")
+    
+    # Get parameter ranges within threshold
+    param_ranges = {}
+    for param in scanned_params:
+        param_ranges[param] = {
+            'min': within_threshold[param].min(),
+            'max': within_threshold[param].max(),
+            'best': best_result[param]
+        }
+        print(f"{param} range: [{param_ranges[param]['min']:.4f}, {param_ranges[param]['max']:.4f}]")
+    
+    # Load the best fit objective
+    best_obj_path = os.path.join(scan_dir, f"{best_model_name}_objective.pkl")
+    try:
+        with open(best_obj_path, 'rb') as f:
+            best_obj = pickle.load(f)
+    except Exception as e:
+        print(f"Error loading best objective: {str(e)}")
+        return None, None
+    
+    # Create a 3-row figure
+    fig, axes = plt.subplots(3, 1, figsize=figure_size)
+    ax_refl = axes[0]      # Full reflectivity plot
+    ax_refl_zoom = axes[1] # Zoomed reflectivity plot
+    ax_sld = axes[2]       # SLD profiles
+    
+    # Get data from best fit objective
+    data = best_obj.data
+    best_model_y = best_obj.model(data.data[0])
+    
+    # Get best fit structure for SLD profile
+    structure = getattr(best_obj.model, 'structure', None)
+    if structure is None:
+        print("Error: No structure found in best fit objective")
+        return fig, axes
+    
+    # ---- Plot full reflectivity ----
+    ax_refl.plot(data.data[0], data.data[1], 'o', markersize=3, color='black', label='Data')
+    ax_refl.plot(data.data[0], best_model_y, '-', linewidth=2, color='blue', 
+                label='Best fit')
+    
+    # Calculate uncertainty bands for reflectivity
+    if len(within_threshold) > 1:
+        min_model_y = np.full_like(best_model_y, np.inf)
+        max_model_y = np.full_like(best_model_y, -np.inf)
+        
+        # Load and evaluate each objective within threshold
+        for _, row in within_threshold.iterrows():
+            model_name = row['model_name']
+            obj_path = os.path.join(scan_dir, f"{model_name}_objective.pkl")
+            
+            try:
+                with open(obj_path, 'rb') as f:
+                    obj = pickle.load(f)
+                
+                model_y = obj.model(data.data[0])
+                min_model_y = np.minimum(min_model_y, model_y)
+                max_model_y = np.maximum(max_model_y, model_y)
+                
+            except Exception as e:
+                print(f"Warning: Could not load {model_name}: {str(e)}")
+                continue
+        
+        # Add uncertainty band
+        if not (np.isinf(min_model_y).any() or np.isinf(max_model_y).any()):
+            ax_refl.fill_between(data.data[0], min_model_y, max_model_y,
+                               color='blue', alpha=0.2,
+                               label=f'Uncertainty ({uncertainty_percent}% GOF)')
+    
+    ax_refl.set_yscale('log')
+    ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
+    ax_refl.set_ylabel('Reflectivity')
+    ax_refl.legend(loc='best')
+    ax_refl.grid(True, alpha=0.3)
+    
+    # ---- Plot zoomed reflectivity ----
+    ax_refl_zoom.plot(data.data[0], data.data[1], 'o', markersize=3, color='black', label='Data')
+    ax_refl_zoom.plot(data.data[0], best_model_y, '-', linewidth=2, color='blue',
+                     label='Best fit')
+    
+    if len(within_threshold) > 1 and not (np.isinf(min_model_y).any() or np.isinf(max_model_y).any()):
+        ax_refl_zoom.fill_between(data.data[0], min_model_y, max_model_y,
+                                 color='blue', alpha=0.2,
+                                 label=f'Uncertainty ({uncertainty_percent}% GOF)')
+    
+    ax_refl_zoom.set_yscale('log')
+    if zoom_xlim is not None:
+        ax_refl_zoom.set_xlim(zoom_xlim)
+    if zoom_ylim is not None:
+        ax_refl_zoom.set_ylim(zoom_ylim)
+    ax_refl_zoom.set_xlabel(r'Q ($\AA^{-1}$)')
+    ax_refl_zoom.set_ylabel('Reflectivity')
+    ax_refl_zoom.legend(loc='best')
+    ax_refl_zoom.grid(True, alpha=0.3)
+    
+    # ---- Plot SLD profiles ----
+    # Get best fit SLD profile
+    z = np.linspace(-10, 300, 1000)
+    z, best_sld = structure.sld_profile(z)
+    
+    # Flip z-axis so Silicon is at 0
+    max_depth = np.max(z)
+    flipped_z = max_depth - z
+    
+    ax_sld.plot(flipped_z + profile_shift, best_sld.real, '-', linewidth=2, color='blue',
+               label='Best fit (Real SLD)')
+    ax_sld.plot(flipped_z + profile_shift, best_sld.imag, ':', linewidth=1.5, color='blue',
+               label='Best fit (Imag SLD)')
+    
+    # Calculate uncertainty bands for SLD profile
+    if len(within_threshold) > 1:
+        min_sld_real = np.full_like(best_sld.real, np.inf)
+        max_sld_real = np.full_like(best_sld.real, -np.inf)
+        min_sld_imag = np.full_like(best_sld.imag, np.inf)
+        max_sld_imag = np.full_like(best_sld.imag, -np.inf)
+        
+        # Load and evaluate each structure within threshold
+        for _, row in within_threshold.iterrows():
+            model_name = row['model_name']
+            obj_path = os.path.join(scan_dir, f"{model_name}_objective.pkl")
+            
+            try:
+                with open(obj_path, 'rb') as f:
+                    obj = pickle.load(f)
+                
+                current_structure = getattr(obj.model, 'structure', None)
+                if current_structure is not None:
+                    current_z, current_sld = current_structure.sld_profile(z)
+                    
+                    min_sld_real = np.minimum(min_sld_real, current_sld.real)
+                    max_sld_real = np.maximum(max_sld_real, current_sld.real)
+                    min_sld_imag = np.minimum(min_sld_imag, current_sld.imag)
+                    max_sld_imag = np.maximum(max_sld_imag, current_sld.imag)
+                
+            except Exception as e:
+                print(f"Warning: Could not process SLD for {model_name}: {str(e)}")
+                continue
+        
+        # Add uncertainty bands
+        if not (np.isinf(min_sld_real).any() or np.isinf(max_sld_real).any()):
+            ax_sld.fill_between(flipped_z + profile_shift, min_sld_real, max_sld_real,
+                              color='blue', alpha=0.2,
+                              label=f'Uncertainty ({uncertainty_percent}% GOF)')
+        
+        if not (np.isinf(min_sld_imag).any() or np.isinf(max_sld_imag).any()):
+            ax_sld.fill_between(flipped_z + profile_shift, min_sld_imag, max_sld_imag,
+                              color='blue', alpha=0.1)
+    
+    if sld_xlim is not None:
+        ax_sld.set_xlim(sld_xlim)
+    else:
+        ax_sld.set_xlim(0, max_depth + profile_shift)
+    
+    ax_sld.set_xlabel(r'Distance from Si ($\AA$)')
+    ax_sld.set_ylabel(r'SLD ($10^{-6}$ $\AA^{-2}$)')
+    ax_sld.legend(loc='best')
+    ax_sld.grid(True, alpha=0.3)
+    
+    # Add annotation with parameter ranges
+    uncertainty_text = f"Parameter ranges for {uncertainty_percent}% GOF uncertainty:\n"
+    for param in scanned_params:
+        uncertainty_text += f"{param}: {param_ranges[param]['best']:.4f} "
+        uncertainty_text += f"[{param_ranges[param]['min']:.4f}, {param_ranges[param]['max']:.4f}]\n"
+    
+    ax_sld.text(0.02, 0.98, uncertainty_text,
+              transform=ax_sld.transAxes, ha='left', va='top',
+              fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
+    
+    # Add orientation note
+    ax_sld.text(0.98, 0.02, "SLD profile flipped: Si at 0, air at max depth",
+              transform=ax_sld.transAxes, ha='right', va='bottom',
+              fontsize=8, bbox=dict(facecolor='white', alpha=0.7))
+    
+    # Add title
+    param_str = ", ".join(scanned_params)
+    fig.suptitle(f"Best Fit with {uncertainty_percent}% GOF Uncertainty\nGlobal Scan: {param_str}", 
+                fontsize=14)
+    
+    # Adjust layout
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.93)  # Make room for suptitle
+    
+    # Save figure if requested
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved figure to {save_path}")
+    
+    return fig, axes
