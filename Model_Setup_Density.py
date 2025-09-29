@@ -1264,9 +1264,14 @@ def run_parameter_sweep(sweep_info, optimization_method='differential_evolution'
                        opt_workers=8, opt_popsize=20, burn_samples=0, 
                        production_samples=0, prod_steps=1, pool=16,
                        save_dir=None, save_intermediate=True, 
-                       save_combined=True, save_log_file=None):
+                       save_combined=True, save_log_file=None,
+                       individual_subdir="individual_results"):
     """
-    Run a parameter sweep for a reflectometry model.
+    Run a parameter sweep for a reflectometry model with structured directory layout.
+    
+    This version saves:
+    - Individual objective files in: save_dir/individual_subdir/
+    - Sweep summary and pickle file in: save_dir/
     
     Args:
         sweep_info: Dictionary from setup_parameter_sweep containing sweep parameters
@@ -1281,10 +1286,12 @@ def run_parameter_sweep(sweep_info, optimization_method='differential_evolution'
         save_intermediate: Whether to save intermediate results for each sweep value
         save_combined: Whether to save combined results at the end
         save_log_file: Filename to save the results log (None to skip saving)
+        individual_subdir: Name of subdirectory for individual results (default: "individual_results")
         
     Returns:
-        Updated sweep_info dictionary with results
+        Updated sweep_info dictionary with results, summary_df
     """
+    
     # Extract parameters from sweep_info
     param_name = sweep_info['param_name']
     sweep_values = sweep_info['sweep_values']
@@ -1347,63 +1354,58 @@ def run_parameter_sweep(sweep_info, optimization_method='differential_evolution'
         
         # Run optimization
         print(f"Starting optimization using {optimization_method}...")
-        if optimization_method == 'differential_evolution':
-            fitter.fit(optimization_method, workers=opt_workers, popsize=opt_popsize)
-        else:
-            fitter.fit(optimization_method)
-        
-        # Store optimization results
-        optimized_chi_squared = current_obj.chisqr()
-        print(f"Optimization complete. Chi-squared: {optimized_chi_squared:.4f}")
+        try:
+            if optimization_method == 'differential_evolution':
+                fitter.fit(optimization_method, workers=opt_workers, popsize=opt_popsize)
+            else:
+                fitter.fit(optimization_method)
+            
+            # Store optimization results
+            optimized_chi_squared = current_obj.chisqr()
+            print(f"Optimization complete. Chi-squared: {optimized_chi_squared:.4f}")
+            
+        except Exception as e:
+            print(f"Error in optimization: {str(e)}")
+            continue
         
         # Run MCMC if requested
         mcmc_samples = None
         mcmc_stats = None
         
         if burn_samples > 0 and production_samples > 0:
-            # Run burn-in MCMC samples
-            print(f"Running {burn_samples}k burn-in MCMC samples...")
-            fitter.sample(burn_samples, pool=pool)
-            print("Burn-in complete. Resetting chain...")
-            fitter.reset()
-            
-            # Run production MCMC samples
-            print(f"Running {production_samples}k production MCMC samples...")
-            mcmc_samples = fitter.sample(production_samples, prod_steps, pool=pool)
-            
-            # Calculate statistics from MCMC chain
             try:
-                print("Calculating parameter statistics from MCMC chain...")
-                mcmc_stats = {}
+                # Run burn-in MCMC samples
+                print(f"Running {burn_samples}k burn-in MCMC samples...")
+                fitter.sample(burn_samples * 1000, pool=pool)
+                print("Burn-in complete.")
                 
-                for param in current_obj.parameters.flattened():
-                    if param.vary:
-                        param_stats = {
-                            'name': param.name,
-                            'value': param.value,
-                            'stderr': param.stderr,
-                            'median': None,
-                            'mean': None,
-                            'std': None,
-                            'percentiles': {}
-                        }
-                        
-                        # Extract chain for this parameter
-                        chain_index = fitter.var_pars.index(param)
-                        if chain_index >= 0 and mcmc_samples is not None:
-                            # Calculate statistics
-                            chain_values = mcmc_samples[:, chain_index]
-                            param_stats['median'] = np.median(chain_values)
-                            param_stats['mean'] = np.mean(chain_values)
-                            param_stats['std'] = np.std(chain_values)
+                # Run production MCMC samples
+                print(f"Running {production_samples}k production MCMC samples...")
+                fitter.sample(production_samples * 1000, pool=pool, nthin=prod_steps)
+                print("Production sampling complete.")
+                
+                # Store MCMC samples
+                mcmc_samples = fitter.chain
+                
+                # Calculate MCMC statistics if samples exist
+                if mcmc_samples is not None and len(mcmc_samples) > 0:
+                    # Basic statistics for each parameter
+                    mcmc_stats = {}
+                    for j, param in enumerate(current_obj.parameters.flattened()):
+                        if param.vary:
+                            param_samples = mcmc_samples[:, j]
+                            mcmc_stats[param.name] = {
+                                'mean': np.mean(param_samples),
+                                'std': np.std(param_samples),
+                                'median': np.median(param_samples),
+                                'percentile_16': np.percentile(param_samples, 16),
+                                'percentile_84': np.percentile(param_samples, 84)
+                            }
                             
-                            # Calculate percentiles
-                            for percentile in [2.5, 16, 50, 84, 97.5]:
-                                param_stats['percentiles'][percentile] = np.percentile(chain_values, percentile)
-                        
-                        mcmc_stats[param.name] = param_stats
             except Exception as e:
-                print(f"Error calculating MCMC statistics: {str(e)}")
+                print(f"Error in MCMC sampling: {str(e)}")
+                mcmc_samples = None
+                mcmc_stats = None
         
         # Store results for this sweep value
         current_results = {
@@ -1427,13 +1429,14 @@ def run_parameter_sweep(sweep_info, optimization_method='differential_evolution'
         structure = getattr(log_obj.model, 'structure', None)
         
         # Update results_log with this sweep value
-        results_log, model_name = log_fitting_results_with_sweep(
-            log_obj, model_name, results_log, param_name, sweep_value
-        )
+        # Note: You may need to implement log_fitting_results_with_sweep function
+        # results_log, model_name = log_fitting_results_with_sweep(
+        #     log_obj, model_name, results_log, param_name, sweep_value
+        # )
         
-        # Save intermediate results if requested
+        # Save intermediate results if requested (now goes to subdirectory)
         if save_dir and save_intermediate:
-            save_sweep_results(current_results, save_dir)
+            save_sweep_results_structured(current_results, save_dir, individual_subdir=individual_subdir)
     
     # Restore original parameter value and vary status
     param.value = original_value
@@ -1446,54 +1449,60 @@ def run_parameter_sweep(sweep_info, optimization_method='differential_evolution'
     best_idx = np.argmin(sweep_info['goodness_of_fit'])
     best_value = sweep_info['parameter_values'][best_idx]
     best_gof = sweep_info['goodness_of_fit'][best_idx]
+    best_model = sweep_info['models'][best_idx]
     
-    print(f"\nBest fit at {param_name} = {best_value} with goodness of fit = {best_gof:.6g}")
+    print(f"\nBest fit at {param_name} = {best_value} with goodness of fit = {best_gof:.6f}")
     
-    # Add best_fit info to sweep_info
+    # Store best fit information
     sweep_info['best_fit'] = {
-        'index': best_idx,
         'value': best_value,
         'gof': best_gof,
-        'model_name': sweep_info['models'][best_idx]
+        'model_name': best_model,
+        'index': best_idx
     }
     
-    
-    # Save combined results if requested
+    # Save combined results if requested (stays in main directory)
     if save_dir and save_combined:
-        sweep_filename = os.path.join(save_dir, f"{base_model_name}_sweep_{param_name}.pkl")
+        # Save the complete sweep_info as a pickle file in the main directory
+        sweep_filename = os.path.join(save_dir, f"{base_model_name}_{param_name}_sweep_info.pkl")
         try:
             with open(sweep_filename, 'wb') as f:
                 pickle.dump(sweep_info, f)
-            print(f"Saved combined sweep results to {sweep_filename}")
+            print(f"Saved sweep info to {sweep_filename}")
         except Exception as e:
-            print(f"Error saving combined sweep results: {str(e)}")
-    
-    # Save the results log if a filename was provided
-    if save_log_file:
-        log_path = save_log_file
-        if save_dir:
-            log_path = os.path.join(save_dir, os.path.basename(save_log_file))
+            print(f"Error saving sweep info: {str(e)}")
         
+        # Create and save summary DataFrame in the main directory
+        summary_data = {
+            'Parameter Value': sweep_info['parameter_values'],
+            'Goodness of Fit': sweep_info['goodness_of_fit'],
+            'Model Name': sweep_info['models']
+        }
+        summary_df = pd.DataFrame(summary_data)
+        
+        summary_filename = os.path.join(save_dir, f"{base_model_name}_{param_name}_summary.csv")
         try:
-            # Save to CSV
+            summary_df.to_csv(summary_filename, index=False)
+            print(f"Saved summary to {summary_filename}")
+        except Exception as e:
+            print(f"Error saving summary: {str(e)}")
+    else:
+        # Create summary even if not saving
+        summary_data = {
+            'Parameter Value': sweep_info['parameter_values'],
+            'Goodness of Fit': sweep_info['goodness_of_fit'],
+            'Model Name': sweep_info['models']
+        }
+        summary_df = pd.DataFrame(summary_data)
+    
+    # Save log file if requested (stays in main directory)
+    if save_log_file and save_dir:
+        log_path = os.path.join(save_dir, save_log_file)
+        try:
             results_log.to_csv(log_path, index=False)
             print(f"Saved results log to {log_path}")
         except Exception as e:
-            print(f"Error saving results log: {str(e)}")
-    
-    # Print summary of sweep results
-    print("\n--- Parameter Sweep Summary ---")
-    print(f"Parameter: {param_name}")
-    print(f"Number of values: {len(sweep_values)}")
-    
-    # Create a summary DataFrame
-    summary_df = pd.DataFrame({
-        'Sweep Value': sweep_info['parameter_values'],
-        'Model Name': sweep_info['models'],
-        'Goodness of Fit': sweep_info['goodness_of_fit']
-    })
-    
-    
+            print(f"Error saving log: {str(e)}")
     
     return sweep_info, summary_df
 
@@ -1640,24 +1649,32 @@ def log_fitting_results_with_sweep(objective, model_name, results_df, swept_para
     return results_df, model_name
 
 
-def save_sweep_results(results, save_dir, prefix=None):
+def save_sweep_results(results, save_dir, prefix=None, individual_subdir="individual_results"):
     """
-    Save the results of a single point in a parameter sweep.
+    Save the results of a single point in a parameter sweep with structured directory layout.
     
     Args:
         results: Dictionary containing results for a single sweep point
-        save_dir: Directory to save results
+        save_dir: Main directory to save results
         prefix: Optional prefix for filenames
+        individual_subdir: Name of subdirectory for individual results (default: "individual_results")
     """
+    # Create main save directory if it doesn't exist
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
+    
+    # Create subdirectory for individual results
+    individual_dir = os.path.join(save_dir, individual_subdir)
+    if not os.path.exists(individual_dir):
+        os.makedirs(individual_dir)
+        print(f"Created subdirectory: {individual_dir}")
     
     model_name = results['model_name']
     if prefix:
         model_name = f"{prefix}_{model_name}"
     
-    # Save the objective
-    objective_filename = os.path.join(save_dir, f"{model_name}_objective.pkl")
+    # Save the objective in the subdirectory
+    objective_filename = os.path.join(individual_dir, f"{model_name}_objective.pkl")
     try:
         with open(objective_filename, 'wb') as f:
             pickle.dump(results['objective'], f)
@@ -1665,15 +1682,56 @@ def save_sweep_results(results, save_dir, prefix=None):
     except Exception as e:
         print(f"Error saving objective: {str(e)}")
     
-    # Save MCMC samples if they exist
+    # Save MCMC samples if they exist (also in subdirectory)
     if results['mcmc_samples'] is not None:
-        mcmc_filename = os.path.join(save_dir, f"{model_name}_mcmc_samples.npy")
+        mcmc_filename = os.path.join(individual_dir, f"{model_name}_mcmc_samples.npy")
         try:
             np.save(mcmc_filename, np.array(results['mcmc_samples'], dtype=float))
             print(f"Saved MCMC samples to {mcmc_filename}")
         except Exception as e:
             print(f"Error saving MCMC samples: {str(e)}")
 
+def save_sweep_results_structured(results, save_dir, prefix=None, individual_subdir="individual_results"):
+    """
+    Save the results of a single point in a parameter sweep with structured directory layout.
+    
+    Args:
+        results: Dictionary containing results for a single sweep point
+        save_dir: Main directory to save results
+        prefix: Optional prefix for filenames
+        individual_subdir: Name of subdirectory for individual results (default: "individual_results")
+    """
+    # Create main save directory if it doesn't exist
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    
+    # Create subdirectory for individual results
+    individual_dir = os.path.join(save_dir, individual_subdir)
+    if not os.path.exists(individual_dir):
+        os.makedirs(individual_dir)
+        print(f"Created subdirectory: {individual_dir}")
+    
+    model_name = results['model_name']
+    if prefix:
+        model_name = f"{prefix}_{model_name}"
+    
+    # Save the objective in the subdirectory
+    objective_filename = os.path.join(individual_dir, f"{model_name}_objective.pkl")
+    try:
+        with open(objective_filename, 'wb') as f:
+            pickle.dump(results['objective'], f)
+        print(f"Saved objective to {objective_filename}")
+    except Exception as e:
+        print(f"Error saving objective: {str(e)}")
+    
+    # Save MCMC samples if they exist (also in subdirectory)
+    if results['mcmc_samples'] is not None:
+        mcmc_filename = os.path.join(individual_dir, f"{model_name}_mcmc_samples.npy")
+        try:
+            np.save(mcmc_filename, np.array(results['mcmc_samples'], dtype=float))
+            print(f"Saved MCMC samples to {mcmc_filename}")
+        except Exception as e:
+            print(f"Error saving MCMC samples: {str(e)}")
 
 def plot_parameter_sweep(sweep_info, param_limits=None, log_y=True, 
                         normalize_gof=False, highlight_best=True,
@@ -2788,14 +2846,14 @@ def global_parameter_scan(objective, param_configs, n_repeats=1, optimization_me
             # Save intermediate results
             if save_dir:
                 results_df = pd.DataFrame(results)
-                results_df.to_csv(os.path.join(save_dir, "scan_results.csv"), index=False)
+                results_df.to_csv(os.path.join(save_dir, "global_scan_results.csv"), index=False)
     
     # Create final DataFrame
     results_df = pd.DataFrame(results)
     
     # Save final results
     if save_dir:
-        results_df.to_csv(os.path.join(save_dir, "scan_results.csv"), index=False)
+        results_df.to_csv(os.path.join(save_dir, "global_scan_results.csv"), index=False)
     
     return results_df
 
@@ -2936,3 +2994,449 @@ def load_parameter_sweep(pickle_filepath):
             print(f"\nBest fit at {param_name} = {best_value} with goodness of fit = {best_gof:.6g}")
     
     return sweep_info, summary_df
+
+
+def get_best_fit_with_uncertainty(sweep_info, uncertainty_percent=10):
+    """
+    Extract the best fit parameter value and uncertainty range from parameter sweep results.
+    
+    This function analyzes parameter sweep results to find the best fit value and calculates
+    the uncertainty range based on parameter values that are within a specified percentage 
+    of the best goodness of fit.
+    
+    Args:
+        sweep_info: Dictionary from run_parameter_sweep containing sweep results with keys:
+                   - 'param_name': Name of the swept parameter
+                   - 'parameter_values': List of parameter values tested
+                   - 'goodness_of_fit': List of goodness of fit values (lower is better)
+                   - 'best_fit': Dictionary containing best fit information
+        uncertainty_percent: Percent change in goodness of fit to use for uncertainty 
+                            calculation (default: 10)
+    
+    Returns:
+        Dictionary containing:
+        - 'param_name': Name of the parameter
+        - 'best_value': Best fit parameter value
+        - 'best_gof': Best goodness of fit value
+        - 'uncertainty_range': Tuple of (min_value, max_value) within uncertainty threshold
+        - 'uncertainty_width': Width of the uncertainty range (max - min)
+        - 'values_in_range': List of all parameter values within the uncertainty threshold
+        - 'gof_threshold': The goodness of fit threshold used for uncertainty calculation
+    
+    Raises:
+        ValueError: If no best fit is found in sweep_info or if sweep_info is invalid
+    """
+    import numpy as np
+    
+    # Validate input
+    if 'best_fit' not in sweep_info:
+        raise ValueError("No best fit found in sweep_info")
+    
+    required_keys = ['param_name', 'parameter_values', 'goodness_of_fit']
+    for key in required_keys:
+        if key not in sweep_info:
+            raise ValueError(f"Required key '{key}' not found in sweep_info")
+    
+    # Get the parameter name and best fit information
+    param_name = sweep_info['param_name']
+    parameter_values = sweep_info['parameter_values']
+    goodness_of_fit = sweep_info['goodness_of_fit']
+    
+    # Get best fit details
+    best_idx = sweep_info['best_fit']['index']
+    best_value = parameter_values[best_idx]
+    best_gof = goodness_of_fit[best_idx]
+    
+    # Calculate the threshold for uncertainty (worse fit by specified percentage)
+    gof_threshold = best_gof * (1 + uncertainty_percent/100)
+    
+    # Find parameter values within the threshold
+    values_within_threshold = []
+    
+    for i, (value, gof) in enumerate(zip(parameter_values, goodness_of_fit)):
+        if gof <= gof_threshold:
+            values_within_threshold.append(value)
+    
+    # Calculate uncertainty range
+    if values_within_threshold:
+        min_value = min(values_within_threshold)
+        max_value = max(values_within_threshold)
+        uncertainty_width = max_value - min_value
+    else:
+        # If no values within threshold (shouldn't happen if best fit exists)
+        min_value = best_value
+        max_value = best_value
+        uncertainty_width = 0.0
+        values_within_threshold = [best_value]
+    
+    # Compile results
+    results = {
+        'param_name': param_name,
+        'best_value': best_value,
+        'best_gof': best_gof,
+        'uncertainty_range': (min_value, max_value),
+        'uncertainty_width': uncertainty_width,
+        'values_in_range': values_within_threshold,
+        'gof_threshold': gof_threshold,
+        'uncertainty_percent': uncertainty_percent
+    }
+    
+    return results
+
+
+def print_best_fit_summary(sweep_results, uncertainty_percent=10):
+    """
+    Print a formatted summary of the best fit and uncertainty results.
+    
+    Args:
+        sweep_results: Dictionary returned from get_best_fit_with_uncertainty
+        uncertainty_percent: Uncertainty percentage used (for display purposes)
+    """
+    print(f"\n{'='*60}")
+    print(f"PARAMETER SWEEP RESULTS SUMMARY")
+    print(f"{'='*60}")
+    
+    print(f"Parameter: {sweep_results['param_name']}")
+    print(f"Best fit value: {sweep_results['best_value']:.6g}")
+    print(f"Best goodness of fit: {sweep_results['best_gof']:.6g}")
+    
+    print(f"\nUncertainty Analysis ({uncertainty_percent}% GOF threshold):")
+    print(f"GOF threshold: {sweep_results['gof_threshold']:.6g}")
+    print(f"Uncertainty range: [{sweep_results['uncertainty_range'][0]:.6g}, {sweep_results['uncertainty_range'][1]:.6g}]")
+    print(f"Uncertainty width: {sweep_results['uncertainty_width']:.6g}")
+    print(f"Number of values in range: {len(sweep_results['values_in_range'])}")
+    
+    # Calculate relative uncertainty if possible
+    if sweep_results['best_value'] != 0:
+        rel_uncertainty = sweep_results['uncertainty_width'] / abs(sweep_results['best_value']) * 100
+        print(f"Relative uncertainty: ±{rel_uncertainty/2:.2f}% of best value")
+    
+    print(f"{'='*60}\n")
+    
+    
+def update_single_objective(objective, structure=None, material=None, updates=None, 
+                                        plot=True, figsize=(12, 8), xlim=None, profile_shift=-20,
+                                        return_copy=True):
+    """
+    Update parameter values and bounds for a single objective with optional plotting.
+    
+    Args:
+        objective: Single refnx Objective object to update
+        structure: Structure object associated with the objective (needed for SLD plotting)
+        material (str): Material name (e.g., "SOC", "PS") - only needed if updates target specific material
+        updates (dict): Dictionary of parameter updates with the following possible keys:
+            - "thickness": new thickness value
+            - "roughness": new roughness value  
+            - "sld_real": new real SLD value
+            - "sld_imag": new imaginary SLD value
+            - "thickness_bounds": (lower, upper, vary) tuple for thickness bounds
+            - "roughness_bounds": (lower, upper, vary) tuple for roughness bounds
+            - "sld_real_bounds": (lower, upper, vary) tuple for real SLD bounds
+            - "sld_imag_bounds": (lower, upper, vary) tuple for imaginary SLD bounds
+            - "scale": new scale value
+            - "bkg": new background value
+            - "dq": new resolution value
+            - "scale_bounds": (lower, upper, vary) tuple for scale bounds
+            - "bkg_bounds": (lower, upper, vary) tuple for background bounds
+            - "dq_bounds": (lower, upper, vary) tuple for resolution bounds
+        plot (bool): Whether to create comparison plots (before/after if updating)
+        figsize (tuple): Figure size as (width, height)
+        xlim (tuple, optional): Custom x-axis limits for SLD profile as (min, max)
+        profile_shift (float): Shift to apply to SLD profile depth axis
+        return_copy (bool): If True, returns a copy of the objective; if False, modifies in place
+        
+    Returns:
+        Updated objective (copy if return_copy=True, otherwise modified original)
+        
+    Example:
+        updated_obj = update_single_objective_with_plotting(
+            objective=my_objective,
+            structure=my_structure,
+            material="SOC",
+            updates={
+                "sld_real": 5,
+                "sld_imag": 0.3,
+                "sld_real_bounds": (2, 7, True),    # Set bounds and vary
+                "sld_imag_bounds": (False,),         # Only turn off fitting, keep existing bounds
+                "thickness_bounds": (True,),         # Only turn on fitting, keep existing bounds
+            },
+            plot=True,
+            figsize=(12, 8)
+        )
+    """
+    
+    # Create a working copy if requested
+    if return_copy:
+        working_objective = copy.deepcopy(objective)
+        working_structure = copy.deepcopy(structure) if structure is not None else None
+    else:
+        working_objective = objective
+        working_structure = structure
+    
+    # Store original state for comparison if plotting
+    if plot:
+        original_chi2 = working_objective.chisqr()
+        if working_structure is not None:
+            # Get original SLD profiles
+            try:
+                from Plotting_Refl import profileflip
+                orig_Real_depth, orig_Real_SLD, orig_Imag_Depth, orig_Imag_SLD = profileflip(working_structure, depth_shift=0)
+                orig_Real_depth = orig_Real_depth + profile_shift
+                orig_Imag_Depth = orig_Imag_Depth + profile_shift
+                has_original_profile = True
+            except Exception as e:
+                print(f"Warning: Could not get original SLD profile: {e}")
+                has_original_profile = False
+        else:
+            has_original_profile = False
+    
+    # Apply updates if provided
+    updates_made = []
+    if updates:
+        for param in working_objective.parameters.flattened():
+            param_name = param.name.lower()
+            
+            # Check if this parameter belongs to the specified material (if material is specified)
+            if material and f"{material.lower()} - " not in param_name and param_name not in ['scale', 'bkg', 'dq']:
+                continue
+            
+            # Determine parameter type and update accordingly
+            param_updated = False
+            
+            # Handle model parameters (scale, bkg, dq)
+            if param.name == 'scale' and 'scale' in updates:
+                old_value = param.value
+                param.value = updates['scale']
+                updates_made.append(f"scale value: {old_value} -> {param.value}")
+                param_updated = True
+            elif param.name == 'scale' and 'scale_bounds' in updates:
+                bounds_update = updates['scale_bounds']
+                old_bounds = getattr(param, 'bounds', None)
+                old_vary = getattr(param, 'vary', None)
+                
+                # Handle different formats for bounds updates
+                if len(bounds_update) == 1:
+                    # Only vary flag provided: (True,) or (False,)
+                    vary = bounds_update[0]
+                    param.setp(vary=vary)
+                    updates_made.append(f"scale vary: {old_vary} -> {param.vary} (bounds unchanged)")
+                elif len(bounds_update) == 3:
+                    # Full bounds specification: (lower, upper, vary)
+                    lower, upper, vary = bounds_update
+                    param.setp(bounds=(lower, upper), vary=vary)
+                    updates_made.append(f"scale bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                param_updated = True
+                
+            elif param.name == 'bkg' and 'bkg' in updates:
+                old_value = param.value
+                param.value = updates['bkg']
+                updates_made.append(f"bkg value: {old_value} -> {param.value}")
+                param_updated = True
+            elif param.name == 'bkg' and 'bkg_bounds' in updates:
+                bounds_update = updates['bkg_bounds']
+                old_bounds = getattr(param, 'bounds', None)
+                old_vary = getattr(param, 'vary', None)
+                
+                # Handle different formats for bounds updates
+                if len(bounds_update) == 1:
+                    # Only vary flag provided: (True,) or (False,)
+                    vary = bounds_update[0]
+                    param.setp(vary=vary)
+                    updates_made.append(f"bkg vary: {old_vary} -> {param.vary} (bounds unchanged)")
+                elif len(bounds_update) == 3:
+                    # Full bounds specification: (lower, upper, vary)
+                    lower, upper, vary = bounds_update
+                    param.setp(bounds=(lower, upper), vary=vary)
+                    updates_made.append(f"bkg bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                param_updated = True
+                
+            elif param.name == 'dq' and 'dq' in updates:
+                old_value = param.value
+                param.value = updates['dq']
+                updates_made.append(f"dq value: {old_value} -> {param.value}")
+                param_updated = True
+            elif param.name == 'dq' and 'dq_bounds' in updates:
+                bounds_update = updates['dq_bounds']
+                old_bounds = getattr(param, 'bounds', None)
+                old_vary = getattr(param, 'vary', None)
+                
+                # Handle different formats for bounds updates
+                if len(bounds_update) == 1:
+                    # Only vary flag provided: (True,) or (False,)
+                    vary = bounds_update[0]
+                    param.setp(vary=vary)
+                    updates_made.append(f"dq vary: {old_vary} -> {param.vary} (bounds unchanged)")
+                elif len(bounds_update) == 3:
+                    # Full bounds specification: (lower, upper, vary)
+                    lower, upper, vary = bounds_update
+                    param.setp(bounds=(lower, upper), vary=vary)
+                    updates_made.append(f"dq bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                param_updated = True
+            
+            # Handle layer parameters
+            elif "thick" in param_name:
+                if "thickness" in updates:
+                    old_value = param.value
+                    param.value = updates["thickness"]
+                    updates_made.append(f"thickness value: {old_value} -> {param.value}")
+                    param_updated = True
+                    
+                if "thickness_bounds" in updates:
+                    bounds_update = updates["thickness_bounds"]
+                    old_bounds = getattr(param, 'bounds', None)
+                    old_vary = getattr(param, 'vary', None)
+                    
+                    # Handle different formats for bounds updates
+                    if len(bounds_update) == 1:
+                        # Only vary flag provided: (True,) or (False,)
+                        vary = bounds_update[0]
+                        param.setp(vary=vary)
+                        updates_made.append(f"thickness vary: {old_vary} -> {param.vary} (bounds unchanged)")
+                    elif len(bounds_update) == 3:
+                        # Full bounds specification: (lower, upper, vary)
+                        lower, upper, vary = bounds_update
+                        param.setp(bounds=(lower, upper), vary=vary)
+                        updates_made.append(f"thickness bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                    param_updated = True
+            
+            elif "rough" in param_name:
+                if "roughness" in updates:
+                    old_value = param.value
+                    param.value = updates["roughness"]
+                    updates_made.append(f"roughness value: {old_value} -> {param.value}")
+                    param_updated = True
+                    
+                if "roughness_bounds" in updates:
+                    bounds_update = updates["roughness_bounds"]
+                    old_bounds = getattr(param, 'bounds', None)
+                    old_vary = getattr(param, 'vary', None)
+                    
+                    # Handle different formats for bounds updates
+                    if len(bounds_update) == 1:
+                        # Only vary flag provided: (True,) or (False,)
+                        vary = bounds_update[0]
+                        param.setp(vary=vary)
+                        updates_made.append(f"roughness vary: {old_vary} -> {param.vary} (bounds unchanged)")
+                    elif len(bounds_update) == 3:
+                        # Full bounds specification: (lower, upper, vary)
+                        lower, upper, vary = bounds_update
+                        param.setp(bounds=(lower, upper), vary=vary)
+                        updates_made.append(f"roughness bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                    param_updated = True
+            
+            # Handle real SLD parameters
+            elif "sld" in param_name and "isld" not in param_name:
+                if "sld_real" in updates:
+                    old_value = param.value
+                    param.value = updates["sld_real"]
+                    updates_made.append(f"sld_real value: {old_value} -> {param.value}")
+                    param_updated = True
+                    
+                if "sld_real_bounds" in updates:
+                    bounds_update = updates["sld_real_bounds"]
+                    old_bounds = getattr(param, 'bounds', None)
+                    old_vary = getattr(param, 'vary', None)
+                    
+                    # Handle different formats for bounds updates
+                    if len(bounds_update) == 1:
+                        # Only vary flag provided: (True,) or (False,)
+                        vary = bounds_update[0]
+                        param.setp(vary=vary)
+                        updates_made.append(f"sld_real vary: {old_vary} -> {param.vary} (bounds unchanged)")
+                    elif len(bounds_update) == 3:
+                        # Full bounds specification: (lower, upper, vary)
+                        lower, upper, vary = bounds_update
+                        param.setp(bounds=(lower, upper), vary=vary)
+                        updates_made.append(f"sld_real bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                    param_updated = True
+            
+            # Handle imaginary SLD parameters
+            elif "isld" in param_name:
+                if "sld_imag" in updates:
+                    old_value = param.value
+                    param.value = updates["sld_imag"]
+                    updates_made.append(f"sld_imag value: {old_value} -> {param.value}")
+                    param_updated = True
+                    
+                if "sld_imag_bounds" in updates:
+                    bounds_update = updates["sld_imag_bounds"]
+                    old_bounds = getattr(param, 'bounds', None)
+                    old_vary = getattr(param, 'vary', None)
+                    
+                    # Handle different formats for bounds updates
+                    if len(bounds_update) == 1:
+                        # Only vary flag provided: (True,) or (False,)
+                        vary = bounds_update[0]
+                        param.setp(vary=vary)
+                        updates_made.append(f"sld_imag vary: {old_vary} -> {param.vary} (bounds unchanged)")
+                    elif len(bounds_update) == 3:
+                        # Full bounds specification: (lower, upper, vary)
+                        lower, upper, vary = bounds_update
+                        param.setp(bounds=(lower, upper), vary=vary)
+                        updates_made.append(f"sld_imag bounds: {old_bounds} -> {param.bounds}, vary: {old_vary} -> {param.vary}")
+                    param_updated = True
+            
+            if param_updated:
+                print(f"Updated parameter: {param.name}")
+    
+    # Print summary of updates
+    if updates_made:
+        print(f"\\nSuccessfully updated {len(updates_made)} parameter(s):")
+        for update in updates_made:
+            print(f"  - {update}")
+    elif updates:
+        material_info = f" for material '{material}'" if material else ""
+        print(f"No matching parameters found{material_info}")
+    
+
+
+    
+    return working_objective
+
+def load_global_scan_results(scan_dir, csv_filename="global_scan_results.csv"):
+    """
+    Load the results of a global parameter scan from CSV file.
+    
+    Args:
+        scan_dir: Directory where the scan results were saved
+        csv_filename: Name of the CSV file (default: "global_scan_results.csv")
+        
+    Returns:
+        DataFrame with all scan results
+    """
+    csv_path = os.path.join(scan_dir, csv_filename)
+    
+    try:
+        scan_results = pd.read_csv(csv_path)
+        print(f"Successfully loaded global scan results from {csv_path}")
+        print(f"Total number of fits: {len(scan_results)}")
+        
+        # Identify scanned parameters (columns without "_value" or "_error" suffix)
+        scanned_params = []
+        for col in scan_results.columns:
+            if col not in ['model_name', 'goodness_of_fit', 'repeat'] and \
+               not col.endswith('_value') and not col.endswith('_error'):
+                scanned_params.append(col)
+        
+        if scanned_params:
+            print(f"Scanned parameters: {', '.join(scanned_params)}")
+            for param in scanned_params:
+                unique_values = scan_results[param].unique()
+                print(f"  {param}: {len(unique_values)} unique values")
+        
+        # Print best result
+        best_idx = scan_results['goodness_of_fit'].idxmin()
+        best_result = scan_results.loc[best_idx]
+        print(f"\nBest fit (χ² = {best_result['goodness_of_fit']:.4f}):")
+        for param in scanned_params:
+            print(f"  {param}: {best_result[param]}")
+        
+        return scan_results
+        
+    except FileNotFoundError:
+        print(f"Error: Could not find {csv_path}")
+        print(f"Make sure the scan_dir path is correct and the file exists.")
+        return None
+    except Exception as e:
+        print(f"Error loading scan results: {str(e)}")
+        return None
