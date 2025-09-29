@@ -281,7 +281,7 @@ def generate_layer_params_with_flexible_bounds(energy_materials, base_layer_para
 
 def generate_batch_models(data_dict, energy_list, material_sld_arrays, constant_materials,
                          base_layer_params, layer_order, sld_offset_bounds=None, 
-                         sample_name="Sample", scale =1, scale_bounds=(0.1, 10), bkg_bounds=(0.01, 10),
+                         sample_name="Sample", scale =1, bkg = None, scale_bounds=(0.1, 10), bkg_bounds=(0.01, 10),
                          dq_bounds=(1.0, 2.0), vary_scale=True, vary_bkg=True, vary_dq=False, 
                          dq=1.6, verbose=True):
     """
@@ -297,6 +297,8 @@ def generate_batch_models(data_dict, energy_list, material_sld_arrays, constant_
         layer_order (list): Order of layers from top to bottom
         sld_offset_bounds (dict, optional): Offset bounds for materials without explicit bounds
         sample_name (str): Name prefix for the sample
+        scale = float: Initial scale value
+        bkg = float or None: Initial background value (None auto-sets to min data value)
         scale_bounds (tuple): Bounds for scale parameter (lower, upper)
         bkg_bounds (tuple): Bounds for background parameter (lower, upper)
         dq_bounds (tuple): Bounds for resolution parameter (lower, upper)
@@ -369,7 +371,7 @@ def generate_batch_models(data_dict, energy_list, material_sld_arrays, constant_
                 data=data_dict[energy],
                 model_name=model_name,
                 scale=scale,
-                bkg=None,  # Auto-set to minimum value in data
+                bkg=bkg,  # Default to None will auto-set to minimum value in data
                 dq=dq,
                 vary_scale=vary_scale,
                 vary_bkg=vary_bkg,
