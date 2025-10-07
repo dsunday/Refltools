@@ -307,7 +307,8 @@ def print_best_fit_summary(sweep_results, uncertainty_percent=10):
 # -------------------------------
 
 def global_parameter_scan(objective, param_configs, n_repeats=1, optimization_method='differential_evolution',
-                         opt_workers=8, opt_popsize=20, save_dir=None):
+                         opt_workers=8, opt_popsize=20, save_dir=None,
+                         save_individual=True, individual_subdir="individual_results"):
     """
     Perform a comprehensive scan by testing all combinations of parameter values.
     
@@ -337,6 +338,10 @@ def global_parameter_scan(objective, param_configs, n_repeats=1, optimization_me
     if save_dir and not os.path.exists(save_dir):
         os.makedirs(save_dir)
         print(f"Created directory: {save_dir}")
+    # Create individual results subdirectory if requested
+    if save_dir and save_individual:
+        indiv_dir = os.path.join(save_dir, individual_subdir)
+        os.makedirs(indiv_dir, exist_ok=True)
     
     # Initialize results DataFrame
     results = []
@@ -402,8 +407,8 @@ def global_parameter_scan(objective, param_configs, n_repeats=1, optimization_me
             print(f"Optimization complete. Chi-squared: {gof:.4f}")
             
             # Save objective if requested
-            if save_dir:
-                objective_filename = os.path.join(save_dir, f"{current_model_name}_objective.pkl")
+            if save_dir and save_individual:
+                objective_filename = os.path.join(indiv_dir, f"{current_model_name}_objective.pkl")
                 try:
                     with open(objective_filename, 'wb') as f:
                         pickle.dump(current_obj, f)
