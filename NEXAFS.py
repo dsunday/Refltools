@@ -372,325 +372,9 @@ def gaussian(x, height, center, width):
     sigma = width / (2 * np.sqrt(2 * np.log(2)))  # Convert FWHM to sigma
     return height * np.exp(-0.5 * ((x - center) / sigma) ** 2)
 
-def parse_peak_params(peak_params: Dict) -> Tuple[Dict, Dict]:
-    """
-    Parse the peak parameters dictionary to separate values from bounds/fit flags.
-    
-    Parameters:
-    peak_params : dict
-        Dictionary containing peak parameters in the format:
-        {"peak_1_width": 10, "peak_1_width_bounds": (5,15,True), ...}
-    
-    Returns:
-    tuple
-        (values_dict, bounds_dict) where values_dict contains the parameter values
-        and bounds_dict contains bounds and fit flags
-    """
-    values = {}
-    bounds = {}
-    
-    for key, value in peak_params.items():
-        if key.endswith('_bounds'):
-            # This is a bounds specification
-            param_name = key[:-7]  # Remove '_bounds' suffix
-            bounds[param_name] = value
-        else:
-            # This is a parameter value
-            values[key] = value
-    
-    return values, bounds
 
-def get_peak_names(peak_params: Dict) -> list:
-    """
-    Extract unique peak names from the parameter dictionary.
-    
-    Parameters:
-    peak_params : dict
-        Dictionary containing peak parameters
-    
-    Returns:
-    list
-        List of peak names (e.g., ['peak_1', 'peak_2', ...])
-    """
-    peak_names = set()
-    for key in peak_params.keys():
-        if not key.endswith('_bounds'):
-            # Extract peak name (everything before the last underscore)
-            parts = key.split('_')
-            if len(parts) >= 3:  # peak_X_parameter format
-                peak_name = '_'.join(parts[:-1])
-                peak_names.add(peak_name)
-    
-    return sorted(list(peak_names))
 
-def validate_peak_params(peak_params: Dict) -> bool:
-    """
-    Validate that all required parameters are present for each peak.
-    
-    Parameters:
-    peak_params : dict
-        Dictionary containing peak parameters
-    
-    Returns:
-    bool
-        True if valid, raises ValueError if invalid
-    """
-    peak_names = get_peak_names(peak_params)
-    required_params = ['width', 'height', 'energy']
-    
-    for peak_name in peak_names:
-        for param in required_params:
-            param_key = f"{peak_name}_{param}"
-            if param_key not in peak_params:
-                raise ValueError(f"Missing required parameter: {param_key}")
-    
-    return True
-
-def simulate_nexafs_spectrum(x: np.ndarray, 
-                           peak_params: Dict,
-                           edge_params: Optional[Dict] = None,
-                           baseline: float = 0.0,
-                           experimental_intensity: Optional[np.ndarray] = None,
-                           plot: bool = False,
-                           plot_kwargs: Optional[Dict] = None) -> Union[Tuple[np.ndarray, np.ndarray], plt.Figure]:
-    """
-    Simulate a NEXAFS spectrum with Gaussian peaks and optional step edge.
-    Automatically uses high-density energy axis if input has sparse spacing.
-    
-    Parameters:
-    x : numpy array
-        Energy values (experimental energy axis)
-    peak_params : dict
-        Peak parameters dictionary
-    edge_params : dict, optional
-        Edge parameters dictionary
-    baseline : float
-        Baseline value
-    experimental_intensity : numpy array, optional
-        Experimental intensity data for plotting comparison
-    plot : bool
-        If True, automatically create plot and return figure instead of data
-    plot_kwargs : dict, optional
-        Additional keyword arguments for plotting function
-        
-    Returns:
-    tuple or matplotlib.figure.Figure
-        If plot=False: (energy_sim, spectrum_sim) tuple
-        If plot=True: matplotlib Figure object
-    """
-    # Check energy spacing
-    energy_spacing = np.median(np.diff(x))
-    
-    if energy_spacing > 0.1:
-        # Create high-density energy axis with 0.1 eV steps
-        energy_sim = np.arange(x.min(), x.max() + 0.1, 0.1)
-        print(f"Using high-density energy axis: {energy_spacing:.3f} eV -> 0.1 eV spacing")
-        print(f"Points: {len(x)} -> {len(energy_sim)}")
-    else:
-        # Use original energy axis
-        energy_sim = x.copy()
-    
-    # Initialize spectrum with baseline
-    spectrum = np.full_like(energy_sim, baseline, dtype=float)
-    
-    # Add step edge if provided
-    if edge_params is not None:
-        edge_contribution = edge_bl_func(energy_sim, 
-                                       edge_params['location'],
-                                       edge_params['height'], 
-                                       edge_params['width'],
-                                       edge_params['decay'])
-        spectrum += edge_contribution
-    
-    # Add Gaussian peaks
-    peak_names = get_peak_names(peak_params)
-    for peak_name in peak_names:
-        width = peak_params[f"{peak_name}_width"]
-        height = peak_params[f"{peak_name}_height"]
-        energy = peak_params[f"{peak_name}_energy"]
-        
-        # Add Gaussian peak to spectrum
-        peak_contribution = gaussian(energy_sim, height, energy, width)
-        spectrum += peak_contribution
-    
-    # If plotting requested, create plot
-    if plot:
-        # Determine what intensity data to use for plotting
-        if experimental_intensity is not None:
-            # Use original experimental data without any interpolation
-            intensity_for_plot = experimental_intensity
-            energy_for_plot = x  # Original experimental energy axis
-        else:
-            # For pure simulation, interpolate simulated spectrum back to original energy axis
-            intensity_for_plot = np.interp(x, energy_sim, spectrum)
-            energy_for_plot = x
-        
-        # Set up plotting arguments
-        if plot_kwargs is None:
-            plot_kwargs = {}
-        
-        # Set default title if not provided
-        if 'title' not in plot_kwargs:
-            if experimental_intensity is not None:
-                plot_kwargs['title'] = "NEXAFS Spectrum with Initial Parameters"
-            else:
-                plot_kwargs['title'] = "Simulated NEXAFS Spectrum"
-        
-        # Call plotting function with original experimental data
-        fig = plot_simulated_nexafs_spectrum(
-            energy_for_plot, intensity_for_plot, peak_params, edge_params, baseline,
-            use_experimental_data=True, **plot_kwargs
-        )
-        
-        return fig
-    
-    else:
-        # Return simulation data
-        return energy_sim, spectrum
-
-def get_fit_parameters(peak_params: Dict, edge_params: Optional[Dict] = None) -> Dict:
-    """
-    Extract parameters that should be fitted (where bounds indicate fit=True).
-    
-    Parameters:
-    peak_params : dict
-        Dictionary containing peak parameters
-    edge_params : dict, optional
-        Dictionary containing edge parameters with bounds
-    
-    Returns:
-    dict
-        Dictionary of parameters to fit with their current values and bounds
-    """
-    values, bounds = parse_peak_params(peak_params)
-    fit_params = {}
-    
-    # Check peak parameters
-    for param_name, bound_info in bounds.items():
-        if len(bound_info) >= 3 and bound_info[2]:  # Third element is fit flag
-            if param_name in values:
-                fit_params[param_name] = {
-                    'value': values[param_name],
-                    'bounds': (bound_info[0], bound_info[1]),
-                    'fit': True
-                }
-    
-    # Check edge parameters if provided
-    if edge_params is not None:
-        edge_values, edge_bounds = parse_edge_params(edge_params)
-        for param_name, bound_info in edge_bounds.items():
-            if len(bound_info) >= 3 and bound_info[2]:  # Third element is fit flag
-                if param_name in edge_values:
-                    fit_params[f"edge_{param_name}"] = {
-                        'value': edge_values[param_name],
-                        'bounds': (bound_info[0], bound_info[1]),
-                        'fit': True
-                    }
-    
-    return fit_params
-
-def parse_edge_params(edge_params: Dict) -> Tuple[Dict, Dict]:
-    """
-    Parse edge parameters dictionary to separate values from bounds/fit flags.
-    
-    Parameters:
-    edge_params : dict
-        Dictionary containing edge parameters and bounds
-    
-    Returns:
-    tuple
-        (values_dict, bounds_dict)
-    """
-    values = {}
-    bounds = {}
-    
-    for key, value in edge_params.items():
-        if key.endswith('_bounds'):
-            # This is a bounds specification
-            param_name = key[:-7]  # Remove '_bounds' suffix
-            bounds[param_name] = value
-        else:
-            # This is a parameter value
-            values[key] = value
-    
-    return values, bounds
-
-def create_fitting_function(peak_params: Dict, edge_params: Optional[Dict] = None, 
-                          baseline: float = 0.0):
-    """
-    Create a fitting function for scipy.optimize with the current parameter structure.
-    This function uses the experimental energy axis exactly as provided.
-    
-    Parameters:
-    peak_params : dict
-        Dictionary containing all peak parameters
-    edge_params : dict, optional
-        Dictionary containing all edge parameters
-    baseline : float
-        Baseline value
-    
-    Returns:
-    function
-        Fitting function that takes (x, *fit_params) and returns spectrum
-    """
-    # Get all parameter dictionaries
-    peak_values, peak_bounds = parse_peak_params(peak_params)
-    edge_values = {}
-    edge_bounds = {}
-    
-    if edge_params is not None:
-        edge_values, edge_bounds = parse_edge_params(edge_params)
-    
-    # Get list of parameters to fit
-    fit_param_names = []
-    
-    # Peak parameters to fit
-    for param_name, bound_info in peak_bounds.items():
-        if len(bound_info) >= 3 and bound_info[2]:  # fit flag is True
-            fit_param_names.append(param_name)
-    
-    # Edge parameters to fit
-    for param_name, bound_info in edge_bounds.items():
-        if len(bound_info) >= 3 and bound_info[2]:  # fit flag is True
-            fit_param_names.append(f"edge_{param_name}")
-    
-    def fitting_function(x, *fit_values):
-        """
-        Function that scipy.optimize will call during fitting.
-        Uses experimental energy axis exactly as provided.
-        
-        Parameters:
-        x : array
-            Energy values (experimental axis)
-        *fit_values : tuple
-            Values for the parameters being fitted
-        
-        Returns:
-        array
-            Calculated spectrum at experimental energy points
-        """
-        # Create copies of parameter dictionaries
-        current_peak_params = peak_params.copy()
-        current_edge_params = edge_params.copy() if edge_params is not None else None
-        
-        # Update with fitted values
-        for i, param_name in enumerate(fit_param_names):
-            if param_name.startswith('edge_'):
-                # This is an edge parameter
-                edge_param = param_name[5:]  # Remove 'edge_' prefix
-                if current_edge_params is not None:
-                    current_edge_params[edge_param] = fit_values[i]
-            else:
-                # This is a peak parameter
-                current_peak_params[param_name] = fit_values[i]
-        
-        # Calculate spectrum using experimental energy axis (no high-density modification)
-        return simulate_nexafs_spectrum_for_fitting(x, current_peak_params, 
-                                                  current_edge_params, baseline)
-    
-    return fitting_function, fit_param_names
-
-def load_spectrum_data(data: Union[str, np.ndarray, pd.DataFrame]) -> Tuple[np.ndarray, np.ndarray]:
+def load_spectrum_data(data: Union[str, np.ndarray, pd.DataFrame]) -> np.ndarray:
     """
     Load spectrum data from various formats.
     
@@ -701,8 +385,8 @@ def load_spectrum_data(data: Union[str, np.ndarray, pd.DataFrame]) -> Tuple[np.n
         - pandas DataFrame: DataFrame with energy and intensity columns
     
     Returns:
-    tuple
-        (energy_array, intensity_array)
+    numpy.ndarray
+        Array with shape (n_points, 2) containing [energy, intensity]
     """
     if isinstance(data, str):
         # Try to load from file
@@ -738,818 +422,156 @@ def load_spectrum_data(data: Union[str, np.ndarray, pd.DataFrame]) -> Tuple[np.n
     else:
         raise ValueError("Data must be filepath, numpy array, or pandas DataFrame")
     
-    return energy, intensity
+    return np.column_stack((energy, intensity))
 
-def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
-                       peak_params: Dict,
-                       edge_params: Optional[Dict] = None,
-                       baseline: float = 0.0,
-                       method: str = 'lm',
-                       max_iterations: int = 1000,
-                       tolerance: float = 1e-8,
-                       algorithm: str = 'curve_fit',
-                       global_opt_params: Optional[Dict] = None) -> Dict:
+def plot_spectra(spectra: Union[Tuple[np.ndarray, np.ndarray], List[Tuple[np.ndarray, np.ndarray]]],
+                 labels: Optional[List[str]] = None,
+                 energy_min: Optional[float] = None,
+                 energy_max: Optional[float] = None,
+                 stacked: bool = False,
+                 figsize: Optional[Tuple[float, float]] = None,
+                 title: Optional[str] = None,
+                 xlabel: str = 'Energy (eV)',
+                 ylabel: str = 'Intensity (a.u.)',
+                 save_path: Optional[str] = None,
+                 dpi: int = 300,
+                 show: bool = True) -> plt.Figure:
     """
-    Fit NEXAFS spectrum parameters to experimental data with multiple optimization algorithms.
-    Fitting always uses experimental energy density, not high-density simulation axis.
+    Plot one or more NEXAFS spectra with customizable energy range and layout.
     
     Parameters:
-    data : str, numpy array, or pandas DataFrame
-        Experimental data with columns [energy, intensity]
-    peak_params : dict
-        Dictionary containing peak parameters with bounds and fit flags
-    edge_params : dict, optional
-        Dictionary containing edge parameters with bounds and fit flags
-    baseline : float
-        Baseline value
-    method : str
-        Fitting method for curve_fit ('lm', 'trf', 'dogbox')
-    max_iterations : int
-        Maximum number of fitting iterations
-    tolerance : float
-        Fitting tolerance
-    algorithm : str
-        Optimization algorithm to use:
-        - 'curve_fit': scipy.optimize.curve_fit (Levenberg-Marquardt or Trust Region)
-        - 'least_squares': scipy.optimize.least_squares (more robust)
-        - 'minimize': scipy.optimize.minimize (general optimization)
-        - 'differential_evolution': Global optimization using differential evolution
-        - 'dual_annealing': Global optimization using dual annealing
-    global_opt_params : dict, optional
-        Additional parameters for global optimization algorithms
-    
-    Returns:
-    dict
-        Dictionary containing fitting results
-    """
-    
-    # Load experimental data
-    energy_exp, intensity_exp = load_spectrum_data(data)
-    
-    print(f"Experimental data: {len(energy_exp)} points, energy spacing: {np.median(np.diff(energy_exp)):.3f} eV")
-    
-    # Create fitting function - this will use experimental energy axis for fitting
-    fitting_func, fit_param_names = create_fitting_function(peak_params, edge_params, baseline)
-    
-    # Get initial values and bounds for fitting parameters
-    fit_params_info = get_fit_parameters(peak_params, edge_params)
-    
-    if len(fit_params_info) == 0:
-        raise ValueError("No parameters marked for fitting (set fit flag to True)")
-    
-    # Prepare initial values and bounds
-    initial_values = []
-    lower_bounds = []
-    upper_bounds = []
-    
-    for param_name in fit_param_names:
-        if param_name in fit_params_info:
-            initial_values.append(fit_params_info[param_name]['value'])
-            bounds = fit_params_info[param_name]['bounds']
-            lower_bounds.append(bounds[0])
-            upper_bounds.append(bounds[1])
-        else:
-            raise ValueError(f"Parameter {param_name} not found in fit parameters")
-    
-    initial_values = np.array(initial_values)
-    
-    # Set default global optimization parameters
-    if global_opt_params is None:
-        global_opt_params = {}
-    
-    try:
-        if algorithm == 'curve_fit':
-            bounds = (lower_bounds, upper_bounds)
-            
-            popt, pcov = curve_fit(
-                fitting_func, 
-                energy_exp, 
-                intensity_exp,
-                p0=initial_values,
-                bounds=bounds,
-                method=method,
-                maxfev=max_iterations,
-                gtol=tolerance,
-                ftol=tolerance,
-                xtol=tolerance
-            )
-            
-            # Calculate fitted spectrum using experimental energy axis
-            fitted_spectrum = fitting_func(energy_exp, *popt)
-            fit_success = True
-            
-        elif algorithm == 'differential_evolution':
-            def objective_func(params):
-                try:
-                    predicted = fitting_func(energy_exp, *params)
-                    return np.sum((intensity_exp - predicted)**2)
-                except:
-                    return np.inf
-            
-            bounds = list(zip(lower_bounds, upper_bounds))
-            
-            de_params = {
-                'popsize': 15,
-                'maxiter': max_iterations,
-                'tol': tolerance,
-                'seed': None,
-                'workers': 1
-            }
-            de_params.update(global_opt_params)
-            
-            result = differential_evolution(
-                objective_func,
-                bounds,
-                **de_params
-            )
-            
-            popt = result.x
-            pcov = None
-            fitted_spectrum = fitting_func(energy_exp, *popt)
-            fit_success = result.success
-            
-        # ... other algorithms would go here
-        
-        else:
-            raise ValueError(f"Algorithm {algorithm} not implemented in this version")
-        
-        # Calculate residuals and statistics
-        residuals = intensity_exp - fitted_spectrum
-        ss_res = np.sum(residuals**2)
-        ss_tot = np.sum((intensity_exp - np.mean(intensity_exp))**2)
-        r_squared = 1 - (ss_res / ss_tot)
-        rmse = np.sqrt(np.mean(residuals**2))
-        
-        # Update parameter dictionaries with fitted values
-        fitted_peak_params = peak_params.copy()
-        fitted_edge_params = edge_params.copy() if edge_params is not None else None
-        
-        for i, param_name in enumerate(fit_param_names):
-            if param_name.startswith('edge_'):
-                edge_param = param_name[5:]
-                if fitted_edge_params is not None:
-                    fitted_edge_params[edge_param] = popt[i]
-            else:
-                fitted_peak_params[param_name] = popt[i]
-        
-        # Calculate parameter uncertainties
-        param_uncertainties = {}
-        if pcov is not None:
-            param_errors = np.sqrt(np.diag(pcov))
-            for i, param_name in enumerate(fit_param_names):
-                param_uncertainties[param_name] = param_errors[i]
-        else:
-            for param_name in fit_param_names:
-                param_uncertainties[param_name] = 0.0
-        
-        # Prepare results dictionary
-        fit_result = {
-            'success': fit_success,
-            'algorithm': algorithm,
-            'fitted_values': dict(zip(fit_param_names, popt)),
-            'parameter_uncertainties': param_uncertainties,
-            'covariance_matrix': pcov,
-            'r_squared': r_squared,
-            'rmse': rmse,
-            'residual_sum_squares': ss_res,
-            'degrees_of_freedom': len(energy_exp) - len(popt)
-        }
-        
-        results = {
-            'fitted_peak_params': fitted_peak_params,
-            'fitted_edge_params': fitted_edge_params,
-            'fit_result': fit_result,
-            'fitted_spectrum': fitted_spectrum,
-            'residuals': residuals,
-            'r_squared': r_squared,
-            'rmse': rmse,
-            'experimental_energy': energy_exp,
-            'experimental_intensity': intensity_exp
-        }
-        
-        print(f"Fitting completed successfully using experimental energy axis ({len(energy_exp)} points)")
-        return results
-        
-    except Exception as e:
-        print(f"Fitting failed: {e}")
-        results = {
-            'fitted_peak_params': peak_params,
-            'fitted_edge_params': edge_params,
-            'fit_result': {
-                'success': False,
-                'algorithm': algorithm,
-                'error_message': str(e),
-                'fitted_values': {},
-                'parameter_uncertainties': {},
-                'r_squared': 0,
-                'rmse': np.inf
-            },
-            'fitted_spectrum': None,
-            'residuals': None,
-            'r_squared': 0,
-            'rmse': np.inf,
-            'experimental_energy': energy_exp,
-            'experimental_intensity': intensity_exp
-        }
-        return results
-
-def estimate_parameter_uncertainties(fitting_func, energy_exp, intensity_exp, 
-                                   popt, param_names, delta_frac=0.01):
-    """
-    Estimate parameter uncertainties using finite differences for algorithms
-    that don't provide covariance matrices.
-    
-    Parameters:
-    fitting_func : function
-        The fitting function
-    energy_exp : array
-        Experimental energy values
-    intensity_exp : array  
-        Experimental intensity values
-    popt : array
-        Optimized parameter values
-    param_names : list
-        List of parameter names
-    delta_frac : float
-        Fractional change for finite difference calculation
-    
-    Returns:
-    dict
-        Dictionary of parameter uncertainties
-    """
-    uncertainties = {}
-    
-    # Calculate baseline residual
-    fitted_spectrum = fitting_func(energy_exp, *popt)
-    base_residual = np.sum((intensity_exp - fitted_spectrum)**2)
-    
-    for i, param_name in enumerate(param_names):
-        # Calculate finite difference
-        delta = abs(popt[i] * delta_frac) if popt[i] != 0 else delta_frac
-        
-        # Perturb parameter up
-        popt_up = popt.copy()
-        popt_up[i] += delta
-        
-        try:
-            fitted_up = fitting_func(energy_exp, *popt_up)
-            residual_up = np.sum((intensity_exp - fitted_up)**2)
-            
-            # Estimate uncertainty from change in residual
-            # This is a rough approximation
-            sensitivity = abs(residual_up - base_residual) / delta
-            if sensitivity > 0:
-                uncertainties[param_name] = np.sqrt(2 * base_residual / len(energy_exp)) / np.sqrt(sensitivity)
-            else:
-                uncertainties[param_name] = 0.0
-                
-        except:
-            uncertainties[param_name] = 0.0
-    
-    return uncertainties
-
-
-def plot_fit_results(results: Dict,
-                    initial_peak_params: Optional[Dict] = None,
-                    initial_edge_params: Optional[Dict] = None,
-                    baseline: float = 0.0,
-                    figsize: Tuple[float, float] = (12, 8),
-                    peak_alpha: float = 0.3,
-                    peak_colors: Optional[List[str]] = None,
-                    save_path: Optional[str] = None,
-                    dpi: int = 300) -> plt.Figure:
-    """
-    Plot NEXAFS fitting results with residuals and statistics.
-    
-    Parameters:
-    results : dict
-        Results dictionary from fit_nexafs_spectrum
-    initial_peak_params : dict, optional
-        Initial peak parameters for comparison
-    initial_edge_params : dict, optional  
-        Initial edge parameters for comparison
-    baseline : float
-        Baseline value
-    figsize : tuple
-        Figure size (width, height)
-    peak_alpha : float
-        Transparency for peak fill areas (0-1)
-    peak_colors : list, optional
-        List of colors for peaks
+    -----------
+    spectra : tuple or list of tuples
+        Single spectrum (energy, intensity) or list of such tuples.
+        Each tuple should contain (energy_array, intensity_array)
+    labels : list of str, optional
+        Labels for each spectrum. If None, auto-generates "Spectrum 1", "Spectrum 2", etc.
+    energy_min : float, optional
+        Minimum energy to display. If None, uses minimum across all spectra.
+    energy_max : float, optional
+        Maximum energy to display. If None, uses maximum across all spectra.
+    stacked : bool, default False
+        If True, creates vertical subplots for each spectrum.
+        If False, overlays all spectra on a single plot.
+    figsize : tuple, optional
+        Figure size (width, height). If None, uses (12, 8) for overlaid or (12, 4*n) for stacked.
+    title : str, optional
+        Plot title. If None, no title is shown.
+    xlabel : str, default 'Energy (eV)'
+        X-axis label
+    ylabel : str, default 'Intensity (a.u.)'
+        Y-axis label
     save_path : str, optional
-        Path to save the figure
-    dpi : int
+        Path to save the figure. If None, figure is not saved.
+    dpi : int, default 300
         Resolution for saved figure
+    show : bool, default True
+        Whether to display the figure. Set to False to prevent duplicate displays in Jupyter notebooks.
         
     Returns:
+    --------
     matplotlib.figure.Figure
         The created figure object
+        
+    Examples:
+    ---------
+    >>> # Single spectrum
+    >>> plot_spectra(Peptoid1, energy_min=280, energy_max=320)
+    
+    >>> # Multiple spectra overlaid
+    >>> plot_spectra([Peptoid1, Peptoid2, Peptoid3], labels=['P1', 'P2', 'P3'])
+    
+    >>> # Multiple spectra stacked
+    >>> plot_spectra([Peptoid1, Peptoid2], stacked=True)
     """
     
-    # Extract data from results
-    energy_exp = results['experimental_energy']
-    intensity_exp = results['experimental_intensity']
-    fitted_spectrum = results['fitted_spectrum']
-    residuals = results['residuals']
-    fitted_peak_params = results.get('fitted_peak_params')
-    fitted_edge_params = results.get('fitted_edge_params')
+    # Normalize input to list of tuples
+    if isinstance(spectra, tuple):
+        spectra_list = [spectra]
+    else:
+        spectra_list = spectra
     
-    # Create figure with residuals subplot
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, 
-                                  gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.1})
+    n_spectra = len(spectra_list)
     
-    # Get peak names and set up colors
-    peak_names = get_peak_names(fitted_peak_params)
-    n_peaks = len(peak_names)
+    # Generate default labels if not provided
+    if labels is None:
+        labels = [f'Spectrum {i+1}' for i in range(n_spectra)]
+    elif len(labels) != n_spectra:
+        raise ValueError(f"Number of labels ({len(labels)}) must match number of spectra ({n_spectra})")
     
-    if peak_colors is None:
-        if n_peaks <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, max(n_peaks, 3)))
+    # Determine energy range
+    all_energies = np.concatenate([spec[0] for spec in spectra_list])
+    if energy_min is None:
+        energy_min = np.min(all_energies)
+    if energy_max is None:
+        energy_max = np.max(all_energies)
+    
+    # Filter data to energy range
+    filtered_spectra = []
+    for energy, intensity in spectra_list:
+        mask = (energy >= energy_min) & (energy <= energy_max)
+        filtered_spectra.append((energy[mask], intensity[mask]))
+    
+    # Determine figure size
+    if figsize is None:
+        if stacked:
+            figsize = (12, 4 * n_spectra)
         else:
-            colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
-        peak_colors = [mcolors.to_hex(color) for color in colors]
+            figsize = (12, 8)
     
-    # Plot experimental data
-    ax1.plot(energy_exp, intensity_exp, 'ko', markersize=3, alpha=0.7, 
-             label='Experimental Data', zorder=1)
+    # Create figure and axes
+    if stacked:
+        fig, axes = plt.subplots(n_spectra, 1, figsize=figsize, sharex=True)
+        if n_spectra == 1:
+            axes = [axes]
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        axes = [ax] * n_spectra
     
-    # Plot initial spectrum if provided (use experimental energy axis)
-    if initial_peak_params is not None:
-        initial_spectrum = simulate_nexafs_spectrum_for_fitting(energy_exp, initial_peak_params, initial_edge_params, baseline)
-        ax1.plot(energy_exp, initial_spectrum, 'g--', linewidth=2, alpha=0.7,
-                 label='Initial Guess', zorder=3)
+    # Generate colors for overlaid plot
+    if not stacked and n_spectra > 1:
+        if n_spectra <= 10:
+            colors = plt.cm.tab10(np.linspace(0, 1, max(n_spectra, 3)))
+        else:
+            colors = plt.cm.tab20(np.linspace(0, 1, n_spectra))
+    else:
+        colors = ['C0'] * n_spectra
     
-    # Plot fitted spectrum
-    if fitted_spectrum is not None:
-        ax1.plot(energy_exp, fitted_spectrum, 'r-', linewidth=2, 
-                 label='Fitted Spectrum', zorder=5)
+    # Plot each spectrum
+    for i, ((energy, intensity), label, color) in enumerate(zip(filtered_spectra, labels, colors)):
+        ax = axes[i]
+        ax.plot(energy, intensity, 'o-', color=color, markersize=3, 
+                linewidth=1.5, label=label, alpha=0.8)
+        ax.set_ylabel(ylabel)
+        if stacked:
+            ax.legend(loc='best')
     
-    # Get high-density energy axis for smooth component plotting
-    energy_sim, _ = simulate_nexafs_spectrum_for_plotting(energy_exp, fitted_peak_params, fitted_edge_params, baseline)
+    # Set common properties
+    axes[-1].set_xlabel(xlabel)
+    axes[-1].set_xlim(energy_min, energy_max)
     
-    # Plot baseline if non-zero
-    if baseline != 0:
-        ax1.axhline(y=baseline, color='gray', linestyle='--', alpha=0.7, 
-                   label=f'Baseline = {baseline:.3f}', zorder=2)
+    # Add legend for overlaid plot
+    if not stacked and n_spectra > 1:
+        axes[0].legend(loc='best')
     
-    # Plot step edge if present (using high-density axis)
-    if fitted_edge_params is not None:
-        edge_spectrum = edge_bl_func(energy_sim, 
-                                   fitted_edge_params['location'],
-                                   fitted_edge_params['height'],
-                                   fitted_edge_params['width'], 
-                                   fitted_edge_params['decay'])
-        edge_spectrum += baseline
-        ax1.plot(energy_sim, edge_spectrum, 'b-', linewidth=2, alpha=0.8,
-                 label='Step Edge', zorder=3)
-        
-        # Shade under the step edge with light grey
-        ax1.fill_between(energy_sim, baseline, edge_spectrum,
-                        color='lightgrey', alpha=0.4, zorder=1)
+    # Add title
+    if title is not None:
+        fig.suptitle(title, fontsize=14, y=0.995)
     
-    # Plot individual fitted peaks (using high-density axis)
-    peak_total = np.full_like(energy_sim, baseline)
-    if fitted_edge_params is not None:
-        peak_total += edge_bl_func(energy_sim,
-                                 fitted_edge_params['location'],
-                                 fitted_edge_params['height'],
-                                 fitted_edge_params['width'],
-                                 fitted_edge_params['decay'])
+    fig.tight_layout()
     
-    for i, peak_name in enumerate(peak_names):
-        # Get fitted peak parameters
-        width = fitted_peak_params[f"{peak_name}_width"]
-        height = fitted_peak_params[f"{peak_name}_height"]  
-        peak_energy = fitted_peak_params[f"{peak_name}_energy"]
-        
-        # Calculate individual peak using high-density axis
-        peak_spectrum = gaussian(energy_sim, height, peak_energy, width)
-        peak_spectrum_with_baseline = peak_spectrum + peak_total
-        
-        # Plot peak line
-        color = peak_colors[i % len(peak_colors)]
-        peak_label = f'{peak_energy:.1f} eV'
-        ax1.plot(energy_sim, peak_spectrum_with_baseline, '-', 
-                 color=color, linewidth=1.5, label=peak_label, zorder=4)
-        
-        # Fill area under peak
-        ax1.fill_between(energy_sim, peak_total, peak_spectrum_with_baseline,
-                        color=color, alpha=peak_alpha, zorder=2)
-    
-    # Formatting for main plot
-    ax1.set_xlabel('Energy (eV)', fontsize=12)
-    ax1.set_ylabel('Intensity (arb. units)', fontsize=12)
-    ax1.set_title('NEXAFS Spectrum Fitting Results', fontsize=14, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
-    
-    # Add fitting statistics as text box
-    if 'r_squared' in results:
-        r_squared = results['r_squared']
-        rmse = results['rmse']
-        algorithm = results.get('fit_result', {}).get('algorithm', 'N/A')
-        
-        stats_text = f'R² = {r_squared:.4f}\nRMSE = {rmse:.4f}\nAlgorithm: {algorithm}'
-        ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, 
-                fontsize=10, verticalalignment='top',
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8))
-    
-    # Plot residuals
-    if residuals is not None:
-        ax2.plot(energy_exp, residuals, 'ko-', markersize=2, linewidth=0.5, alpha=0.7)
-        ax2.axhline(y=0, color='red', linestyle='-', alpha=0.7)
-        ax2.set_xlabel('Energy (eV)', fontsize=12)
-        ax2.set_ylabel('Residuals', fontsize=10)
-        ax2.grid(True, alpha=0.3)
-        ax2.set_title('Fit Residuals', fontsize=12)
-        
-        # Calculate and display residual statistics
-        if len(residuals) > 0:
-            res_std = np.std(residuals)
-            res_mean = np.mean(residuals)
-            ax2.axhline(y=res_mean + 2*res_std, color='orange', linestyle='--', alpha=0.7, label='±2σ')
-            ax2.axhline(y=res_mean - 2*res_std, color='orange', linestyle='--', alpha=0.7)
-            ax2.text(0.02, 0.95, f'σ = {res_std:.4f}', transform=ax2.transAxes,
-                    fontsize=9, verticalalignment='top',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-    
-    # Adjust layout
-    plt.tight_layout()
-    
-    # Save figure if path provided
+    # Save figure if requested
     if save_path is not None:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-        print(f"Figure saved to: {save_path}")
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    
+    # Show figure if requested
+    if show:
+        plt.show()
+        plt.close(fig)
     
     return fig
 
 
-def plot_nexafs_spectrum(energy: np.ndarray,
-                        intensity: np.ndarray,
-                        peak_params: Dict,
-                        edge_params: Optional[Dict] = None,
-                        baseline: float = 0.0,
-                        figsize: Tuple[float, float] = (12, 8),
-                        peak_alpha: float = 0.3,
-                        peak_colors: Optional[List[str]] = None,
-                        title: str = "NEXAFS Spectrum",
-                        save_path: Optional[str] = None,
-                        dpi: int = 300) -> plt.Figure:
-    """
-    Plot NEXAFS spectrum with peak decomposition - works with either initial or fitted parameters.
-    
-    This general function can plot:
-    - Initial spectrum with starting parameter guesses
-    - Fitted spectrum with optimized parameters
-    - Any spectrum with given peak and edge parameters
-    
-    Parameters:
-    energy : numpy array
-        Energy values
-    intensity : numpy array
-        Intensity values (experimental data or simulated spectrum)
-    peak_params : dict
-        Peak parameters dictionary (either initial guesses or fitted values)
-        Format: {"peak_1_width": 1.5, "peak_1_height": 2.0, "peak_1_energy": 285.0, ...}
-    edge_params : dict, optional
-        Edge parameters dictionary (either initial guesses or fitted values)
-        Format: {"location": 284.0, "height": 1.0, "width": 2.0, "decay": 0.1}
-    baseline : float
-        Baseline value
-    figsize : tuple
-        Figure size (width, height)
-    peak_alpha : float
-        Transparency for peak fill areas (0-1)
-    peak_colors : list, optional
-        List of colors for peaks. If None, uses default colormap
-    title : str
-        Plot title
-    save_path : str, optional
-        Path to save the figure
-    dpi : int
-        Resolution for saved figure
-        
-    Returns:
-    matplotlib.figure.Figure
-        The created figure object
-    """
-    
-    # Create figure
-    fig, ax = plt.subplots(1, 1, figsize=figsize)
-    
-    # Get peak names and set up colors
-    peak_names = get_peak_names(peak_params)
-    n_peaks = len(peak_names)
-    
-    if peak_colors is None:
-        # Use a colormap to generate distinct colors
-        if n_peaks <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, max(n_peaks, 3)))
-        else:
-            colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
-        peak_colors = [mcolors.to_hex(color) for color in colors]
-    
-    # Plot experimental/input data
-    ax.plot(energy, intensity, 'ko', markersize=3, alpha=0.7, 
-             label='Data', zorder=1)
-    
-    # Calculate and plot total spectrum
-    total_spectrum = simulate_nexafs_spectrum(energy, peak_params, edge_params, baseline)
-    ax.plot(energy, total_spectrum, 'r-', linewidth=2, 
-             label='Total Spectrum', zorder=5)
-    
-    # Plot baseline if non-zero
-    if baseline != 0:
-        ax.axhline(y=baseline, color='gray', linestyle='--', alpha=0.7, 
-                   label=f'Baseline = {baseline:.3f}', zorder=2)
-    
-    # Plot step edge if present
-    if edge_params is not None:
-        edge_spectrum = edge_bl_func(energy, 
-                                   edge_params['location'],
-                                   edge_params['height'],
-                                   edge_params['width'], 
-                                   edge_params['decay'])
-        edge_spectrum += baseline
-        ax.plot(energy, edge_spectrum, 'b-', linewidth=2, alpha=0.8,
-                 label='Step Edge', zorder=3)
-    
-    # Plot individual peaks
-    peak_total = np.full_like(energy, baseline)
-    if edge_params is not None:
-        peak_total += edge_bl_func(energy,
-                                 edge_params['location'],
-                                 edge_params['height'],
-                                 edge_params['width'],
-                                 edge_params['decay'])
-    
-    for i, peak_name in enumerate(peak_names):
-        # Get peak parameters
-        width = peak_params[f"{peak_name}_width"]
-        height = peak_params[f"{peak_name}_height"]  
-        peak_energy = peak_params[f"{peak_name}_energy"]
-        
-        # Calculate individual peak
-        peak_spectrum = gaussian(energy, height, peak_energy, width)
-        peak_spectrum_with_baseline = peak_spectrum + peak_total
-        
-        # Plot peak line
-        color = peak_colors[i % len(peak_colors)]
-        peak_label = f'{peak_name.replace("_", " ").title()}'
-        ax.plot(energy, peak_spectrum_with_baseline, '-', 
-                 color=color, linewidth=1.5, label=peak_label, zorder=4)
-        
-        # Fill area under peak
-        ax.fill_between(energy, peak_total, peak_spectrum_with_baseline,
-                        color=color, alpha=peak_alpha, zorder=2)
-        
-        # Add peak info text
-        peak_center_idx = np.argmin(np.abs(energy - peak_energy))
-        peak_y = peak_spectrum_with_baseline[peak_center_idx]
-        ax.annotate(f'{peak_energy:.1f} eV\nFWHM: {width:.2f}', 
-                    xy=(peak_energy, peak_y), xytext=(5, 10),
-                    textcoords='offset points', fontsize=8,
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor=color, alpha=0.7),
-                    ha='left', va='bottom')
-    
-    # Formatting
-    ax.set_xlabel('Energy (eV)', fontsize=12)
-    ax.set_ylabel('Intensity (arb. units)', fontsize=12)
-    ax.set_title(title, fontsize=14, fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
-    
-    # Adjust layout
-    plt.tight_layout()
-    
-    # Save figure if path provided
-    if save_path is not None:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-        print(f"Figure saved to: {save_path}")
-    
-    return fig
-
-def plot_nexafs_fit(results: Dict, 
-                   peak_params: Dict,
-                   edge_params: Optional[Dict] = None,
-                   baseline: float = 0.0,
-                   figsize: Tuple[float, float] = (12, 8),
-                   show_residuals: bool = True,
-                   peak_alpha: float = 0.3,
-                   peak_colors: Optional[List[str]] = None,
-                   save_path: Optional[str] = None,
-                   dpi: int = 300) -> plt.Figure:
-    """
-    Plot NEXAFS spectrum fitting results with individual peak components.
-    
-    Parameters:
-    results : dict
-        Results dictionary from fit_nexafs_spectrum containing:
-        - 'experimental_energy': Energy values
-        - 'experimental_intensity': Intensity values
-        - 'fitted_spectrum': Fitted spectrum
-        - 'residuals': Residuals (data - fit)
-        - 'fitted_peak_params': Fitted peak parameters
-        - 'fitted_edge_params': Fitted edge parameters
-        - 'r_squared': R-squared value
-        - 'rmse': Root mean square error
-        - 'fit_result': Dictionary with algorithm info
-    peak_params : dict
-        Peak parameters dictionary (used if fitted params not available)
-    edge_params : dict, optional
-        Edge parameters dictionary (used if fitted params not available)
-    baseline : float
-        Baseline value
-    figsize : tuple
-        Figure size (width, height)
-    show_residuals : bool
-        Whether to show residuals subplot
-    peak_alpha : float
-        Transparency for peak fill areas (0-1)
-    peak_colors : list, optional
-        List of colors for peaks. If None, uses default colormap
-    save_path : str, optional
-        Path to save the figure
-    dpi : int
-        Resolution for saved figure
-        
-    Returns:
-    matplotlib.figure.Figure
-        The created figure object
-    """
-    
-    # Extract data from results
-    energy_exp = results['experimental_energy']
-    intensity_exp = results['experimental_intensity']
-    fitted_spectrum = results['fitted_spectrum']
-    residuals = results['residuals']
-    
-    # Use fitted parameters if available, otherwise use input parameters
-    if results.get('fitted_peak_params') is not None:
-        plot_peak_params = results['fitted_peak_params']
-    else:
-        plot_peak_params = peak_params
-        
-    if results.get('fitted_edge_params') is not None:
-        plot_edge_params = results['fitted_edge_params']
-    else:
-        plot_edge_params = edge_params
-    
-    # Create figure and subplots
-    if show_residuals:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, 
-                                      gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.1})
-    else:
-        fig, ax1 = plt.subplots(1, 1, figsize=figsize)
-        ax2 = None
-    
-    # Get peak names and set up colors
-    peak_names = get_peak_names(plot_peak_params)
-    n_peaks = len(peak_names)
-    
-    if peak_colors is None:
-        # Use a colormap to generate distinct colors
-        if n_peaks <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, max(n_peaks, 3)))
-        else:
-            colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
-        peak_colors = [mcolors.to_hex(color) for color in colors]
-    
-    # Plot experimental data
-    ax1.plot(energy_exp, intensity_exp, 'ko', markersize=3, alpha=0.7, 
-             label='Experimental Data', zorder=1)
-    
-    # Plot fitted spectrum
-    if fitted_spectrum is not None:
-        ax1.plot(energy_exp, fitted_spectrum, 'r-', linewidth=2, 
-                 label='Fitted Spectrum', zorder=5)
-    
-    # Plot baseline if non-zero
-    if baseline != 0:
-        ax1.axhline(y=baseline, color='gray', linestyle='--', alpha=0.7, 
-                   label=f'Baseline = {baseline:.3f}', zorder=2)
-    
-    # Plot step edge if present
-    if plot_edge_params is not None:
-        edge_spectrum = edge_bl_func(energy_exp, 
-                                   plot_edge_params['location'],
-                                   plot_edge_params['height'],
-                                   plot_edge_params['width'], 
-                                   plot_edge_params['decay'])
-        edge_spectrum += baseline
-        ax1.plot(energy_exp, edge_spectrum, 'b-', linewidth=2, alpha=0.8,
-                 label='Step Edge', zorder=3)
-    
-    # Plot individual peaks
-    peak_total = np.full_like(energy_exp, baseline)
-    if plot_edge_params is not None:
-        peak_total += edge_bl_func(energy_exp,
-                                 plot_edge_params['location'],
-                                 plot_edge_params['height'],
-                                 plot_edge_params['width'],
-                                 plot_edge_params['decay'])
-    
-    for i, peak_name in enumerate(peak_names):
-        # Get peak parameters
-        width = plot_peak_params[f"{peak_name}_width"]
-        height = plot_peak_params[f"{peak_name}_height"]  
-        energy = plot_peak_params[f"{peak_name}_energy"]
-        
-        # Calculate individual peak
-        peak_spectrum = gaussian(energy_exp, height, energy, width)
-        peak_spectrum_with_baseline = peak_spectrum + peak_total
-        
-        # Plot peak line
-        color = peak_colors[i % len(peak_colors)]
-        peak_label = f'{peak_name.replace("_", " ").title()}'
-        ax1.plot(energy_exp, peak_spectrum_with_baseline, '-', 
-                 color=color, linewidth=1.5, label=peak_label, zorder=4)
-        
-        # Fill area under peak
-        ax1.fill_between(energy_exp, peak_total, peak_spectrum_with_baseline,
-                        color=color, alpha=peak_alpha, zorder=2)
-        
-        # Add peak info text
-        peak_center_idx = np.argmin(np.abs(energy_exp - energy))
-        peak_y = peak_spectrum_with_baseline[peak_center_idx]
-        ax1.annotate(f'{energy:.1f} eV\nFWHM: {width:.2f}', 
-                    xy=(energy, peak_y), xytext=(5, 10),
-                    textcoords='offset points', fontsize=8,
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor=color, alpha=0.7),
-                    ha='left', va='bottom')
-    
-    # Formatting for main plot
-    ax1.set_xlabel('Energy (eV)', fontsize=12)
-    ax1.set_ylabel('Intensity (arb. units)', fontsize=12)
-    ax1.set_title('NEXAFS Spectrum Fitting Results', fontsize=14, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
-    
-    # Add fitting statistics as text box
-    if 'r_squared' in results:
-        r_squared = results['r_squared']
-        rmse = results['rmse']
-        algorithm = results.get('fit_result', {}).get('algorithm', 'N/A')
-        
-        stats_text = f'R² = {r_squared:.4f}\nRMSE = {rmse:.4f}\nAlgorithm: {algorithm}'
-        ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, 
-                fontsize=10, verticalalignment='top',
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8))
-    
-    # Plot residuals if requested
-    if show_residuals and ax2 is not None and residuals is not None:
-        ax2.plot(energy_exp, residuals, 'ko-', markersize=2, linewidth=0.5, alpha=0.7)
-        ax2.axhline(y=0, color='red', linestyle='-', alpha=0.7)
-        ax2.set_xlabel('Energy (eV)', fontsize=12)
-        ax2.set_ylabel('Residuals', fontsize=10)
-        ax2.grid(True, alpha=0.3)
-        ax2.set_title('Fit Residuals', fontsize=12)
-        
-        # Calculate and display residual statistics
-        if len(residuals) > 0:
-            res_std = np.std(residuals)
-            res_mean = np.mean(residuals)
-            ax2.axhline(y=res_mean + 2*res_std, color='orange', linestyle='--', alpha=0.7, label='±2σ')
-            ax2.axhline(y=res_mean - 2*res_std, color='orange', linestyle='--', alpha=0.7)
-            ax2.text(0.02, 0.95, f'σ = {res_std:.4f}', transform=ax2.transAxes,
-                    fontsize=9, verticalalignment='top',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-    
-    # Adjust layout
-    plt.tight_layout()
-    
-    # Save figure if path provided
-    if save_path is not None:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-        print(f"Figure saved to: {save_path}")
-    
-    return fig
-
-def print_fit_results(results: Dict):
-    """
-    Print a summary of fitting results.
-    
-    Parameters:
-    results : dict
-        Results dictionary from fit_nexafs_spectrum
-    """
-    fit_result = results['fit_result']
-    
-    if fit_result['success']:
-        print("=== NEXAFS Fitting Results ===")
-        print(f"R-squared: {results['r_squared']:.6f}")
-        print(f"RMSE: {results['rmse']:.6f}")
-        print(f"Degrees of freedom: {fit_result['degrees_of_freedom']}")
-        print("\nFitted Parameters:")
-        print("-" * 50)
-        
-        for param_name, value in fit_result['fitted_values'].items():
-            uncertainty = fit_result['parameter_uncertainties'].get(param_name, 0)
-            print(f"{param_name:25s}: {value:10.4f} ± {uncertainty:8.4f}")
-            
-    else:
-        print("=== Fitting Failed ===")
-        print(f"Error: {fit_result['error_message']}")
 
 def fit_spectra_with_edge(target_spectrum, spectrum1, spectrum2, 
                          initial_guess=None, include_edge=True,
