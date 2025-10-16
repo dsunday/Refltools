@@ -14,7 +14,8 @@ class LariatDataProcessor:
     A class for processing Lariat datacube files and extracting/analyzing spectra.
     """
     
-    def __init__(self, filepath=None, pixel_size_um=50.0):
+    
+    def __init__(self, filepath=None, pixel_size_um=50.0, energy_range=None):
         """
         Initialize the LariatDataProcessor.
         
@@ -24,15 +25,18 @@ class LariatDataProcessor:
             Path to the HDF5 file to load immediately
         pixel_size_um : float, optional
             Size of each pixel in micrometers. Default is 50.0 um
+        energy_range : tuple, optional
+            (min_energy, max_energy) to load only a subset of energies.
+            If None, loads all energies from the file.
         """
         self.data = None
         self.metadata = None
         self.filepath = filepath
-        self.pixel_size_um = pixel_size_um  # Add pixel size parameter
+        self.pixel_size_um = pixel_size_um
         
         if filepath is not None:
-            self.load_data(filepath)
-    
+            self.load_data(filepath, energy_range=energy_range)
+        
     def set_pixel_size(self, pixel_size_um):
         """
         Set or update the pixel size in micrometers.
@@ -101,7 +105,7 @@ class LariatDataProcessor:
         extent = [0, width * self.pixel_size_um, 0, height * self.pixel_size_um]
         return extent
     
-    def load_data(self, filepath):
+    def load_data(self, filepath, energy_range=None):
         """
         Load lariat datacube from HDF5 file.
         
@@ -109,11 +113,14 @@ class LariatDataProcessor:
         -----------
         filepath : str
             Path to the HDF5 file
+        energy_range : tuple, optional
+            (min_energy, max_energy) to load only a subset of energies.
+            If None, loads all energies from the file.
         """
         self.filepath = filepath
-        self.data, self.metadata = self._read_lariat_datacube(filepath)
+        self.data, self.metadata = self._read_lariat_datacube(filepath, energy_range=energy_range)
     
-    def _read_lariat_datacube(self, filepath):
+    def _read_lariat_datacube(self, filepath, energy_range=None):
         """
         Read lariat datacube from HDF5 file.
         
@@ -121,6 +128,9 @@ class LariatDataProcessor:
         -----------
         filepath : str
             Path to the HDF5 file
+        energy_range : tuple, optional
+            (min_energy, max_energy) to load only a subset of energies.
+            If None, loads all energies from the file.
             
         Returns:
         --------
@@ -131,13 +141,34 @@ class LariatDataProcessor:
         """
         f = h5py.File(filepath)
         metadata = json.loads(f['File Version'].attrs['Meta Data'])
-        energies = np.arange(*metadata['BeamEnergy'])
+        all_energies = np.arange(*metadata['BeamEnergy'])
+        
+        # Apply energy range filter if specified
+        if energy_range is not None:
+            min_energy, max_energy = energy_range
+            energy_mask = (all_energies >= min_energy) & (all_energies <= max_energy)
+            energy_indices = np.where(energy_mask)[0]
+            energies = all_energies[energy_mask]
+            
+            if len(energies) == 0:
+                raise ValueError(f"No energies found in range {min_energy} - {max_energy} eV. "
+                            f"Available range: {all_energies.min():.2f} - {all_energies.max():.2f} eV")
+            
+            print(f"Loading {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
+            print(f"(Requested range: {min_energy:.2f} - {max_energy:.2f} eV)")
+        else:
+            energy_indices = np.arange(len(all_energies))
+            energies = all_energies
+            print(f"Loading all {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
+        
         image_list = []
         energy_list = []
-        for i, energy in enumerate(energies):
-            image = f['Images'][f'Image{i}']['ImagePlane0']
+        for idx in energy_indices:
+            image = f['Images'][f'Image{idx}']['ImagePlane0'][()]
             image_list.append(image)
-            energy_list.append(energy)
+            energy_list.append(energies[idx - energy_indices[0]])
+        
+        f.close()
         return xr.DataArray(image_list, dims=['energy','pix_y','pix_x'], coords={'energy':energy_list}), metadata
     
     def crop_image(self, crop_region=None, interactive=False, preview_energy=None, 
@@ -4579,3 +4610,743 @@ class LariatDataProcessor:
             print(f"ROI information saved to {info_filepath}")
         
         return spectra_dict, roi_info
+    
+    def perform_pca_analysis(self, n_components=10, plot=True, save_results=False, 
+                        save_path=None, save_name='pca_analysis'):
+        """
+        Perform Principal Component Analysis (PCA) on the datacube.
+        Each pixel's spectrum is treated as a sample, and energies are features.
+        
+        Parameters:
+        -----------
+        n_components : int, optional
+            Number of PCA components to compute. Default is 10.
+            Will be adjusted if less than available energies or pixels.
+        plot : bool, optional
+            If True, create visualizations of PCA results. Default is True.
+        save_results : bool, optional
+            If True, save PCA results to files. Default is False.
+        save_path : str, optional
+            Directory to save results. If None, uses current directory.
+        save_name : str, optional
+            Base name for saved files.
+            
+        Returns:
+        --------
+        pca_dataset : xarray.Dataset
+            Dataset containing:
+            - 'weights': PCA component weights in image space (n_components, pix_y, pix_x)
+            - 'spectra': PCA component spectra (n_components, energy)
+            - 'explained_variance_ratio': Fraction of variance explained by each component
+        pca_info : dict
+            Dictionary with PCA analysis information and statistics
+        """
+        from sklearn.decomposition import PCA
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import xarray as xr
+        import os
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        print("Starting PCA analysis...")
+        
+        # Get data shape
+        image_data = self.data.values  # Shape: (energy, pix_y, pix_x)
+        n_energy, n_y, n_x = image_data.shape
+        
+        print(f"Original data shape: {image_data.shape}")
+        print(f"Total pixels: {n_y * n_x:,}")
+        print(f"Energy points: {n_energy}")
+        
+        # Reshape to (n_pixels, n_energies) for PCA
+        # Each pixel becomes a sample, each energy becomes a feature
+        pixel_spectra = image_data.transpose(1, 2, 0).reshape(-1, n_energy)
+        
+        # Remove any pixels with NaN or zero values
+        valid_pixels = ~np.isnan(pixel_spectra).any(axis=1)
+        # Also remove pixels that are all zeros or very low intensity
+        max_intensity = np.max(pixel_spectra, axis=1)
+        valid_pixels = valid_pixels & (max_intensity > 1e-10)
+        
+        pixel_spectra_clean = pixel_spectra[valid_pixels]
+        
+        print(f"Valid pixels for PCA: {len(pixel_spectra_clean):,} ({len(pixel_spectra_clean)/(n_y*n_x)*100:.1f}%)")
+        
+        if len(pixel_spectra_clean) == 0:
+            raise ValueError("No valid pixels found for PCA analysis")
+        
+        # Adjust n_components if necessary
+        n_components = min(n_components, n_energy, len(pixel_spectra_clean))
+        print(f"Computing {n_components} principal components")
+        
+        # Perform PCA
+        pca = PCA(n_components=n_components)
+        pca_result = pca.fit_transform(pixel_spectra_clean)
+        
+        # Get the PCA components (eigenvectors) - these are the spectral signatures
+        pca_components = pca.components_  # Shape: (n_components, n_energies)
+        
+        # Get the explained variance ratio
+        explained_variance_ratio = pca.explained_variance_ratio_
+        cumulative_variance = np.cumsum(explained_variance_ratio)
+        
+        print(f"\nPCA Results:")
+        print(f"Explained variance by first 3 components: {np.sum(explained_variance_ratio[:3]):.1%}")
+        print(f"Explained variance by first 5 components: {np.sum(explained_variance_ratio[:5]):.1%}")
+        components_95 = np.argmax(cumulative_variance >= 0.95) + 1
+        print(f"Components needed for 95% variance: {components_95}")
+        
+        # Create the PCA weights images (scores in image space)
+        pca_weights_images = np.full((n_components, n_y, n_x), np.nan)
+        pca_weights_flat = np.full((n_y * n_x, n_components), np.nan)
+        
+        # Fill in the PCA weights for valid pixels
+        valid_indices = np.where(valid_pixels)[0]
+        for i in range(n_components):
+            pca_weights_flat[valid_indices, i] = pca_result[:, i]
+            pca_weights_images[i] = pca_weights_flat[:, i].reshape(n_y, n_x)
+        
+        # Create xarray for PCA weights (spatial distribution of each component)
+        pca_weights_da = xr.DataArray(
+            pca_weights_images,
+            dims=['component', 'pix_y', 'pix_x'],
+            coords={
+                'component': range(1, n_components + 1),
+                'pix_y': self.data.pix_y,
+                'pix_x': self.data.pix_x
+            },
+            attrs={'description': 'PCA component weights in image space (scores)'}
+        )
+        
+        # Create xarray for PCA spectra (spectral signatures of each component)
+        pca_spectra_da = xr.DataArray(
+            pca_components,
+            dims=['component', 'energy'],
+            coords={
+                'component': range(1, n_components + 1),
+                'energy': self.data.energy
+            },
+            attrs={'description': 'PCA component spectra (loadings)'}
+        )
+        
+        # Create combined dataset
+        pca_dataset = xr.Dataset({
+            'weights': pca_weights_da,
+            'spectra': pca_spectra_da,
+            'explained_variance_ratio': (['component'], explained_variance_ratio),
+            'cumulative_variance': (['component'], cumulative_variance)
+        })
+        
+        # Store PCA information
+        pca_info = {
+            'n_components': n_components,
+            'n_valid_pixels': len(pixel_spectra_clean),
+            'n_total_pixels': n_y * n_x,
+            'valid_pixel_fraction': len(pixel_spectra_clean) / (n_y * n_x),
+            'explained_variance_ratio': explained_variance_ratio,
+            'cumulative_variance': cumulative_variance,
+            'components_for_95_variance': components_95,
+            'variance_by_first_3': np.sum(explained_variance_ratio[:3]),
+            'variance_by_first_5': np.sum(explained_variance_ratio[:5]),
+            'data_shape': image_data.shape
+        }
+        
+        # Plot results if requested
+        if plot:
+            # Determine number of components to plot (max 6)
+            n_plot = min(6, n_components)
+            aspect_ratio = n_x / n_y if n_y != 0 else 1.0
+            
+            # Figure 1: PCA component weight images
+            fig1, axes = plt.subplots(3, 2, figsize=(12, 16))
+            axes = axes.flatten()
+            
+            for i in range(n_plot):
+                weights = pca_weights_images[i]
+                # Calculate vmin/vmax using percentiles for better contrast
+                vmin, vmax = np.nanpercentile(weights, [2, 98])
+                
+                im = axes[i].imshow(
+                    weights,
+                    aspect=aspect_ratio,
+                    cmap='RdBu_r',
+                    origin='lower',
+                    vmin=vmin,
+                    vmax=vmax
+                )
+                axes[i].set_title(f'PC{i+1} Weights (Scores)\n'
+                                f'{explained_variance_ratio[i]:.1%} variance explained')
+                axes[i].set_xlabel('Pixel X')
+                axes[i].set_ylabel('Pixel Y')
+                cbar = plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
+                cbar.set_label('Weight')
+            
+            # Hide any unused subplots
+            for i in range(n_plot, len(axes)):
+                axes[i].set_visible(False)
+            
+            plt.suptitle('PCA Component Spatial Distribution', fontsize=14, y=0.995)
+            plt.tight_layout()
+            plt.show()
+            
+            # Figure 2: PCA component spectra
+            fig2, axes = plt.subplots(2, 3, figsize=(15, 8))
+            axes = axes.flatten()
+            
+            energies = self.data.energy.values
+            for i in range(n_plot):
+                axes[i].plot(energies, pca_components[i], 'b-', linewidth=2)
+                axes[i].set_title(f'PC{i+1} Spectrum (Loading)\n'
+                                f'{explained_variance_ratio[i]:.1%} variance explained')
+                axes[i].set_xlabel('Energy (eV)')
+                axes[i].set_ylabel('PCA Loading')
+                axes[i].grid(True, alpha=0.3)
+                axes[i].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+            
+            # Hide any unused subplots
+            for i in range(n_plot, len(axes)):
+                axes[i].set_visible(False)
+            
+            plt.suptitle('PCA Component Spectral Signatures', fontsize=14)
+            plt.tight_layout()
+            plt.show()
+            
+            # Figure 3: Variance explained
+            fig3, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            
+            # Individual variance
+            ax1.bar(range(1, n_components+1), explained_variance_ratio, color='steelblue', alpha=0.7)
+            ax1.set_xlabel('Principal Component')
+            ax1.set_ylabel('Explained Variance Ratio')
+            ax1.set_title('Individual Explained Variance')
+            ax1.grid(True, alpha=0.3, axis='y')
+            ax1.set_xticks(range(1, n_components+1))
+            
+            # Cumulative variance
+            ax2.plot(range(1, n_components+1), cumulative_variance, 'bo-', linewidth=2, markersize=8)
+            ax2.axhline(y=0.95, color='r', linestyle='--', linewidth=2, label='95% variance')
+            ax2.axhline(y=0.99, color='orange', linestyle='--', linewidth=2, label='99% variance')
+            ax2.set_xlabel('Number of Components')
+            ax2.set_ylabel('Cumulative Explained Variance')
+            ax2.set_title('Cumulative Explained Variance')
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+            ax2.set_xticks(range(1, n_components+1))
+            ax2.set_ylim([0, 1.05])
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Save results if requested
+        if save_results:
+            if save_path is None:
+                save_path = os.getcwd()
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Save PCA dataset as NetCDF
+            dataset_filename = f"{save_name}_dataset.nc"
+            dataset_filepath = os.path.join(save_path, dataset_filename)
+            pca_dataset.to_netcdf(dataset_filepath)
+            
+            # Save component spectra as CSV
+            spectra_filename = f"{save_name}_spectra.csv"
+            spectra_filepath = os.path.join(save_path, spectra_filename)
+            
+            # Create header with component labels
+            header = 'Energy,' + ','.join([f'PC{i+1}' for i in range(n_components)])
+            spectra_array = np.column_stack([energies, pca_components.T])
+            np.savetxt(spectra_filepath, spectra_array, delimiter=',', header=header, comments='')
+            
+            # Save variance information
+            variance_filename = f"{save_name}_variance.csv"
+            variance_filepath = os.path.join(save_path, variance_filename)
+            
+            variance_data = np.column_stack([
+                range(1, n_components+1),
+                explained_variance_ratio,
+                cumulative_variance
+            ])
+            variance_header = 'Component,Explained_Variance_Ratio,Cumulative_Variance'
+            np.savetxt(variance_filepath, variance_data, delimiter=',', 
+                    header=variance_header, comments='', fmt='%d,%.6f,%.6f')
+            
+            # Save summary information
+            info_filename = f"{save_name}_info.txt"
+            info_filepath = os.path.join(save_path, info_filename)
+            
+            with open(info_filepath, 'w') as f:
+                f.write("PCA Analysis Summary\n")
+                f.write("=" * 50 + "\n")
+                f.write(f"Data shape: {image_data.shape} (energy, pix_y, pix_x)\n")
+                f.write(f"Number of components: {n_components}\n")
+                f.write(f"Valid pixels: {len(pixel_spectra_clean):,} / {n_y * n_x:,} "
+                    f"({len(pixel_spectra_clean)/(n_y*n_x)*100:.1f}%)\n")
+                f.write(f"\nVariance Explained:\n")
+                f.write(f"  First 3 components: {np.sum(explained_variance_ratio[:3]):.1%}\n")
+                f.write(f"  First 5 components: {np.sum(explained_variance_ratio[:5]):.1%}\n")
+                f.write(f"  Components for 95% variance: {components_95}\n")
+                f.write(f"\nIndividual Component Variance:\n")
+                for i in range(n_components):
+                    f.write(f"  PC{i+1}: {explained_variance_ratio[i]:.2%} "
+                        f"(cumulative: {cumulative_variance[i]:.2%})\n")
+            
+            print(f"\nPCA results saved to {save_path}")
+            print(f"  Dataset: {dataset_filename}")
+            print(f"  Spectra: {spectra_filename}")
+            print(f"  Variance: {variance_filename}")
+            print(f"  Info: {info_filename}")
+        
+        return pca_dataset, pca_info
+    
+    def perform_nmf_analysis(self, n_components=8, normalize_illumination=True,
+                        low_energy_range=(525, 530), high_energy_range=(575, 580),
+                        random_state=42, max_iter=1000, plot=True, 
+                        save_results=False, save_path=None, save_name='nmf_analysis'):
+        """
+        Perform Non-negative Matrix Factorization (NMF) on the datacube.
+        Each pixel's spectrum is treated as a sample, and energies are features.
+        
+        NMF decomposes the data into non-negative components, which is useful for
+        spectral unmixing and identifying pure component spectra.
+        
+        Parameters:
+        -----------
+        n_components : int, optional
+            Number of NMF components to compute. Default is 8.
+        normalize_illumination : bool, optional
+            If True, normalize spectra to remove illumination bias. Default is True.
+            Normalization: (spectrum - low_avg) / high_avg
+        low_energy_range : tuple, optional
+            (min, max) energy range for background subtraction. Default is (525, 530).
+        high_energy_range : tuple, optional
+            (min, max) energy range for normalization. Default is (575, 580).
+        random_state : int, optional
+            Random seed for reproducibility. Default is 42.
+        max_iter : int, optional
+            Maximum number of iterations for NMF. Default is 1000.
+        plot : bool, optional
+            If True, create visualizations of NMF results. Default is True.
+        save_results : bool, optional
+            If True, save NMF results to files. Default is False.
+        save_path : str, optional
+            Directory to save results. If None, uses current directory.
+        save_name : str, optional
+            Base name for saved files.
+            
+        Returns:
+        --------
+        nmf_dataset : xarray.Dataset
+            Dataset containing:
+            - 'weights': NMF component weights in image space (n_components, pix_y, pix_x)
+            - 'spectra': NMF component spectra (n_components, energy)
+            - 'reconstruction_error': Overall reconstruction error
+        nmf_info : dict
+            Dictionary with NMF analysis information and statistics
+        """
+        from sklearn.decomposition import NMF
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import xarray as xr
+        import os
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        print("Starting NMF analysis...")
+        
+        # Get data shape
+        image_data = self.data.values  # Shape: (energy, pix_y, pix_x)
+        n_energy, n_y, n_x = image_data.shape
+        energies = self.data.energy.values
+        
+        print(f"Original data shape: {image_data.shape}")
+        print(f"Total pixels: {n_y * n_x:,}")
+        print(f"Energy points: {n_energy}")
+        
+        # Reshape to (n_pixels, n_energies) for NMF
+        pixel_spectra = image_data.transpose(1, 2, 0).reshape(-1, n_energy)
+        
+        # Remove any pixels with NaN values
+        valid_pixels = ~np.isnan(pixel_spectra).any(axis=1)
+        # Also remove pixels that are all zeros or very low intensity
+        max_intensity = np.max(pixel_spectra, axis=1)
+        valid_pixels = valid_pixels & (max_intensity > 1e-10)
+        
+        pixel_spectra_clean = pixel_spectra[valid_pixels]
+        
+        print(f"Valid pixels for NMF: {len(pixel_spectra_clean):,} ({len(pixel_spectra_clean)/(n_y*n_x)*100:.1f}%)")
+        
+        if len(pixel_spectra_clean) == 0:
+            raise ValueError("No valid pixels found for NMF analysis")
+        
+        # Store original spectra for comparison
+        pixel_spectra_original = pixel_spectra_clean.copy()
+        
+        # Normalize the spectra to remove illumination bias if requested
+        if normalize_illumination:
+            print(f"Normalizing spectra to remove illumination bias...")
+            print(f"  Low energy range (subtraction): {low_energy_range[0]}-{low_energy_range[1]} eV")
+            print(f"  High energy range (division): {high_energy_range[0]}-{high_energy_range[1]} eV")
+            
+            # Find indices for normalization ranges
+            low_energy_mask = (energies >= low_energy_range[0]) & (energies <= low_energy_range[1])
+            high_energy_mask = (energies >= high_energy_range[0]) & (energies <= high_energy_range[1])
+            
+            if not np.any(low_energy_mask):
+                print(f"Warning: No energy points in low energy range {low_energy_range}. Skipping normalization.")
+                normalize_illumination = False
+            elif not np.any(high_energy_mask):
+                print(f"Warning: No energy points in high energy range {high_energy_range}. Skipping normalization.")
+                normalize_illumination = False
+            else:
+                print(f"  Low energy points: {np.sum(low_energy_mask)} at {energies[low_energy_mask]}")
+                print(f"  High energy points: {np.sum(high_energy_mask)} at {energies[high_energy_mask]}")
+                
+                # Calculate normalization factors for each pixel
+                low_energy_avg = np.mean(pixel_spectra_clean[:, low_energy_mask], axis=1, keepdims=True)
+                high_energy_avg = np.mean(pixel_spectra_clean[:, high_energy_mask], axis=1, keepdims=True)
+                
+                # Avoid division by zero
+                high_energy_avg = np.where(high_energy_avg == 0, 1e-10, high_energy_avg)
+                
+                # Normalize: (spectrum - low_avg) / high_avg
+                pixel_spectra_clean = (pixel_spectra_clean - low_energy_avg) / high_energy_avg
+                
+                # Ensure non-negative values for NMF (add offset if needed)
+                min_val = pixel_spectra_clean.min()
+                if min_val < 0:
+                    print(f"  Adding offset of {abs(min_val):.4f} to make data non-negative")
+                    pixel_spectra_clean = pixel_spectra_clean - min_val
+                
+                print(f"  Data range after normalization: [{pixel_spectra_clean.min():.4f}, {pixel_spectra_clean.max():.4f}]")
+        
+        # Adjust n_components if necessary
+        n_components = min(n_components, n_energy, len(pixel_spectra_clean))
+        print(f"Computing {n_components} NMF components")
+        
+        # Perform NMF
+        nmf = NMF(n_components=n_components, random_state=random_state, max_iter=max_iter, init='nndsvda')
+        nmf_coefficients = nmf.fit_transform(pixel_spectra_clean)
+        
+        # Get the NMF components (spectra) and coefficients (weights)
+        nmf_components = nmf.components_  # Shape: (n_components, n_energies)
+        
+        # Get the reconstruction error
+        reconstruction_error = nmf.reconstruction_err_
+        converged = nmf.n_iter_ < nmf.max_iter
+        
+        print(f"\nNMF Results:")
+        print(f"Converged: {converged} (iterations: {nmf.n_iter_}/{nmf.max_iter})")
+        print(f"Reconstruction error: {reconstruction_error:.4f}")
+        
+        # Calculate reconstruction quality metrics
+        reconstructed = nmf.inverse_transform(nmf_coefficients)
+        mse = np.mean((pixel_spectra_clean - reconstructed) ** 2)
+        r2_score = 1 - (np.sum((pixel_spectra_clean - reconstructed) ** 2) / 
+                        np.sum((pixel_spectra_clean - np.mean(pixel_spectra_clean, axis=0)) ** 2))
+        
+        print(f"Mean Squared Error: {mse:.4f}")
+        print(f"R² Score: {r2_score:.4f}")
+        
+        # Create the NMF weights images (coefficients in image space)
+        nmf_weights_images = np.full((n_components, n_y, n_x), np.nan)
+        nmf_weights_flat = np.full((n_y * n_x, n_components), np.nan)
+        
+        # Fill in the NMF weights for valid pixels
+        valid_indices = np.where(valid_pixels)[0]
+        for i in range(n_components):
+            nmf_weights_flat[valid_indices, i] = nmf_coefficients[:, i]
+            nmf_weights_images[i] = nmf_weights_flat[:, i].reshape(n_y, n_x)
+        
+        # Create xarray for NMF weights (spatial distribution of each component)
+        nmf_weights_da = xr.DataArray(
+            nmf_weights_images,
+            dims=['component', 'pix_y', 'pix_x'],
+            coords={
+                'component': range(1, n_components + 1),
+                'pix_y': self.data.pix_y,
+                'pix_x': self.data.pix_x
+            },
+            attrs={
+                'description': 'NMF component weights in image space (coefficients)',
+                'normalized': normalize_illumination
+            }
+        )
+        
+        # Create xarray for NMF spectra (spectral signatures of each component)
+        nmf_spectra_da = xr.DataArray(
+            nmf_components,
+            dims=['component', 'energy'],
+            coords={
+                'component': range(1, n_components + 1),
+                'energy': self.data.energy
+            },
+            attrs={
+                'description': 'NMF component spectra (basis spectra)',
+                'normalized': normalize_illumination
+            }
+        )
+        
+        # Create combined dataset
+        nmf_dataset = xr.Dataset({
+            'weights': nmf_weights_da,
+            'spectra': nmf_spectra_da,
+            'reconstruction_error': reconstruction_error,
+            'mse': mse,
+            'r2_score': r2_score
+        })
+        
+        # Calculate component statistics
+        component_stats = []
+        for i in range(n_components):
+            weights = nmf_coefficients[:, i]
+            component_stats.append({
+                'component': i + 1,
+                'mean': float(weights.mean()),
+                'std': float(weights.std()),
+                'min': float(weights.min()),
+                'max': float(weights.max()),
+                'median': float(np.median(weights))
+            })
+        
+        # Store NMF information
+        nmf_info = {
+            'n_components': n_components,
+            'n_valid_pixels': len(pixel_spectra_clean),
+            'n_total_pixels': n_y * n_x,
+            'valid_pixel_fraction': len(pixel_spectra_clean) / (n_y * n_x),
+            'reconstruction_error': float(reconstruction_error),
+            'mse': float(mse),
+            'r2_score': float(r2_score),
+            'converged': converged,
+            'n_iterations': nmf.n_iter_,
+            'max_iterations': max_iter,
+            'normalized': normalize_illumination,
+            'low_energy_range': low_energy_range if normalize_illumination else None,
+            'high_energy_range': high_energy_range if normalize_illumination else None,
+            'component_stats': component_stats,
+            'data_shape': image_data.shape
+        }
+        
+        # Print component statistics
+        print(f"\nNMF Component Statistics:")
+        for stats in component_stats:
+            print(f"  Component {stats['component']}: Mean={stats['mean']:.4f}, Std={stats['std']:.4f}, "
+                f"Max={stats['max']:.4f}, Min={stats['min']:.4f}")
+        
+        # Plot results if requested
+        if plot:
+            # Determine number of components to plot (max 6)
+            n_plot = min(6, n_components)
+            aspect_ratio = n_x / n_y if n_y != 0 else 1.0
+            
+            # Figure 1: NMF component weight images
+            fig1, axes = plt.subplots(3, 2, figsize=(12, 16))
+            axes = axes.flatten()
+            
+            for i in range(n_plot):
+                weights = nmf_weights_images[i]
+                # Calculate vmin/vmax using percentiles for better contrast
+                vmin, vmax = np.nanpercentile(weights, [2, 98])
+                
+                im = axes[i].imshow(
+                    weights,
+                    aspect=aspect_ratio,
+                    cmap='viridis',
+                    origin='lower',
+                    vmin=vmin,
+                    vmax=vmax
+                )
+                norm_label = " (Normalized)" if normalize_illumination else ""
+                axes[i].set_title(f'NMF Component {i+1} Weights{norm_label}')
+                axes[i].set_xlabel('Pixel X')
+                axes[i].set_ylabel('Pixel Y')
+                cbar = plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
+                cbar.set_label('Weight')
+            
+            # Hide any unused subplots
+            for i in range(n_plot, len(axes)):
+                axes[i].set_visible(False)
+            
+            title_suffix = " (Illumination Normalized)" if normalize_illumination else ""
+            plt.suptitle(f'NMF Component Spatial Distribution{title_suffix}', fontsize=14, y=0.995)
+            plt.tight_layout()
+            plt.show()
+            
+            # Figure 2: NMF component spectra
+            fig2, axes = plt.subplots(2, 3, figsize=(15, 8))
+            axes = axes.flatten()
+            
+            for i in range(n_plot):
+                axes[i].plot(energies, nmf_components[i], 'b-', linewidth=2)
+                norm_label = " (Normalized)" if normalize_illumination else ""
+                axes[i].set_title(f'NMF Component {i+1} Spectrum{norm_label}')
+                axes[i].set_xlabel('Energy (eV)')
+                axes[i].set_ylabel('NMF Component Weight')
+                axes[i].grid(True, alpha=0.3)
+                axes[i].set_ylim(bottom=0)  # NMF components are non-negative
+            
+            # Hide any unused subplots
+            for i in range(n_plot, len(axes)):
+                axes[i].set_visible(False)
+            
+            title_suffix = " (Illumination Normalized)" if normalize_illumination else ""
+            plt.suptitle(f'NMF Component Spectral Signatures{title_suffix}', fontsize=14)
+            plt.tight_layout()
+            plt.show()
+            
+            # Figure 3: Component weight distributions
+            n_hist = min(8, n_components)
+            fig3, axes = plt.subplots(2, 4, figsize=(16, 8))
+            axes = axes.flatten()
+            
+            for i in range(n_hist):
+                weights = nmf_coefficients[:, i]
+                axes[i].hist(weights, bins=50, alpha=0.7, edgecolor='black', color='steelblue')
+                axes[i].set_title(f'Component {i+1} Weight Distribution')
+                axes[i].set_xlabel('Weight Value')
+                axes[i].set_ylabel('Frequency')
+                axes[i].grid(True, alpha=0.3, axis='y')
+                # Add vertical line for mean
+                axes[i].axvline(weights.mean(), color='r', linestyle='--', linewidth=2, label='Mean')
+                axes[i].legend()
+            
+            # Hide any unused subplots
+            for i in range(n_hist, len(axes)):
+                axes[i].set_visible(False)
+            
+            plt.suptitle('NMF Component Weight Distributions', fontsize=14)
+            plt.tight_layout()
+            plt.show()
+            
+            # Figure 4: Reconstruction quality - compare original vs reconstructed for random pixels
+            fig4, axes = plt.subplots(2, 3, figsize=(15, 8))
+            axes = axes.flatten()
+            
+            # Select random pixels for visualization
+            np.random.seed(random_state)
+            random_pixels = np.random.choice(len(pixel_spectra_clean), size=6, replace=False)
+            
+            for i, pixel_idx in enumerate(random_pixels):
+                axes[i].plot(energies, pixel_spectra_clean[pixel_idx], 'b-', 
+                            label='Original', linewidth=2, alpha=0.7)
+                axes[i].plot(energies, reconstructed[pixel_idx], 'r--', 
+                            label='Reconstructed', linewidth=2)
+                pixel_mse = np.mean((pixel_spectra_clean[pixel_idx] - reconstructed[pixel_idx]) ** 2)
+                axes[i].set_title(f'Pixel {pixel_idx} (MSE: {pixel_mse:.4f})')
+                axes[i].set_xlabel('Energy (eV)')
+                ylabel = 'Normalized Intensity' if normalize_illumination else 'Intensity'
+                axes[i].set_ylabel(ylabel)
+                axes[i].legend()
+                axes[i].grid(True, alpha=0.3)
+            
+            fig_title = f'NMF Reconstruction Quality (Overall R²: {r2_score:.4f})'
+            plt.suptitle(fig_title, fontsize=14)
+            plt.tight_layout()
+            plt.show()
+            
+            # Figure 5: Overall reconstruction quality metrics
+            fig5, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            
+            # Plot 1: Per-pixel MSE distribution
+            pixel_mse_values = np.mean((pixel_spectra_clean - reconstructed) ** 2, axis=1)
+            ax1.hist(pixel_mse_values, bins=50, alpha=0.7, edgecolor='black', color='coral')
+            ax1.axvline(mse, color='r', linestyle='--', linewidth=2, label=f'Mean MSE: {mse:.4f}')
+            ax1.set_xlabel('Mean Squared Error per Pixel')
+            ax1.set_ylabel('Frequency')
+            ax1.set_title('Distribution of Reconstruction Error')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3, axis='y')
+            
+            # Plot 2: Reconstruction quality summary
+            metrics = ['R² Score', 'Convergence', 'Components']
+            values = [r2_score, 1.0 if converged else 0.5, n_components / max(10, n_components)]
+            colors_bar = ['green' if r2_score > 0.9 else 'orange', 
+                        'green' if converged else 'red', 
+                        'blue']
+            
+            bars = ax2.barh(metrics, values, color=colors_bar, alpha=0.7)
+            ax2.set_xlim([0, 1.1])
+            ax2.set_xlabel('Score / Status')
+            ax2.set_title('NMF Quality Metrics')
+            ax2.grid(True, alpha=0.3, axis='x')
+            
+            # Add value labels on bars
+            for i, (bar, value) in enumerate(zip(bars, values)):
+                if i == 2:  # Components - show actual number
+                    label = f'{n_components} comps'
+                elif i == 1:  # Convergence
+                    label = 'Yes' if converged else 'No'
+                else:  # R² score
+                    label = f'{value:.3f}'
+                ax2.text(value + 0.02, bar.get_y() + bar.get_height()/2, label, 
+                        va='center', fontweight='bold')
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Save results if requested
+        if save_results:
+            if save_path is None:
+                save_path = os.getcwd()
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Save NMF dataset as NetCDF
+            dataset_filename = f"{save_name}_dataset.nc"
+            dataset_filepath = os.path.join(save_path, dataset_filename)
+            nmf_dataset.to_netcdf(dataset_filepath)
+            
+            # Save component spectra as CSV
+            spectra_filename = f"{save_name}_spectra.csv"
+            spectra_filepath = os.path.join(save_path, spectra_filename)
+            
+            header = 'Energy,' + ','.join([f'Component_{i+1}' for i in range(n_components)])
+            spectra_array = np.column_stack([energies, nmf_components.T])
+            np.savetxt(spectra_filepath, spectra_array, delimiter=',', header=header, comments='')
+            
+            # Save component weights for each pixel as CSV
+            weights_filename = f"{save_name}_weights.csv"
+            weights_filepath = os.path.join(save_path, weights_filename)
+            
+            header = ','.join([f'Component_{i+1}' for i in range(n_components)])
+            np.savetxt(weights_filepath, nmf_coefficients, delimiter=',', header=header, comments='')
+            
+            # Save summary information
+            info_filename = f"{save_name}_info.txt"
+            info_filepath = os.path.join(save_path, info_filename)
+            
+            with open(info_filepath, 'w') as f:
+                f.write("NMF Analysis Summary\n")
+                f.write("=" * 50 + "\n")
+                f.write(f"Data shape: {image_data.shape} (energy, pix_y, pix_x)\n")
+                f.write(f"Number of components: {n_components}\n")
+                f.write(f"Valid pixels: {len(pixel_spectra_clean):,} / {n_y * n_x:,} "
+                    f"({len(pixel_spectra_clean)/(n_y*n_x)*100:.1f}%)\n")
+                f.write(f"\nNormalization:\n")
+                f.write(f"  Illumination normalized: {normalize_illumination}\n")
+                if normalize_illumination:
+                    f.write(f"  Low energy range (subtraction): {low_energy_range}\n")
+                    f.write(f"  High energy range (division): {high_energy_range}\n")
+                f.write(f"\nReconstruction Quality:\n")
+                f.write(f"  Reconstruction error: {reconstruction_error:.4f}\n")
+                f.write(f"  Mean Squared Error: {mse:.4f}\n")
+                f.write(f"  R² Score: {r2_score:.4f}\n")
+                f.write(f"  Converged: {converged}\n")
+                f.write(f"  Iterations: {nmf.n_iter_}/{max_iter}\n")
+                f.write(f"\nComponent Statistics:\n")
+                for stats in component_stats:
+                    f.write(f"  Component {stats['component']}:\n")
+                    f.write(f"    Mean: {stats['mean']:.4f}\n")
+                    f.write(f"    Std: {stats['std']:.4f}\n")
+                    f.write(f"    Range: [{stats['min']:.4f}, {stats['max']:.4f}]\n")
+                    f.write(f"    Median: {stats['median']:.4f}\n")
+            
+            print(f"\nNMF results saved to {save_path}")
+            print(f"  Dataset: {dataset_filename}")
+            print(f"  Spectra: {spectra_filename}")
+            print(f"  Weights: {weights_filename}")
+            print(f"  Info: {info_filename}")
+        
+        return nmf_dataset, nmf_info
