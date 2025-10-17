@@ -360,7 +360,7 @@ def global_parameter_scan(objective, param_configs, n_repeats=1, optimization_me
         # Generate a model name for this combination
         model_name = f"{base_model_name}_scan"
         for name, value in combo_dict.items():
-            model_name += f"_{name}_{value}"
+            model_name += f"_{name}_{value:.3f}"
         
         # Repeat the fitting process n_repeats times
         for repeat in range(n_repeats):
@@ -770,7 +770,7 @@ def run_parameter_sweep(sweep_info, optimization_method='differential_evolution'
         current_param.vary = False
         
         # Create a unique model name for this sweep
-        model_name = f"{base_model_name}_{param_name}_{sweep_value}"
+        model_name = f"{base_model_name}_{param_name}_{sweep_value:.3f}"
         current_obj.model.name = model_name
         
         # Create fitter
