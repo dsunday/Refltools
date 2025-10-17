@@ -601,6 +601,8 @@ __all__ = [
     "global_parameter_scan",
     "plot_scan_heatmap",
     "load_global_scan_results",
+    "density_profile_from_scan_results",
+    "plot_global_scan_best_fit_with_uncertainty_density",
 ]
 
 
@@ -1889,6 +1891,118 @@ def plot_best_fit_with_uncertainty(sweep_info, uncertainty_percent=10,
     return fig, axes
 
 
+def density_profile_from_scan_results(scan_result_row, structure, z=None, debug=False):
+    """
+    Extract density profile from scan results and structure.
+    
+    Args:
+        scan_result_row: Single row from scan_results DataFrame containing parameter values
+        structure: refnx Structure object
+        z: Optional depth array. If None, uses default from structure
+        debug: If True, print debugging information
+    
+    Returns:
+        z: depth array
+        density: density values at each depth
+    """
+    # Get slabs from structure
+    slabs = structure.slabs()
+    
+    if debug:
+        print(f"Scan result row: {scan_result_row.to_dict()}")
+        print(f"Number of slabs: {len(slabs)}")
+    
+    # Initialize arrays for depth and density
+    if z is None:
+        # Calculate total thickness and create depth array
+        total_thickness = sum([slab[0] for slab in slabs[1:-1]])  # Exclude fronting/backing
+        z = np.linspace(-10, total_thickness + 50, 1000)
+    
+    density = np.zeros_like(z)
+    
+    # Calculate cumulative positions
+    position = 0
+    for i, slab in enumerate(slabs):
+        thickness = slab[0]  # thickness
+        
+        if debug:
+            print(f"\nSlab {i}: thickness={thickness}, SLD_real={slab[1]}, SLD_imag={slab[2]}")
+        
+        # Get density from scan results
+        layer_density = 0
+        
+        # Look for density parameters in the scan results
+        # The scan results contain the actual parameter values used for each fit
+        density_params = {}
+        for col in scan_result_row.index:
+            if 'density' in col.lower() and col not in ['model_name', 'goodness_of_fit', 'repeat']:
+                density_params[col] = scan_result_row[col]
+        
+        if debug:
+            print(f"  Found density parameters in scan results: {density_params}")
+        
+        # Map density parameters to layers based on your naming convention
+        # Based on your debug output, the layer structure is:
+        # Layer 0: air (fronting) - thickness=0
+        # Layer 1: Peptoid2 - Peptoid2_density
+        # Layer 2: Peptoid1 - Peptoid1_density  
+        # Layer 3: SiO2 - density (2.6)
+        # Layer 4: Si (backing) - density (2.33)
+        
+        if i == 0:  # Air/fronting layer
+            layer_density = 0.0  # Air has zero density
+            if debug:
+                print(f"    Layer {i} (air): density = 0.0")
+        elif i == 1 and 'Peptoid2_density' in density_params:
+            layer_density = density_params['Peptoid2_density']
+            if debug:
+                print(f"    Layer {i} (Peptoid2): Peptoid2_density = {layer_density}")
+        elif i == 2 and 'Peptoid1_density' in density_params:
+            layer_density = density_params['Peptoid1_density']
+            if debug:
+                print(f"    Layer {i} (Peptoid1): Peptoid1_density = {layer_density}")
+        elif i == 3:  # SiO2 layer
+            # Look for the SiO2 density parameter
+            if 'density' in density_params:
+                layer_density = density_params['density']
+                if debug:
+                    print(f"    Layer {i} (SiO2): density = {layer_density}")
+            else:
+                layer_density = 2.6  # Default SiO2 density
+                if debug:
+                    print(f"    Layer {i} (SiO2): using default density = {layer_density}")
+        elif i == 4:  # Si backing layer
+            layer_density = 2.33  # Silicon density
+            if debug:
+                print(f"    Layer {i} (Si): density = {layer_density}")
+        else:
+            # Fallback for any other layers
+            layer_density = 0.0
+            if debug:
+                print(f"    Layer {i}: no specific mapping, using density = {layer_density}")
+        
+        if debug:
+            print(f"  Final layer_density: {layer_density}")
+        
+        # Assign density to corresponding depths
+        if thickness > 0:
+            # Normal layer with finite thickness
+            mask = (z >= position) & (z < position + thickness)
+            density[mask] = layer_density
+        else:
+            # Zero-thickness layer (usually backing/fronting)
+            # For backing layer, assign to all depths beyond current position
+            if i == len(slabs) - 1:  # Last layer (backing)
+                mask = z >= position
+                density[mask] = layer_density
+            # For fronting layer with zero thickness, we can skip assignment
+            # as it's already initialized to 0
+        
+        position += thickness
+    
+    return z, density
+
+
 def plot_global_scan_best_fit_with_uncertainty(scan_results, scan_dir, 
                                               scanned_params=None,
                                               uncertainty_percent=10,
@@ -1897,7 +2011,8 @@ def plot_global_scan_best_fit_with_uncertainty(scan_results, scan_dir,
                                               zoom_ylim=None,
                                               sld_xlim=None, 
                                               profile_shift=0, 
-                                              save_path=None):
+                                              save_path=None,
+                                              individual_subdir="individual_results"):
     """
     Plot the best fit reflectivity curve and SLD profile with shading to indicate
     uncertainty corresponding to a specified percent change in goodness of fit
@@ -1917,6 +2032,7 @@ def plot_global_scan_best_fit_with_uncertainty(scan_results, scan_dir,
         sld_xlim: X-axis limits for SLD profile plot as (min, max)
         profile_shift: Shift applied to depth profiles
         save_path: Path to save the figure (None to skip saving)
+        individual_subdir: Name of subdirectory containing individual objective files (default: "individual_results")
         
     Returns:
         matplotlib figure and axes
@@ -1958,7 +2074,7 @@ def plot_global_scan_best_fit_with_uncertainty(scan_results, scan_dir,
         print(f"{param} range: [{param_ranges[param]['min']:.4f}, {param_ranges[param]['max']:.4f}]")
     
     # Load the best fit objective
-    best_obj_path = os.path.join(scan_dir, f"{best_model_name}_objective.pkl")
+    best_obj_path = os.path.join(scan_dir, individual_subdir, f"{best_model_name}_objective.pkl")
     try:
         with open(best_obj_path, 'rb') as f:
             best_obj = pickle.load(f)
@@ -1995,7 +2111,7 @@ def plot_global_scan_best_fit_with_uncertainty(scan_results, scan_dir,
         # Load and evaluate each objective within threshold
         for _, row in within_threshold.iterrows():
             model_name = row['model_name']
-            obj_path = os.path.join(scan_dir, f"{model_name}_objective.pkl")
+            obj_path = os.path.join(scan_dir, individual_subdir, f"{model_name}_objective.pkl")
             
             try:
                 with open(obj_path, 'rb') as f:
@@ -2065,7 +2181,7 @@ def plot_global_scan_best_fit_with_uncertainty(scan_results, scan_dir,
         # Load and evaluate each structure within threshold
         for _, row in within_threshold.iterrows():
             model_name = row['model_name']
-            obj_path = os.path.join(scan_dir, f"{model_name}_objective.pkl")
+            obj_path = os.path.join(scan_dir, individual_subdir, f"{model_name}_objective.pkl")
             
             try:
                 with open(obj_path, 'rb') as f:
@@ -2134,6 +2250,247 @@ def plot_global_scan_best_fit_with_uncertainty(scan_results, scan_dir,
         print(f"Saved figure to {save_path}")
     
     return fig, axes
+
+
+def plot_global_scan_best_fit_with_uncertainty_density(scan_results, scan_dir, 
+                                                       scanned_params=None,
+                                                       uncertainty_percent=10,
+                                                       figure_size=(16, 12), 
+                                                       zoom_xlim=None, 
+                                                       zoom_ylim=None,
+                                                       density_xlim=None, 
+                                                       profile_shift=0, 
+                                                       save_path=None,
+                                                       individual_subdir="individual_results",
+                                                       debug=False):
+    """
+    Plot the best fit reflectivity curve and density profile with shading to indicate
+    uncertainty corresponding to a specified percent change in goodness of fit
+    from a global parameter scan.
+    
+    This function is similar to plot_global_scan_best_fit_with_uncertainty but plots
+    density profiles instead of SLD profiles in the third subplot.
+    
+    Args:
+        scan_results: DataFrame from load_global_scan_results
+        scan_dir: Directory where objective pickle files are saved
+        scanned_params: List of parameter names that were scanned (auto-detected if None)
+        uncertainty_percent: Percent change in goodness of fit to use for uncertainty (default: 10)
+        figure_size: Size of the figure as (width, height)
+        zoom_xlim: X-axis limits for zoomed reflectivity plot as (min, max)
+        zoom_ylim: Y-axis limits for zoomed reflectivity plot as (min, max)
+        density_xlim: X-axis limits for density profile plot as (min, max)
+        profile_shift: Shift applied to depth profiles
+        save_path: Path to save the figure (None to skip saving)
+        individual_subdir: Name of subdirectory containing individual objective files (default: "individual_results")
+        
+    Returns:
+        matplotlib figure and axes
+    """
+    
+    # Auto-detect scanned parameters if not provided
+    if scanned_params is None:
+        scanned_params = []
+        for col in scan_results.columns:
+            if col not in ['model_name', 'goodness_of_fit', 'repeat'] and \
+               not col.endswith('_value') and not col.endswith('_error'):
+                scanned_params.append(col)
+    
+    # Find the best fit
+    best_idx = scan_results['goodness_of_fit'].idxmin()
+    best_result = scan_results.loc[best_idx]
+    best_model_name = best_result['model_name']
+    best_gof = best_result['goodness_of_fit']
+    
+    print(f"Best fit: χ² = {best_gof:.4f}")
+    for param in scanned_params:
+        print(f"  {param}: {best_result[param]:.4f}")
+    
+    # Calculate the threshold for uncertainty
+    gof_threshold = best_gof * (1 + uncertainty_percent/100)
+    
+    # Find all results within the threshold
+    within_threshold = scan_results[scan_results['goodness_of_fit'] <= gof_threshold]
+    print(f"\nFound {len(within_threshold)} fits within {uncertainty_percent}% GOF threshold")
+    
+    # Get parameter ranges within threshold
+    param_ranges = {}
+    for param in scanned_params:
+        param_ranges[param] = {
+            'min': within_threshold[param].min(),
+            'max': within_threshold[param].max(),
+            'best': best_result[param]
+        }
+        print(f"{param} range: [{param_ranges[param]['min']:.4f}, {param_ranges[param]['max']:.4f}]")
+    
+    # Load the best fit objective
+    best_obj_path = os.path.join(scan_dir, individual_subdir, f"{best_model_name}_objective.pkl")
+    try:
+        with open(best_obj_path, 'rb') as f:
+            best_obj = pickle.load(f)
+    except Exception as e:
+        print(f"Error loading best objective: {str(e)}")
+        return None, None
+    
+    # Create a 3-row figure
+    fig, axes = plt.subplots(3, 1, figsize=figure_size)
+    ax_refl = axes[0]      # Full reflectivity plot
+    ax_refl_zoom = axes[1] # Zoomed reflectivity plot
+    ax_density = axes[2]   # Density profiles
+    
+    # Get data from best fit objective
+    data = best_obj.data
+    best_model_y = best_obj.model(data.data[0])
+    
+    # Get best fit structure for density profile
+    structure = getattr(best_obj.model, 'structure', None)
+    if structure is None:
+        print("Error: No structure found in best fit objective")
+        return fig, axes
+    
+    # ---- Plot full reflectivity ----
+    ax_refl.plot(data.data[0], data.data[1], 'o', markersize=3, color='black', label='Data')
+    ax_refl.plot(data.data[0], best_model_y, '-', linewidth=2, color='blue', 
+                label='Best fit')
+    
+    # Calculate uncertainty bands for reflectivity
+    if len(within_threshold) > 1:
+        min_model_y = np.full_like(best_model_y, np.inf)
+        max_model_y = np.full_like(best_model_y, -np.inf)
+        
+        # Load and evaluate each objective within threshold
+        for _, row in within_threshold.iterrows():
+            model_name = row['model_name']
+            obj_path = os.path.join(scan_dir, individual_subdir, f"{model_name}_objective.pkl")
+            
+            try:
+                with open(obj_path, 'rb') as f:
+                    obj = pickle.load(f)
+                
+                model_y = obj.model(data.data[0])
+                min_model_y = np.minimum(min_model_y, model_y)
+                max_model_y = np.maximum(max_model_y, model_y)
+                
+            except Exception as e:
+                print(f"Warning: Could not load {model_name}: {str(e)}")
+                continue
+        
+        # Add uncertainty band
+        if not (np.isinf(min_model_y).any() or np.isinf(max_model_y).any()):
+            ax_refl.fill_between(data.data[0], min_model_y, max_model_y,
+                               color='blue', alpha=0.2,
+                               label=f'Uncertainty ({uncertainty_percent}% GOF)')
+    
+    ax_refl.set_yscale('log')
+    ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
+    ax_refl.set_ylabel('Reflectivity')
+    ax_refl.legend(loc='best')
+    ax_refl.grid(True, alpha=0.3)
+    
+    # ---- Plot zoomed reflectivity ----
+    ax_refl_zoom.plot(data.data[0], data.data[1], 'o', markersize=3, color='black', label='Data')
+    ax_refl_zoom.plot(data.data[0], best_model_y, '-', linewidth=2, color='blue',
+                     label='Best fit')
+    
+    if len(within_threshold) > 1 and not (np.isinf(min_model_y).any() or np.isinf(max_model_y).any()):
+        ax_refl_zoom.fill_between(data.data[0], min_model_y, max_model_y,
+                                 color='blue', alpha=0.2,
+                                 label=f'Uncertainty ({uncertainty_percent}% GOF)')
+    
+    ax_refl_zoom.set_yscale('log')
+    if zoom_xlim is not None:
+        ax_refl_zoom.set_xlim(zoom_xlim)
+    if zoom_ylim is not None:
+        ax_refl_zoom.set_ylim(zoom_ylim)
+    ax_refl_zoom.set_xlabel(r'Q ($\AA^{-1}$)')
+    ax_refl_zoom.set_ylabel('Reflectivity')
+    ax_refl_zoom.legend(loc='best')
+    ax_refl_zoom.grid(True, alpha=0.3)
+    
+    # ---- Plot density profiles ----
+    # Get best fit density profile
+    z = np.linspace(-10, 300, 1000)
+    z, best_density = density_profile_from_scan_results(best_result, structure, z, debug=debug)
+    
+    # Flip z-axis so Silicon is at 0
+    max_depth = np.max(z)
+    flipped_z = max_depth - z
+    
+    ax_density.plot(flipped_z + profile_shift, best_density, '-', linewidth=2, color='blue',
+                   label='Best fit')
+    
+    # Calculate uncertainty bands for density profile
+    if len(within_threshold) > 1:
+        min_density = np.full_like(best_density, np.inf)
+        max_density = np.full_like(best_density, -np.inf)
+        
+        # Load and evaluate each structure within threshold
+        for _, row in within_threshold.iterrows():
+            model_name = row['model_name']
+            obj_path = os.path.join(scan_dir, individual_subdir, f"{model_name}_objective.pkl")
+            
+            try:
+                with open(obj_path, 'rb') as f:
+                    obj = pickle.load(f)
+                
+                current_structure = getattr(obj.model, 'structure', None)
+                if current_structure is not None:
+                    current_z, current_density = density_profile_from_scan_results(row, current_structure, z, debug=False)
+                    
+                    min_density = np.minimum(min_density, current_density)
+                    max_density = np.maximum(max_density, current_density)
+                
+            except Exception as e:
+                print(f"Warning: Could not process density for {model_name}: {str(e)}")
+                continue
+        
+        # Add uncertainty band
+        if not (np.isinf(min_density).any() or np.isinf(max_density).any()):
+            ax_density.fill_between(flipped_z + profile_shift, min_density, max_density,
+                                   color='blue', alpha=0.2,
+                                   label=f'Uncertainty ({uncertainty_percent}% GOF)')
+    
+    if density_xlim is not None:
+        ax_density.set_xlim(density_xlim)
+    else:
+        ax_density.set_xlim(0, max_depth + profile_shift)
+    
+    ax_density.set_xlabel(r'Distance from Si ($\AA$)')
+    ax_density.set_ylabel(r'Density (g/cm³)')
+    ax_density.legend(loc='best')
+    ax_density.grid(True, alpha=0.3)
+    
+    # Add annotation with parameter ranges
+    uncertainty_text = f"Parameter ranges for {uncertainty_percent}% GOF uncertainty:\n"
+    for param in scanned_params:
+        uncertainty_text += f"{param}: {param_ranges[param]['best']:.4f} "
+        uncertainty_text += f"[{param_ranges[param]['min']:.4f}, {param_ranges[param]['max']:.4f}]\n"
+    
+    ax_density.text(0.02, 0.98, uncertainty_text,
+                   transform=ax_density.transAxes, ha='left', va='top',
+                   fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
+    
+    # Add orientation note
+    ax_density.text(0.98, 0.02, "Density profile flipped: Si at 0, air at max depth",
+                   transform=ax_density.transAxes, ha='right', va='bottom',
+                   fontsize=8, bbox=dict(facecolor='white', alpha=0.7))
+    
+    # Add title
+    param_str = ", ".join(scanned_params)
+    fig.suptitle(f"Best Fit with {uncertainty_percent}% GOF Uncertainty (Density)\nGlobal Scan: {param_str}", 
+                fontsize=14)
+    
+    # Adjust layout
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.93)  # Make room for suptitle
+    
+    # Save figure if requested
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved figure to {save_path}")
+    
+    return fig, axes
+
 
 def log_fitting_results_with_sweep(objective, model_name, results_df, swept_param, swept_value):
     """
