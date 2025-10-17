@@ -594,6 +594,7 @@ __all__ = [
     "compare_sweep_profiles",
     "compare_sweep_reflectivity",
     "plot_best_fit_with_uncertainty",
+    "plot_best_fit_with_uncertainty_density",
     # IO / summaries / scans
     "load_parameter_sweep",
     "get_best_fit_with_uncertainty",
@@ -1891,9 +1892,406 @@ def plot_best_fit_with_uncertainty(sweep_info, uncertainty_percent=10,
     return fig, axes
 
 
+def plot_best_fit_with_uncertainty_density(sweep_info, uncertainty_percent=10, 
+                                         figure_size=(16, 12), zoom_xlim=None, zoom_ylim=None,
+                                         density_xlim=None, profile_shift=0, save_path=None, debug=False):
+    """
+    Plot the best fit reflectivity curve and density profile with shading to indicate
+    uncertainty corresponding to a specified percent change in goodness of fit.
+    
+    Args:
+        sweep_info: Dictionary from run_parameter_sweep containing sweep results
+        uncertainty_percent: Percent change in goodness of fit to use for uncertainty (default: 10)
+        figure_size: Size of the figure as (width, height)
+        zoom_xlim: X-axis limits for zoomed reflectivity plot as (min, max)
+        zoom_ylim: Y-axis limits for zoomed reflectivity plot as (min, max)
+        density_xlim: X-axis limits for density profile plot as (min, max)
+        profile_shift: Shift applied to depth profiles
+        save_path: Path to save the figure (None to skip saving)
+        debug: If True, print debugging information
+        
+    Returns:
+        matplotlib figure and axes
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import matplotlib.patches as patches
+    
+    # Check if best fit exists
+    if 'best_fit' not in sweep_info:
+        raise ValueError("No best fit found in sweep_info")
+    
+    # Get the parameter name and best fit value
+    param_name = sweep_info['param_name']
+    best_idx = sweep_info['best_fit']['index']
+    best_value = sweep_info['parameter_values'][best_idx]
+    best_gof = sweep_info['goodness_of_fit'][best_idx]
+    
+    # Calculate the threshold for uncertainty
+    gof_threshold = best_gof * (1 + uncertainty_percent/100)
+    
+    # Find parameter values within the threshold
+    values_within_threshold = []
+    indices_within_threshold = []
+    
+    for i, (value, gof) in enumerate(zip(sweep_info['parameter_values'], sweep_info['goodness_of_fit'])):
+        if gof <= gof_threshold:
+            values_within_threshold.append(value)
+            indices_within_threshold.append(i)
+    
+    # Get the min and max values within threshold
+    if values_within_threshold:
+        min_value = min(values_within_threshold)
+        max_value = max(values_within_threshold)
+    else:
+        # If no values within threshold, just use the best value
+        min_value = best_value
+        max_value = best_value
+    
+    # Create a 3-row figure similar to modelcomparisonplot
+    fig, axes = plt.subplots(3, 1, figsize=figure_size)
+    ax_refl = axes[0]      # Full reflectivity plot
+    ax_refl_zoom = axes[1] # Zoomed reflectivity plot
+    ax_density = axes[2]   # Density profiles
+    
+    # Get reference objective (best fit)
+    best_obj = sweep_info['all_results'][best_idx]['objective']
+    data = best_obj.data
+    
+    # Get best fit model and data
+    best_model_y = best_obj.model(data.data[0])
+    
+    # ---- Plot full reflectivity ----
+    # Plot data points
+    ax_refl.plot(data.data[0], data.data[1], 'o', markersize=3, color='black', label='Data')
+    
+    # Plot best fit
+    ax_refl.plot(data.data[0], best_model_y, '-', linewidth=2, color='blue', 
+               label=f'Best fit ({param_name}={best_value})')
+    
+    # Calculate uncertainty band for reflectivity
+    min_model_y = None
+    max_model_y = None
+    
+    if len(indices_within_threshold) > 1:
+        # Initialize with the first model within threshold
+        first_idx = indices_within_threshold[0]
+        first_obj = sweep_info['all_results'][first_idx]['objective']
+        first_model_y = first_obj.model(data.data[0])
+        
+        min_model_y = first_model_y.copy()
+        max_model_y = first_model_y.copy()
+        
+        # Find min and max for each Q point across all models within threshold
+        for idx in indices_within_threshold[1:]:
+            obj = sweep_info['all_results'][idx]['objective']
+            model_y = obj.model(data.data[0])
+            
+            min_model_y = np.minimum(min_model_y, model_y)
+            max_model_y = np.maximum(max_model_y, model_y)
+    
+    # Add uncertainty band if calculated
+    if min_model_y is not None and max_model_y is not None:
+        ax_refl.fill_between(data.data[0], min_model_y, max_model_y, 
+                           color='blue', alpha=0.2, 
+                           label=f'Uncertainty ({uncertainty_percent}% GOF)')
+    
+    # Set up full reflectivity plot
+    ax_refl.set_yscale('log')
+    ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
+    ax_refl.set_ylabel('Reflectivity (a.u)')
+    ax_refl.legend(loc='upper right')
+    
+    # ---- Plot zoomed reflectivity ----
+    # Plot data points
+    ax_refl_zoom.plot(data.data[0], data.data[1], 'o', markersize=3, color='black', label='Data')
+    
+    # Plot best fit
+    ax_refl_zoom.plot(data.data[0], best_model_y, '-', linewidth=2, color='blue', 
+                    label=f'Best fit ({param_name}={best_value})')
+    
+    # Add uncertainty band if calculated
+    if min_model_y is not None and max_model_y is not None:
+        ax_refl_zoom.fill_between(data.data[0], min_model_y, max_model_y, 
+                                color='blue', alpha=0.2, 
+                                label=f'Uncertainty ({uncertainty_percent}% GOF)')
+    
+    # Set custom x limits for zoom
+    if zoom_xlim is None:
+        zoom_xlim = (0, 0.05)  # Default zoom to low-Q region
+    
+    ax_refl_zoom.set_xlim(zoom_xlim)
+    
+    # Set linear scale for zoomed view
+    ax_refl_zoom.set_yscale('linear')
+    
+    # Set custom y limits for zoom if provided
+    if zoom_ylim is not None:
+        ax_refl_zoom.set_ylim(zoom_ylim)
+    else:
+        # Auto-determine y limits based on data in the zoom region
+        mask = (data.data[0] >= zoom_xlim[0]) & (data.data[0] <= zoom_xlim[1])
+        if np.any(mask):
+            y_in_range = data.data[1][mask]
+            best_y_in_range = best_model_y[mask]
+            
+            # Also include uncertainty ranges if available
+            all_y = []
+            all_y.extend(y_in_range)
+            all_y.extend(best_y_in_range)
+            
+            if min_model_y is not None and max_model_y is not None:
+                all_y.extend(min_model_y[mask])
+                all_y.extend(max_model_y[mask])
+            
+            # Set y limits with margin
+            y_min = np.min(all_y) * 0.9
+            y_max = np.max(all_y) * 1.1
+            ax_refl_zoom.set_ylim(y_min, y_max)
+    
+    ax_refl_zoom.set_xlabel(r'Q ($\AA^{-1}$)')
+    ax_refl_zoom.set_ylabel('Reflectivity (linear)')
+    ax_refl_zoom.legend(loc='best')
+    
+    # Add a rectangle to the full view showing the zoom region
+    rect = patches.Rectangle((zoom_xlim[0], 10**(np.log10(ax_refl.get_ylim()[0]) * 0.9)), 
+                           zoom_xlim[1]-zoom_xlim[0], 
+                           10**(np.log10(ax_refl.get_ylim()[1]) * 0.9) - 10**(np.log10(ax_refl.get_ylim()[0]) * 0.9), 
+                           linewidth=1, edgecolor='r', facecolor='none',
+                           alpha=0.5)
+    ax_refl.add_patch(rect)
+    
+    # Annotate the zoom region
+    ax_refl.annotate('Zoom\nRegion', 
+                    xy=(zoom_xlim[0] + (zoom_xlim[1]-zoom_xlim[0])/2, 
+                        10**(np.log10(ax_refl.get_ylim()[0]) * 0.95)),
+                    xytext=(zoom_xlim[0] + (zoom_xlim[1]-zoom_xlim[0])/2, 
+                            10**(np.log10(ax_refl.get_ylim()[0]) * 0.95)),
+                    ha='center', va='bottom',
+                    color='red', fontsize=8)
+    
+    # ---- Plot density profiles ----
+    # Get best fit structure
+    best_structure = getattr(best_obj.model, 'structure', None)
+    
+    if best_structure is not None:
+        # Create a mock scan_result_row for the best fit
+        # We need to extract the density parameters from the best fit objective
+        best_scan_row = {}
+        
+        # Get all parameters from the best fit objective
+        if debug:
+            print("All parameters in best_obj:")
+            for param in best_obj.parameters:
+                print(f"  {param.name} = {param}")
+        
+        # Track density parameters to handle duplicates
+        density_count = {'SiO2': 0, 'Si': 0, 'other': 0}
+        
+        for param in best_obj.parameters.flattened():
+            param_name_full = param.name
+            if debug:
+                print(f"  Checking parameter: '{param_name_full}'")
+            
+            if 'density' in param_name_full.lower():
+                # Extract the base parameter name (e.g., 'Peptoid1_density' from 'Peptoid1_density=0.963')
+                if '=' in param_name_full:
+                    base_name = param_name_full.split('=')[0].strip()
+                else:
+                    base_name = param_name_full
+                
+                # Handle the case where multiple parameters have the same name 'density'
+                if base_name == 'density':
+                    # Use the parameter's string representation to identify the component
+                    param_str = str(param)
+                    if debug:
+                        print(f"    Parameter string: {param_str}")
+                    
+                    # Look for component names in the parameter's context
+                    # We need to find which component this density parameter belongs to
+                    # by looking at the parameter's position in the structure
+                    
+                    # Get the parameter's index in the flattened list to determine context
+                    param_index = list(best_obj.parameters.flattened()).index(param)
+                    if debug:
+                        print(f"    Parameter index: {param_index}")
+                    
+                    # Based on the debug output, we know the order:
+                    # SiO2 density comes before Si density in the parameter list
+                    if density_count['SiO2'] == 0 and density_count['Si'] == 0:
+                        # First density parameter should be SiO2
+                        base_name = 'SiO2_density'
+                        density_count['SiO2'] += 1
+                        if debug:
+                            print(f"    Assigned to SiO2 (first density parameter)")
+                    elif density_count['SiO2'] == 1 and density_count['Si'] == 0:
+                        # Second density parameter should be Si
+                        base_name = 'Si_density'
+                        density_count['Si'] += 1
+                        if debug:
+                            print(f"    Assigned to Si (second density parameter)")
+                    else:
+                        # Fallback
+                        base_name = f'density_{density_count["other"]}'
+                        density_count['other'] += 1
+                        if debug:
+                            print(f"    Assigned to other (fallback)")
+                
+                best_scan_row[base_name] = float(param)
+                if debug:
+                    print(f"  Added density parameter: {base_name} = {float(param)}")
+        
+        # Get best density profile
+        z = np.linspace(-10, 300, 1000)
+        if debug:
+            print(f"Passing to density_profile_from_scan_results: {best_scan_row}")
+        z, best_density = density_profile_from_scan_results(best_scan_row, best_structure, z, debug=debug)
+        
+        # MODIFIED: Flip the density profile by:
+        # 1. Find the maximum depth value (will be the new origin for Silicon)
+        max_depth = np.max(z)
+        # 2. Create flipped z-values so Silicon is at 0 and air is at max
+        flipped_z = max_depth - z
+        
+        # Plot best fit density profile with flipped z-axis
+        ax_density.plot(flipped_z + profile_shift, best_density, '-', linewidth=2, color='blue',
+                      label=f'Best fit ({param_name}={best_value})')
+        
+        # Calculate uncertainty bands for density profile
+        min_density = None
+        max_density = None
+        
+        if len(indices_within_threshold) > 1:
+            # Initialize arrays for min/max density values
+            min_density = np.full_like(best_density, np.inf)
+            max_density = np.full_like(best_density, -np.inf)
+            
+            # Find min and max density values across all models within threshold
+            for idx in indices_within_threshold:
+                obj = sweep_info['all_results'][idx]['objective']
+                structure = getattr(obj.model, 'structure', None)
+                
+                if structure is not None:
+                    try:
+                        # Create a mock scan_result_row for this fit
+                        current_scan_row = {}
+                        
+                        # Track density parameters to handle duplicates
+                        density_count = {'SiO2': 0, 'Si': 0, 'other': 0}
+                        
+                        # Get all parameters from this objective
+                        for param in obj.parameters.flattened():
+                            param_name_full = param.name
+                            if 'density' in param_name_full.lower():
+                                # Extract the base parameter name
+                                if '=' in param_name_full:
+                                    base_name = param_name_full.split('=')[0].strip()
+                                else:
+                                    base_name = param_name_full
+                                
+                                # Handle the case where multiple parameters have the same name 'density'
+                                if base_name == 'density':
+                                    # Use the same logic as the best fit extraction
+                                    if density_count['SiO2'] == 0 and density_count['Si'] == 0:
+                                        # First density parameter should be SiO2
+                                        base_name = 'SiO2_density'
+                                        density_count['SiO2'] += 1
+                                    elif density_count['SiO2'] == 1 and density_count['Si'] == 0:
+                                        # Second density parameter should be Si
+                                        base_name = 'Si_density'
+                                        density_count['Si'] += 1
+                                    else:
+                                        # Fallback
+                                        base_name = f'density_{density_count["other"]}'
+                                        density_count['other'] += 1
+                                
+                                current_scan_row[base_name] = float(param)
+                        
+                        # Get current density profile
+                        current_z, current_density = density_profile_from_scan_results(current_scan_row, structure, z, debug=False)
+                        
+                        # Update min/max values
+                        min_density = np.minimum(min_density, current_density)
+                        max_density = np.maximum(max_density, current_density)
+                    except Exception as e:
+                        print(f"Error calculating density profile for index {idx}: {str(e)}")
+        
+        # Add uncertainty bands if calculated - with flipped z-axis
+        if min_density is not None and max_density is not None:
+            # Check if we have valid values (not inf)
+            if not (np.isinf(min_density).any() or np.isinf(max_density).any()):
+                ax_density.fill_between(flipped_z + profile_shift, min_density, max_density, 
+                                      color='blue', alpha=0.2, 
+                                      label=f'Uncertainty ({uncertainty_percent}% GOF)')
+        
+        # Set up density plot
+        if density_xlim is not None:
+            # Adjust density_xlim if provided
+            ax_density.set_xlim(density_xlim)
+        else:
+            # If no specific limits are provided, ensure we show the full flipped range
+            ax_density.set_xlim(0, max_depth + profile_shift)
+        
+        # Modify x-axis label to reflect the new orientation
+        ax_density.set_xlabel(r'Distance from Si ($\AA$)')
+        ax_density.set_ylabel(r'Density (g/cm³)')
+        ax_density.legend(loc='best')
+        ax_density.grid(True, alpha=0.3)
+        
+        # Add annotation about uncertainty
+        min_val = min_value if min_value != best_value else None
+        max_val = max_value if max_value != best_value else None
+        
+        uncertainty_text = f"Parameter range for {uncertainty_percent}% GOF uncertainty:\n"
+        uncertainty_text += f"{param_name} = {best_value}"
+        
+        if min_val is not None or max_val is not None:
+            uncertainty_text += " ["
+            if min_val is not None:
+                uncertainty_text += f"{min_val}"
+            else:
+                uncertainty_text += f"{best_value}"
+            
+            uncertainty_text += " to "
+            
+            if max_val is not None:
+                uncertainty_text += f"{max_val}"
+            else:
+                uncertainty_text += f"{best_value}"
+            
+            uncertainty_text += "]"
+        
+        # Add text box with uncertainty information
+        ax_density.text(0.02, 0.98, uncertainty_text, 
+                      transform=ax_density.transAxes, ha='left', va='top', 
+                      fontsize=10, bbox=dict(facecolor='white', alpha=0.7))
+        
+        # Add a note about the orientation
+        ax_density.text(0.98, 0.02, "Density profile flipped: Si at 0, air at max depth", 
+                      transform=ax_density.transAxes, ha='right', va='bottom', 
+                      fontsize=8, bbox=dict(facecolor='white', alpha=0.7))
+    
+    # Add title with sweep parameter information
+    fig.suptitle(f"Best Fit with {uncertainty_percent}% GOF Uncertainty (Density) for {param_name}", fontsize=14)
+    
+    # Adjust layout
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.95)  # Make room for suptitle
+    
+    # Save figure if requested
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved figure to {save_path}")
+    
+    return fig, axes
+
+
 def density_profile_from_scan_results(scan_result_row, structure, z=None, debug=False):
     """
-    Extract density profile from scan results and structure.
+    Extract density profile from scan results and structure using refnx's error function logic.
+    
+    This function creates a density profile by mirroring refnx's sld_profile function,
+    replacing SLD values with density values while preserving proper interface smoothing.
     
     Args:
         scan_result_row: Single row from scan_results DataFrame containing parameter values
@@ -1905,102 +2303,110 @@ def density_profile_from_scan_results(scan_result_row, structure, z=None, debug=
         z: depth array
         density: density values at each depth
     """
-    # Get slabs from structure
-    slabs = structure.slabs()
+    import numpy as np
+    from refnx.reflect.structure import Erf, Step
     
-    if debug:
-        print(f"Scan result row: {scan_result_row.to_dict()}")
-        print(f"Number of slabs: {len(slabs)}")
+    # Extract density parameters from scan results
+    density_params = {}
     
-    # Initialize arrays for depth and density
-    if z is None:
-        # Calculate total thickness and create depth array
-        total_thickness = sum([slab[0] for slab in slabs[1:-1]])  # Exclude fronting/backing
-        z = np.linspace(-10, total_thickness + 50, 1000)
-    
-    density = np.zeros_like(z)
-    
-    # Calculate cumulative positions
-    position = 0
-    for i, slab in enumerate(slabs):
-        thickness = slab[0]  # thickness
-        
-        if debug:
-            print(f"\nSlab {i}: thickness={thickness}, SLD_real={slab[1]}, SLD_imag={slab[2]}")
-        
-        # Get density from scan results
-        layer_density = 0
-        
-        # Look for density parameters in the scan results
-        # The scan results contain the actual parameter values used for each fit
-        density_params = {}
+    # Handle both pandas Series and dictionary inputs
+    if hasattr(scan_result_row, 'index'):
+        # pandas Series
         for col in scan_result_row.index:
             if 'density' in col.lower() and col not in ['model_name', 'goodness_of_fit', 'repeat']:
                 density_params[col] = scan_result_row[col]
-        
-        if debug:
-            print(f"  Found density parameters in scan results: {density_params}")
-        
-        # Map density parameters to layers based on your naming convention
-        # Based on your debug output, the layer structure is:
-        # Layer 0: air (fronting) - thickness=0
-        # Layer 1: Peptoid2 - Peptoid2_density
-        # Layer 2: Peptoid1 - Peptoid1_density  
-        # Layer 3: SiO2 - density (2.6)
-        # Layer 4: Si (backing) - density (2.33)
-        
-        if i == 0:  # Air/fronting layer
-            layer_density = 0.0  # Air has zero density
-            if debug:
-                print(f"    Layer {i} (air): density = 0.0")
-        elif i == 1 and 'Peptoid2_density' in density_params:
-            layer_density = density_params['Peptoid2_density']
-            if debug:
-                print(f"    Layer {i} (Peptoid2): Peptoid2_density = {layer_density}")
-        elif i == 2 and 'Peptoid1_density' in density_params:
-            layer_density = density_params['Peptoid1_density']
-            if debug:
-                print(f"    Layer {i} (Peptoid1): Peptoid1_density = {layer_density}")
-        elif i == 3:  # SiO2 layer
-            # Look for the SiO2 density parameter
-            if 'density' in density_params:
-                layer_density = density_params['density']
-                if debug:
-                    print(f"    Layer {i} (SiO2): density = {layer_density}")
-            else:
-                layer_density = 2.6  # Default SiO2 density
-                if debug:
-                    print(f"    Layer {i} (SiO2): using default density = {layer_density}")
-        elif i == 4:  # Si backing layer
-            layer_density = 2.33  # Silicon density
-            if debug:
-                print(f"    Layer {i} (Si): density = {layer_density}")
-        else:
-            # Fallback for any other layers
-            layer_density = 0.0
-            if debug:
-                print(f"    Layer {i}: no specific mapping, using density = {layer_density}")
-        
-        if debug:
-            print(f"  Final layer_density: {layer_density}")
-        
-        # Assign density to corresponding depths
-        if thickness > 0:
-            # Normal layer with finite thickness
-            mask = (z >= position) & (z < position + thickness)
-            density[mask] = layer_density
-        else:
-            # Zero-thickness layer (usually backing/fronting)
-            # For backing layer, assign to all depths beyond current position
-            if i == len(slabs) - 1:  # Last layer (backing)
-                mask = z >= position
-                density[mask] = layer_density
-            # For fronting layer with zero thickness, we can skip assignment
-            # as it's already initialized to 0
-        
-        position += thickness
+    else:
+        # dictionary
+        for col, value in scan_result_row.items():
+            if 'density' in col.lower() and col not in ['model_name', 'goodness_of_fit', 'repeat']:
+                density_params[col] = value
     
-    return z, density
+    if debug:
+        print(f"  Found density parameters: {density_params}")
+    
+    # Get the slabs to understand the layer structure
+    slabs = structure.slabs()
+    
+    # Build density slabs array [thickness, density, roughness]
+    density_slabs = []
+    
+    for i, slab in enumerate(slabs):
+        thickness = slab[0]
+        roughness = slab[3]
+        
+        # Determine the density value for this layer
+        if i == 0:  # Air
+            density_value = 0.0
+        elif i == 1 and 'Peptoid2_density' in density_params:  # Peptoid2
+            density_value = density_params['Peptoid2_density']
+        elif i == 2 and 'Peptoid1_density' in density_params:  # Peptoid1
+            density_value = density_params['Peptoid1_density']
+        elif i == 3:  # SiO2
+            if 'SiO2_density' in density_params:
+                density_value = density_params['SiO2_density']
+            elif 'density' in density_params:
+                density_value = density_params['density']
+            else:
+                density_value = 2.6
+        elif i == 4:  # Si
+            if 'Si_density' in density_params:
+                density_value = density_params['Si_density']
+            else:
+                density_value = 2.33
+        else:
+            density_value = 0.0
+        
+        density_slabs.append([thickness, density_value, roughness])
+        
+        if debug:
+            print(f"Layer {i}: thickness={thickness}, density={density_value}, roughness={roughness}")
+    
+    # Convert to numpy array
+    density_slabs = np.array(density_slabs)
+    
+    # Adapted from refnx's sld_profile function (lines 2057-2103)
+    nlayers = np.size(density_slabs, 0) - 2
+    
+    # Work on a copy of the input array
+    layers = np.copy(density_slabs)
+    layers[:, 0] = np.fabs(density_slabs[:, 0])  # thickness
+    layers[:, 2] = np.fabs(density_slabs[:, 2])  # roughness
+    # Bounding layers should have zero thickness
+    layers[0, 0] = layers[-1, 0] = 0
+    
+    # Distance of each interface from the fronting interface
+    dist = np.cumsum(layers[:-1, 0])
+    zstart = -5 - 4 * np.fabs(density_slabs[1, 2])
+    zend = 5 + dist[-1] + 4 * layers[-1, 2]
+    
+    # Work out how much space the density profile should encompass
+    if z is None:
+        zed = np.linspace(zstart, zend, num=500)
+    else:
+        zed = np.asarray(z).astype(float, copy=False)
+    
+    # The output array - initialize with fronting layer density
+    density = np.ones_like(zed, dtype=float) * layers[0, 1]
+    
+    # Work out the step in density at an interface
+    delta_density = layers[1:, 1] - layers[:-1, 1]
+    
+    # Use erf for roughness function, but step if the roughness is zero
+    step_f = Step()
+    erf_f = Erf()
+    sigma = layers[1:, 2]
+    
+    # Accumulate the density of each step
+    for i in range(nlayers + 1):
+        f = erf_f
+        if sigma[i] == 0:
+            f = step_f
+        density += delta_density[i] * f(zed, scale=sigma[i], loc=dist[i])
+    
+    if debug:
+        print(f"Density profile range: {np.min(density):.2f} to {np.max(density):.2f}")
+    
+    return zed, density
 
 
 def plot_global_scan_best_fit_with_uncertainty(scan_results, scan_dir, 
