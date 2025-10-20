@@ -14,24 +14,27 @@ class LariatDataProcessor:
     A class for processing Lariat datacube files and extracting/analyzing spectra.
     """
     
-    def __init__(self, filepath=None, pixel_size_um=50.0):
-        """
-        Initialize the LariatDataProcessor.
-        
-        Parameters:
-        -----------
-        filepath : str, optional
-            Path to the HDF5 file to load immediately
-        pixel_size_um : float, optional
-            Size of each pixel in micrometers. Default is 50.0 um
-        """
-        self.data = None
-        self.metadata = None
-        self.filepath = filepath
-        self.pixel_size_um = pixel_size_um  # Add pixel size parameter
-        
-        if filepath is not None:
-            self.load_data(filepath)
+    def __init__(self, filepath=None, pixel_size_um=50.0, energy_range=None):
+            """
+            Initialize the LariatDataProcessor.
+            
+            Parameters:
+            -----------
+            filepath : str, optional
+                Path to the HDF5 file to load immediately
+            pixel_size_um : float, optional
+                Size of each pixel in micrometers. Default is 50.0 um
+            energy_range : tuple, optional
+                (min_energy, max_energy) to load only a subset of energies.
+                If None, loads all energies from the file.
+            """
+            self.data = None
+            self.metadata = None
+            self.filepath = filepath
+            self.pixel_size_um = pixel_size_um
+            
+            if filepath is not None:
+                self.load_data(filepath, energy_range=energy_range)
     
     def set_pixel_size(self, pixel_size_um):
         """
@@ -101,7 +104,7 @@ class LariatDataProcessor:
         extent = [0, width * self.pixel_size_um, 0, height * self.pixel_size_um]
         return extent
     
-    def load_data(self, filepath):
+    def load_data(self, filepath, energy_range=None):
         """
         Load lariat datacube from HDF5 file.
         
@@ -109,11 +112,14 @@ class LariatDataProcessor:
         -----------
         filepath : str
             Path to the HDF5 file
+        energy_range : tuple, optional
+            (min_energy, max_energy) to load only a subset of energies.
+            If None, loads all energies from the file.
         """
         self.filepath = filepath
-        self.data, self.metadata = self._read_lariat_datacube(filepath)
+        self.data, self.metadata = self._read_lariat_datacube(filepath, energy_range=energy_range)
     
-    def _read_lariat_datacube(self, filepath):
+    def _read_lariat_datacube(self, filepath, energy_range=None):
         """
         Read lariat datacube from HDF5 file.
         
@@ -121,6 +127,9 @@ class LariatDataProcessor:
         -----------
         filepath : str
             Path to the HDF5 file
+        energy_range : tuple, optional
+            (min_energy, max_energy) to load only a subset of energies.
+            If None, loads all energies from the file.
             
         Returns:
         --------
@@ -131,13 +140,34 @@ class LariatDataProcessor:
         """
         f = h5py.File(filepath)
         metadata = json.loads(f['File Version'].attrs['Meta Data'])
-        energies = np.arange(*metadata['BeamEnergy'])
+        all_energies = np.arange(*metadata['BeamEnergy'])
+        
+        # Apply energy range filter if specified
+        if energy_range is not None:
+            min_energy, max_energy = energy_range
+            energy_mask = (all_energies >= min_energy) & (all_energies <= max_energy)
+            energy_indices = np.where(energy_mask)[0]
+            energies = all_energies[energy_mask]
+            
+            if len(energies) == 0:
+                raise ValueError(f"No energies found in range {min_energy} - {max_energy} eV. "
+                            f"Available range: {all_energies.min():.2f} - {all_energies.max():.2f} eV")
+            
+            print(f"Loading {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
+            print(f"(Requested range: {min_energy:.2f} - {max_energy:.2f} eV)")
+        else:
+            energy_indices = np.arange(len(all_energies))
+            energies = all_energies
+            print(f"Loading all {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
+        
         image_list = []
         energy_list = []
-        for i, energy in enumerate(energies):
-            image = f['Images'][f'Image{i}']['ImagePlane0']
+        for idx in energy_indices:
+            image = f['Images'][f'Image{idx}']['ImagePlane0'][()]
             image_list.append(image)
-            energy_list.append(energy)
+            energy_list.append(energies[idx - energy_indices[0]])
+        
+        f.close()
         return xr.DataArray(image_list, dims=['energy','pix_y','pix_x'], coords={'energy':energy_list}), metadata
     
     def crop_image(self, crop_region=None, interactive=False, preview_energy=None, 
@@ -612,7 +642,8 @@ class LariatDataProcessor:
         
         return fig, ax
     
-    def extract_roi_spectrum(self, roi, plot=False, energy_slice=None, use_um=True, roi_in_um=False):
+    def extract_roi_spectrum(self, roi, plot=False, energy_slice=None, use_um=True, roi_in_um=False,
+                             save_data=False, save_path=None, save_format='csv', spectrum_label=None):
         """
         Extract the average spectrum from a region of interest and optionally plot it.
         
@@ -629,6 +660,14 @@ class LariatDataProcessor:
             If True, display image coordinates in micrometers
         roi_in_um : bool, optional
             If True, roi is specified in micrometers. If False, in pixels.
+        save_data : bool, optional
+            If True, save the spectrum to files
+        save_path : str, optional
+            Directory path to save files. If None, saves to current directory
+        save_format : str, optional
+            Format to save data ('csv', 'txt', or 'npz'). Default is 'csv'
+        spectrum_label : str, optional
+            Label for the spectrum used in filenames. If None, uses 'spectrum'
             
         Returns:
         --------
@@ -732,6 +771,61 @@ class LariatDataProcessor:
             
             plt.tight_layout()
             plt.show()
+        
+        # Save data if requested
+        if save_data:
+            import os
+            
+            if save_path is None:
+                save_path = os.getcwd()
+            
+            # Create directory if it doesn't exist
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Use default label if none provided
+            if spectrum_label is None:
+                spectrum_label = 'spectrum'
+            
+            # Clean label for filename (remove spaces and special characters)
+            clean_label = "".join(c for c in spectrum_label if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            clean_label = clean_label.replace(' ', '_')
+            
+            if save_format.lower() == 'csv':
+                # Save spectrum
+                filename = f"{clean_label}.csv"
+                filepath = os.path.join(save_path, filename)
+                np.savetxt(filepath, spectrum_np, delimiter=',', 
+                        header='Energy,Intensity', comments='')
+                
+                # Save ROI info
+                info_filename = f"{clean_label}_info.txt"
+                info_filepath = os.path.join(save_path, info_filename)
+                with open(info_filepath, 'w') as f:
+                    f.write(f"Spectrum Information for {spectrum_label}\n")
+                    f.write(f"ROI: {roi}\n")
+                    if roi_in_um:
+                        f.write(f"ROI units: micrometers\n")
+                        f.write(f"ROI (pixels): {roi_pixels}\n")
+                    else:
+                        f.write(f"ROI units: pixels\n")
+            
+            elif save_format.lower() == 'txt':
+                # Save as space-delimited text file
+                filename = f"{clean_label}.txt"
+                filepath = os.path.join(save_path, filename)
+                np.savetxt(filepath, spectrum_np, delimiter=' ', 
+                        header='Energy Intensity')
+            
+            elif save_format.lower() == 'npz':
+                # Save as compressed numpy array
+                filename = f"{clean_label}.npz"
+                filepath = os.path.join(save_path, filename)
+                np.savez_compressed(filepath,
+                                spectrum=spectrum_np,
+                                roi=roi,
+                                roi_in_um=roi_in_um)
+            
+            print(f"Data saved to {save_path} in {save_format.upper()} format")
         
         return spectrum_xr, spectrum_np
     
@@ -1080,7 +1174,8 @@ class LariatDataProcessor:
     
     def extract_and_process_spectrum(self, roi, pre_edge_norm_range=None, pre_edge_sub_range=None, 
                                     post_edge_range=None, do_pre_edge_norm=True, do_pre_edge_sub=True,
-                                    do_post_edge_norm=True, plot=False, energy_slice=None):
+                                    do_post_edge_norm=True, plot=False, energy_slice=None, 
+                                    save_data=False, save_path=None, save_format='csv', spectrum_label=None):
         """
         Extract a spectrum from an ROI and apply processing steps in this order:
         1. Normalize by pre-edge slope
@@ -1110,6 +1205,14 @@ class LariatDataProcessor:
             If True, plot the extracted and processed spectra
         energy_slice : float, optional
             If provided, also shows the 2D image at this energy with the ROI
+        save_data : bool, optional
+            If True, save the processed spectrum to files
+        save_path : str, optional
+            Directory path to save files. If None, saves to current directory
+        save_format : str, optional
+            Format to save data ('csv', 'txt', or 'npz'). Default is 'csv'
+        spectrum_label : str, optional
+            Label for the spectrum used in filenames. If None, uses 'spectrum'
             
         Returns:
         --------
@@ -1322,6 +1425,76 @@ class LariatDataProcessor:
             
             plt.tight_layout()
             plt.show()
+        
+        # Save data if requested
+        if save_data:
+            import os
+            
+            if save_path is None:
+                save_path = os.getcwd()
+            
+            # Create directory if it doesn't exist
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Use default label if none provided
+            if spectrum_label is None:
+                spectrum_label = 'spectrum'
+            
+            # Clean label for filename (remove spaces and special characters)
+            clean_label = "".join(c for c in spectrum_label if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            clean_label = clean_label.replace(' ', '_')
+            
+            if save_format.lower() == 'csv':
+                # Save original spectrum
+                orig_filename = f"{clean_label}_original.csv"
+                orig_filepath = os.path.join(save_path, orig_filename)
+                np.savetxt(orig_filepath, spectrum_np, delimiter=',', 
+                        header='Energy,Intensity', comments='')
+                
+                # Save processed spectrum
+                proc_filename = f"{clean_label}_processed.csv"
+                proc_filepath = os.path.join(save_path, proc_filename)
+                np.savetxt(proc_filepath, spectrum_final, delimiter=',', 
+                        header='Energy,Processed_Intensity', comments='')
+                
+                # Save processing info
+                info_filename = f"{clean_label}_processing_info.txt"
+                info_filepath = os.path.join(save_path, info_filename)
+                with open(info_filepath, 'w') as f:
+                    f.write(f"Processing Information for {spectrum_label}\n")
+                    f.write(f"ROI: {roi}\n")
+                    f.write(f"Pre-edge normalization: {do_pre_edge_norm}\n")
+                    f.write(f"Pre-edge subtraction: {do_pre_edge_sub}\n")
+                    f.write(f"Post-edge normalization: {do_post_edge_norm}\n")
+                    f.write(f"Pre-edge norm range: {pre_edge_norm_range}\n")
+                    f.write(f"Pre-edge sub range: {pre_edge_sub_range}\n")
+                    f.write(f"Post-edge range: {post_edge_range}\n")
+                    for key, value in processing_info.items():
+                        f.write(f"{key}: {value}\n")
+            
+            elif save_format.lower() == 'txt':
+                # Save as space-delimited text files
+                orig_filename = f"{clean_label}_original.txt"
+                orig_filepath = os.path.join(save_path, orig_filename)
+                np.savetxt(orig_filepath, spectrum_np, delimiter=' ', 
+                        header='Energy Intensity')
+                
+                proc_filename = f"{clean_label}_processed.txt"
+                proc_filepath = os.path.join(save_path, proc_filename)
+                np.savetxt(proc_filepath, spectrum_final, delimiter=' ', 
+                        header='Energy Processed_Intensity')
+            
+            elif save_format.lower() == 'npz':
+                # Save as compressed numpy arrays
+                data_filename = f"{clean_label}_data.npz"
+                data_filepath = os.path.join(save_path, data_filename)
+                np.savez_compressed(data_filepath,
+                                original_spectrum=spectrum_np,
+                                processed_spectrum=spectrum_final,
+                                processing_info=processing_info,
+                                roi=roi)
+            
+            print(f"Data saved to {save_path} in {save_format.upper()} format")
         
         return spectrum_xr, spectrum_np, spectrum_final, processing_info
 
