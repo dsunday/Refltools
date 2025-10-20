@@ -2339,7 +2339,11 @@ class LariatDataProcessor:
         if spectrum_np is None:
             if roi is not None:
                 print("Extracting spectrum from provided ROI...")
-                spectrum_xr, spectrum_np = self.extract_roi_spectrum(roi, plot=False)
+                # Use extract_processed_roi_spectra to ensure consistency
+                spectra_dict, roi_info = self.extract_processed_roi_spectra(
+                    [roi], roi_labels=['spectrum'], plot=False, verbose=False
+                )
+                spectrum_np = spectra_dict['spectrum']
             else:
                 print("No spectrum or ROI provided. Using average spectrum from entire image...")
                 # Create a spectrum from the entire image
@@ -2400,13 +2404,25 @@ class LariatDataProcessor:
         print(f"FPS: {actual_fps:.2f}, interval: {interval_ms:.1f} ms per frame")
         print(f"Animation energy range: {animation_energies[0]:.2f} to {animation_energies[-1]:.2f} eV")
         
+        # Calculate global dynamic range across all animation frames
+        print("Calculating global dynamic range across all frames...")
+        all_frame_values = []
+        for idx in animation_indices:
+            frame_data = data_to_use.isel(energy=idx).values
+            all_frame_values.append(frame_data.ravel())
+        all_frame_values = np.concatenate(all_frame_values)
+        
+        # Calculate global vmin/vmax using percentiles
+        global_vmin, global_vmax = np.nanpercentile(all_frame_values, contrast_percentiles)
+        print(f"Global dynamic range: {global_vmin:.4f} to {global_vmax:.4f}")
+        
         # Set up the figure with two subplots
         fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=(15, 5),
                                             gridspec_kw={'width_ratios': [1, 2]})
         
-        # Initialize the image plot with first animation frame
+        # Initialize the image plot with first animation frame using global range
         img_data = data_to_use.isel(energy=animation_indices[0])
-        img = ax_img.imshow(img_data, cmap='viridis', origin='lower')
+        img = ax_img.imshow(img_data, cmap='viridis', origin='lower', vmin=global_vmin, vmax=global_vmax)
         img_title = ax_img.set_title(f'Energy: {animation_energies[0]:.2f} eV')
         plt.colorbar(img, ax=ax_img, label='Intensity')
         ax_img.set_xlabel('Pixel X')
@@ -2463,9 +2479,8 @@ class LariatDataProcessor:
             img_data = data_to_use.isel(energy=energy_idx)
             img.set_array(img_data)
             
-            # Adjust contrast dynamically using percentiles
-            vmin, vmax = np.nanpercentile(img_data, contrast_percentiles)
-            img.set_clim(vmin, vmax)
+            # Keep the global dynamic range (no per-frame adjustment)
+            # The colorbar limits are already set to global_vmin and global_vmax
             
             # Update the image title
             img_title.set_text(f'Energy: {current_energy:.2f} eV')
@@ -2601,25 +2616,32 @@ class LariatDataProcessor:
             if len(roi_labels) != len(roi_list):
                 raise ValueError("Number of ROI labels must match number of ROIs")
             
-            # Convert roi_list format (x_min, y_min, width, height) to bounds format
-            for i, roi in enumerate(roi_list):
-                if len(roi) == 4:
-                    x_min, y_min, width, height = roi
-                    # Convert to bounds and store for display
-                    display_rois.append((x_min, y_min, x_min + width, y_min + height))
-                    
-                    # Extract spectrum from this ROI
-                    spectrum_xr, spectrum_np = self.extract_roi_spectrum(roi, plot=False)
-                    spectra_list.append(spectrum_np)
-                    display_labels.append(roi_labels[i])
-                    print(f"  {roi_labels[i]}: {width}x{height} pixels")
-                else:
-                    raise ValueError(f"ROI {i+1} must be (x_min, y_min, width, height)")
+            # Extract all spectra using the same method as extract_processed_roi_spectra
+            # This ensures identical results between animation and extract_processed_roi_spectra
+            spectra_dict, roi_info = self.extract_processed_roi_spectra(
+                roi_list, roi_labels=roi_labels, plot=False, verbose=False
+            )
+            
+            # Convert to lists for animation compatibility
+            for label in roi_labels:
+                spectrum_data = spectra_dict[label]
+                spectra_list.append(spectrum_data)
+                display_labels.append(label)
+                
+                # Convert ROI to bounds format for display
+                roi_bounds = roi_info[label]['roi_bounds']
+                x, y, width, height = roi_bounds
+                display_rois.append((x, y, x + width, y + height))
+                print(f"  {label}: {width}x{height} pixels")
                     
         elif roi is not None:
             # Single ROI (backward compatibility)
             print("Extracting spectrum from provided ROI...")
-            spectrum_xr, spectrum_np = self.extract_roi_spectrum(roi, plot=False)
+            # Use extract_processed_roi_spectra to ensure consistency
+            spectra_dict, roi_info = self.extract_processed_roi_spectra(
+                [roi], roi_labels=['ROI Spectrum'], plot=False, verbose=False
+            )
+            spectrum_np = spectra_dict['ROI Spectrum']
             spectra_list = [spectrum_np]
             display_labels = ['ROI Spectrum']
             
@@ -2696,9 +2718,21 @@ class LariatDataProcessor:
         fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=(15, 5),
                                             gridspec_kw={'width_ratios': [1, 2]})
         
-        # Initialize the image plot with first animation frame
+        # Calculate global dynamic range across all animation frames
+        print("Calculating global dynamic range across all frames...")
+        all_frame_values = []
+        for idx in animation_indices:
+            frame_data = data_to_use.isel(energy=idx).values
+            all_frame_values.append(frame_data.ravel())
+        all_frame_values = np.concatenate(all_frame_values)
+        
+        # Calculate global vmin/vmax using percentiles
+        global_vmin, global_vmax = np.nanpercentile(all_frame_values, contrast_percentiles)
+        print(f"Global dynamic range: {global_vmin:.4f} to {global_vmax:.4f}")
+        
+        # Initialize the image plot with first animation frame using global range
         img_data = data_to_use.isel(energy=animation_indices[0])
-        img = ax_img.imshow(img_data, cmap='viridis', origin='lower')
+        img = ax_img.imshow(img_data, cmap='viridis', origin='lower', vmin=global_vmin, vmax=global_vmax)
         img_title = ax_img.set_title(f'Energy: {animation_energies[0]:.2f} eV')
         plt.colorbar(img, ax=ax_img, label='Intensity')
         ax_img.set_xlabel('Pixel X')
@@ -2779,9 +2813,8 @@ class LariatDataProcessor:
             img_data = data_to_use.isel(energy=energy_idx)
             img.set_array(img_data)
             
-            # Adjust contrast dynamically using percentiles
-            vmin, vmax = np.nanpercentile(img_data, contrast_percentiles)
-            img.set_clim(vmin, vmax)
+            # Keep the global dynamic range (no per-frame adjustment)
+            # The colorbar limits are already set to global_vmin and global_vmax
             
             # Update the image title
             img_title.set_text(f'Energy: {current_energy:.2f} eV')
@@ -4393,7 +4426,7 @@ class LariatDataProcessor:
                                   save_spectra=False, save_path=None, save_name='processed_roi_spectra',
                                   plot_style='individual', figsize=None, energy_range=None,
                                   normalize_for_display=False, show_image=True, image_energy=None,
-                                  image_contrast_percentiles=(2, 98)):
+                                  image_contrast_percentiles=(2, 98), verbose=False):
         """
         Extract and plot spectra from one or more ROIs using already processed data.
         This function does NOT perform any spectral processing - it works on data that
@@ -4429,6 +4462,8 @@ class LariatDataProcessor:
             Energy value to use for the ROI location image. If None, uses middle energy.
         image_contrast_percentiles : tuple, optional
             (low, high) percentiles for image contrast. Default is (2, 98).
+        verbose : bool, optional
+            If True, print progress and diagnostic information. Default is False.
             
         Returns:
         --------
@@ -4465,15 +4500,17 @@ class LariatDataProcessor:
         energies = self.data.energy.values
         n_energies, n_y, n_x = self.data.shape
         
-        print(f"Extracting spectra from {len(roi_list)} ROI(s) from processed data")
-        print(f"Data shape: {n_x} x {n_y} pixels, {n_energies} energies")
+        if verbose:
+            print(f"Extracting spectra from {len(roi_list)} ROI(s) from processed data")
+            print(f"Data shape: {n_x} x {n_y} pixels, {n_energies} energies")
         
         # Check if data appears to be processed
         is_processed = self.data.attrs.get('pixel_by_pixel_processing', False)
-        if is_processed:
-            print("Data appears to be pixel-by-pixel processed")
-        else:
-            print("Warning: Data may not be processed. This function is designed for processed data.")
+        if verbose:
+            if is_processed:
+                print("Data appears to be pixel-by-pixel processed")
+            else:
+                print("Warning: Data may not be processed. This function is designed for processed data.")
         
         # Extract spectra for each ROI
         spectra_dict = {}
@@ -4490,8 +4527,9 @@ class LariatDataProcessor:
             # Validate ROI bounds
             if (x_min < 0 or y_min < 0 or x_max > n_x or y_max > n_y or 
                 width <= 0 or height <= 0):
-                print(f"Warning: ROI {label} ({x}, {y}, {width}, {height}) is outside bounds or invalid")
-                print(f"Image bounds: (0, 0, {n_x}, {n_y})")
+                if verbose:
+                    print(f"Warning: ROI {label} ({x}, {y}, {width}, {height}) is outside bounds or invalid")
+                    print(f"Image bounds: (0, 0, {n_x}, {n_y})")
                 continue
             
             # Extract ROI data
@@ -4532,8 +4570,9 @@ class LariatDataProcessor:
             }
             roi_info[label] = roi_stats
             
-            print(f"  {label}: {roi_stats['roi_size'][0]}x{roi_stats['roi_size'][1]} pixels, "
-                f"intensity range: {roi_stats['intensity_min']:.3f} - {roi_stats['intensity_max']:.3f}")
+            if verbose:
+                print(f"  {label}: {roi_stats['roi_size'][0]}x{roi_stats['roi_size'][1]} pixels, "
+                    f"intensity range: {roi_stats['intensity_min']:.3f} - {roi_stats['intensity_max']:.3f}")
         
         if not spectra_dict:
             raise ValueError("No valid ROIs found")
@@ -4817,7 +4856,8 @@ class LariatDataProcessor:
                     f.write(f"  Energy points: {stats['n_energy_points']}\n")
                     f.write("\n")
             
-            print(f"Spectra saved to {save_path}")
-            print(f"ROI information saved to {info_filepath}")
+            if verbose:
+                print(f"Spectra saved to {save_path}")
+                print(f"ROI information saved to {info_filepath}")
         
         return spectra_dict, roi_info
