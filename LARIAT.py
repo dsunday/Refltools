@@ -14,7 +14,8 @@ class LariatDataProcessor:
     A class for processing Lariat datacube files and extracting/analyzing spectra.
     """
     
-    def __init__(self, filepath=None, pixel_size_um=50.0, energy_range=None):
+    def __init__(self, filepath=None, pixel_size_um=50.0, energy_range=None, 
+                 invert_x=False, invert_y=False, rotate=0):
             """
             Initialize the LariatDataProcessor.
             
@@ -27,6 +28,13 @@ class LariatDataProcessor:
             energy_range : tuple, optional
                 (min_energy, max_energy) to load only a subset of energies.
                 If None, loads all energies from the file.
+            invert_x : bool, optional
+                If True, flip the data along the x-axis (left-right). Default is False.
+            invert_y : bool, optional
+                If True, flip the data along the y-axis (up-down). Default is False.
+            rotate : int, optional
+                Rotate the data counterclockwise by this many degrees.
+                Valid values: 0, 90, 180, 270 (or -90, -180, -270). Default is 0.
             """
             self.data = None
             self.metadata = None
@@ -34,7 +42,8 @@ class LariatDataProcessor:
             self.pixel_size_um = pixel_size_um
             
             if filepath is not None:
-                self.load_data(filepath, energy_range=energy_range)
+                self.load_data(filepath, energy_range=energy_range, 
+                             invert_x=invert_x, invert_y=invert_y, rotate=rotate)
     
     def set_pixel_size(self, pixel_size_um):
         """
@@ -104,7 +113,7 @@ class LariatDataProcessor:
         extent = [0, width * self.pixel_size_um, 0, height * self.pixel_size_um]
         return extent
     
-    def load_data(self, filepath, energy_range=None):
+    def load_data(self, filepath, energy_range=None, invert_x=False, invert_y=False, rotate=0):
         """
         Load lariat datacube from HDF5 file.
         
@@ -115,11 +124,19 @@ class LariatDataProcessor:
         energy_range : tuple, optional
             (min_energy, max_energy) to load only a subset of energies.
             If None, loads all energies from the file.
+        invert_x : bool, optional
+            If True, flip the data along the x-axis (left-right). Default is False.
+        invert_y : bool, optional
+            If True, flip the data along the y-axis (up-down). Default is False.
+        rotate : int, optional
+            Rotate the data counterclockwise by this many degrees.
+            Valid values: 0, 90, 180, 270 (or -90, -180, -270). Default is 0.
         """
         self.filepath = filepath
-        self.data, self.metadata = self._read_lariat_datacube(filepath, energy_range=energy_range)
+        self.data, self.metadata = self._read_lariat_datacube(filepath, energy_range=energy_range,
+                                                              invert_x=invert_x, invert_y=invert_y, rotate=rotate)
     
-    def _read_lariat_datacube(self, filepath, energy_range=None):
+    def _read_lariat_datacube(self, filepath, energy_range=None, invert_x=False, invert_y=False, rotate=0):
         """
         Read lariat datacube from HDF5 file.
         
@@ -130,6 +147,13 @@ class LariatDataProcessor:
         energy_range : tuple, optional
             (min_energy, max_energy) to load only a subset of energies.
             If None, loads all energies from the file.
+        invert_x : bool, optional
+            If True, flip the data along the x-axis (left-right). Default is False.
+        invert_y : bool, optional
+            If True, flip the data along the y-axis (up-down). Default is False.
+        rotate : int, optional
+            Rotate the data counterclockwise by this many degrees.
+            Valid values: 0, 90, 180, 270 (or -90, -180, -270). Default is 0.
             
         Returns:
         --------
@@ -138,6 +162,11 @@ class LariatDataProcessor:
         metadata : dict
             Metadata from the file
         """
+        # Validate rotation value
+        valid_rotations = [0, 90, 180, 270, -90, -180, -270]
+        if rotate not in valid_rotations:
+            raise ValueError(f"rotate must be one of {valid_rotations}, got {rotate}")
+        
         f = h5py.File(filepath)
         metadata = json.loads(f['File Version'].attrs['Meta Data'])
         all_energies = np.arange(*metadata['BeamEnergy'])
@@ -164,10 +193,36 @@ class LariatDataProcessor:
         energy_list = []
         for idx in energy_indices:
             image = f['Images'][f'Image{idx}']['ImagePlane0'][()]
+            
+            # Apply axis inversions if requested
+            if invert_y:
+                image = np.flip(image, axis=0)  # Flip along y-axis (rows)
+            if invert_x:
+                image = np.flip(image, axis=1)  # Flip along x-axis (columns)
+            
+            # Apply rotation if requested
+            # np.rot90 rotates counterclockwise, k is number of 90-degree rotations
+            if rotate != 0:
+                k = rotate // 90  # Convert degrees to number of 90-degree rotations
+                image = np.rot90(image, k=k)
+            
             image_list.append(image)
             energy_list.append(energies[idx - energy_indices[0]])
         
         f.close()
+        
+        # Print information about transformations applied
+        transformations = []
+        if invert_x:
+            transformations.append("X-axis inversion (left-right)")
+        if invert_y:
+            transformations.append("Y-axis inversion (up-down)")
+        if rotate != 0:
+            transformations.append(f"{rotate}° rotation (counterclockwise)")
+        
+        if transformations:
+            print(f"Data loaded with transformation(s): {', '.join(transformations)}")
+        
         return xr.DataArray(image_list, dims=['energy','pix_y','pix_x'], coords={'energy':energy_list}), metadata
     
     def crop_image(self, crop_region=None, interactive=False, preview_energy=None, 
