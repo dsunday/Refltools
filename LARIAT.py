@@ -149,7 +149,7 @@ class LariatDataProcessor:
         Parameters:
         -----------
         crop_region : tuple, optional
-            (x_min, y_min, x_max, y_max) defining the crop region in pixel coordinates.
+            (x, y, width, height) defining the crop region in pixel coordinates.
             If None and interactive=False, will prompt for coordinates.
         interactive : bool, optional
             If True, display an image and allow interactive selection of crop region.
@@ -321,20 +321,26 @@ class LariatDataProcessor:
         # If no crop region specified and not interactive, prompt user
         elif crop_region is None:
             print(f"Current image size: {n_x} x {n_y} pixels")
-            print("Please specify crop region as (x_min, y_min, x_max, y_max)")
+            print("Please specify crop region as (x, y, width, height)")
             
             try:
-                x_min = int(input(f"Enter x_min (0 to {n_x-1}): "))
-                y_min = int(input(f"Enter y_min (0 to {n_y-1}): "))
-                x_max = int(input(f"Enter x_max ({x_min+1} to {n_x}): "))
-                y_max = int(input(f"Enter y_max ({y_min+1} to {n_y}): "))
-                crop_region = (x_min, y_min, x_max, y_max)
+                x = int(input(f"Enter x (0 to {n_x-1}): "))
+                y = int(input(f"Enter y (0 to {n_y-1}): "))
+                width = int(input(f"Enter width (1 to {n_x-x}): "))
+                height = int(input(f"Enter height (1 to {n_y-y}): "))
+                crop_region = (x, y, width, height)
             except (ValueError, KeyboardInterrupt):
                 print("Invalid input or operation cancelled.")
                 return None, None
         
-        # Validate crop region
-        x_min, y_min, x_max, y_max = crop_region
+        # Convert crop region from (x, y, width, height) to internal (x_min, y_min, x_max, y_max) format
+        if len(crop_region) == 4:
+            x, y, width, height = crop_region
+            x_min, y_min = x, y
+            x_max, y_max = x + width, y + height
+        else:
+            # Handle legacy format for backward compatibility
+            x_min, y_min, x_max, y_max = crop_region
         
         if not (0 <= x_min < x_max <= n_x and 0 <= y_min < y_max <= n_y):
             raise ValueError(f"Invalid crop region {crop_region}. Must be within image bounds "
@@ -360,7 +366,8 @@ class LariatDataProcessor:
         # Store crop information
         crop_info = {
             'original_shape': original_shape,
-            'crop_region': crop_region,
+            'crop_region': crop_region,  # Original input format
+            'crop_region_standardized': (x_min, y_min, crop_width, crop_height),  # Standardized (x, y, width, height)
             'cropped_shape': cropped_data.shape,
             'crop_size': (crop_width, crop_height),
             'pixels_removed': original_shape[1] * original_shape[2] - crop_width * crop_height,
@@ -3655,6 +3662,14 @@ class LariatDataProcessor:
         pre_values = np.full((n_y, n_x), np.nan)
         post_values = np.full((n_y, n_x), np.nan)
         
+        # Arrays for storing intermediate results when plotting is requested
+        intermediate_step1 = None  # After pre-edge slope normalization
+        intermediate_step2 = None  # After pre-edge background subtraction
+        
+        if plot_pixel_spectrum:
+            intermediate_step1 = np.full_like(working_data.values, np.nan)
+            intermediate_step2 = np.full_like(working_data.values, np.nan)
+        
         # Find valid pixels (non-zero, sufficient intensity)
         max_intensities = np.max(working_data.values, axis=0)
         valid_pixels = max_intensities > 1e-10
@@ -3708,6 +3723,10 @@ class LariatDataProcessor:
                         line_values = chunk_slopes[:, None] * energies[None, :] + chunk_intercepts[:, None]
                         line_values = np.maximum(line_values, 1e-10)  # Avoid division by zero
                         chunk_spectra = chunk_spectra / line_values
+                        
+                        # Store intermediate result after step 1 if plotting is requested
+                        if plot_pixel_spectrum:
+                            intermediate_step1[:, chunk_y, chunk_x] = chunk_spectra.T
                 
                 # Step 2: Pre-edge subtraction
                 if do_pre_edge_sub:
@@ -3715,6 +3734,10 @@ class LariatDataProcessor:
                     chunk_pre_values = np.mean(sub_spectra, axis=1)
                     pre_values[chunk_y, chunk_x] = chunk_pre_values
                     chunk_spectra = chunk_spectra - chunk_pre_values[:, None]
+                    
+                    # Store intermediate result after step 2 if plotting is requested
+                    if plot_pixel_spectrum:
+                        intermediate_step2[:, chunk_y, chunk_x] = chunk_spectra.T
                 
                 # Step 3: Post-edge normalization
                 if do_post_edge_norm:
@@ -3751,6 +3774,11 @@ class LariatDataProcessor:
             'post_edge_values': post_values,
             'valid_pixels': valid_pixels
         }
+        
+        # Add intermediate results if they were stored
+        if plot_pixel_spectrum:
+            processing_stats['intermediate_step1'] = intermediate_step1
+            processing_stats['intermediate_step2'] = intermediate_step2
         
         processing_info = {
             'pre_edge_norm_range': pre_edge_norm_range,
@@ -3858,57 +3886,95 @@ class LariatDataProcessor:
                     print(f"Warning: Pixel location ({x_pixel}, {y_pixel}) is outside processed image bounds. Using center pixel.")
                     x_pixel, y_pixel = (processed_data.shape[2] // 2, processed_data.shape[1] // 2)
                 
-                # Extract original and processed spectra for this pixel
+                # Always use pixel-level data from original unbinned data for plotting
+                # Map binned coordinates back to original coordinates
                 if bin_x > 1 or bin_y > 1:
-                    # For binned data, we need to map back to original coordinates
                     orig_x = x_pixel * bin_x + bin_x // 2
                     orig_y = y_pixel * bin_y + bin_y // 2
                     # Make sure we're within bounds of original data
                     orig_x = min(orig_x, self.data.shape[2] - 1)
                     orig_y = min(orig_y, self.data.shape[1] - 1)
                     orig_spectrum = self.data[:, orig_y, orig_x].values
+                    location_str = f"Pixel ({x_pixel}, {y_pixel}) [binned {bin_x}x{bin_y}] -> Original Pixel ({orig_x}, {orig_y})"
                 else:
-                    orig_spectrum = working_data[:, y_pixel, x_pixel].values
-                    
+                    orig_spectrum = self.data[:, y_pixel, x_pixel].values
+                    location_str = f"Pixel ({x_pixel}, {y_pixel})"
+                
+                # Get processed spectrum from the binned data
                 proc_spectrum = processed_data[:, y_pixel, x_pixel].values
-                location_str = f"Pixel ({x_pixel}, {y_pixel})"
+                
+                # Get intermediate results if they were stored
+                step1_spectrum = None
+                step2_spectrum = None
+                if 'intermediate_step1' in processing_stats:
+                    step1_spectrum = processing_stats['intermediate_step1'][:, y_pixel, x_pixel]
+                if 'intermediate_step2' in processing_stats:
+                    step2_spectrum = processing_stats['intermediate_step2'][:, y_pixel, x_pixel]
                 
             elif len(pixel_location) == 4:
-                # ROI format: (x1, y1, x2, y2)
-                x1, y1, x2, y2 = pixel_location
+                # ROI format: (x, y, width, height)
+                x, y, width, height = pixel_location
                 is_roi = True
                 
-                # Validate ROI bounds
-                x1, x2 = max(0, min(x1, x2)), min(processed_data.shape[2], max(x1, x2))
-                y1, y2 = max(0, min(y1, y2)), min(processed_data.shape[1], max(y1, y2))
+                # Calculate corner coordinates for validation
+                x2 = x + width
+                y2 = y + height
                 
-                if x2 <= x1 or y2 <= y1:
-                    print(f"Warning: Invalid ROI ({x1}, {y1}, {x2}, {y2}). Using center pixel.")
+                # Validate ROI bounds
+                x = max(0, min(x, processed_data.shape[2]))
+                y = max(0, min(y, processed_data.shape[1]))
+                x2 = min(processed_data.shape[2], x2)
+                y2 = min(processed_data.shape[1], y2)
+                
+                # Recalculate width and height after bounds checking
+                width = x2 - x
+                height = y2 - y
+                
+                if width <= 0 or height <= 0:
+                    print(f"Warning: Invalid ROI ({x}, {y}, {width}, {height}). Using center pixel.")
                     x_pixel, y_pixel = (processed_data.shape[2] // 2, processed_data.shape[1] // 2)
-                    orig_spectrum = working_data[:, y_pixel, x_pixel].values
+                    orig_spectrum = self.data[:, y_pixel, x_pixel].values
                     proc_spectrum = processed_data[:, y_pixel, x_pixel].values
                     location_str = f"Pixel ({x_pixel}, {y_pixel})"
                     is_roi = False
-                else:
-                    # Extract ROI from original data
-                    if bin_x > 1 or bin_y > 1:
-                        # Map ROI back to original coordinates
-                        orig_x1, orig_y1 = x1 * bin_x, y1 * bin_y
-                        orig_x2, orig_y2 = x2 * bin_x, y2 * bin_y
-                        orig_x2 = min(orig_x2, self.data.shape[2])
-                        orig_y2 = min(orig_y2, self.data.shape[1])
-                        orig_roi_data = self.data[:, orig_y1:orig_y2, orig_x1:orig_x2]
-                        orig_spectrum = orig_roi_data.mean(dim=['pix_x', 'pix_y']).values
-                    else:
-                        orig_roi_data = working_data[:, y1:y2, x1:x2]
-                        orig_spectrum = orig_roi_data.mean(dim=['pix_x', 'pix_y']).values
                     
-                    # Extract ROI from processed data
-                    proc_roi_data = processed_data[:, y1:y2, x1:x2]
-                    proc_spectrum = proc_roi_data.mean(dim=['pix_x', 'pix_y']).values
-                    location_str = f"ROI ({x1}, {y1}, {x2}, {y2})"
+                    # Get intermediate results for single pixel
+                    step1_spectrum = None
+                    step2_spectrum = None
+                    if 'intermediate_step1' in processing_stats:
+                        step1_spectrum = processing_stats['intermediate_step1'][:, y_pixel, x_pixel]
+                    if 'intermediate_step2' in processing_stats:
+                        step2_spectrum = processing_stats['intermediate_step2'][:, y_pixel, x_pixel]
+                else:
+                    # For ROI, we'll use the center pixel of the ROI for detailed processing visualization
+                    # but still show ROI information
+                    center_x = x + width // 2
+                    center_y = y + height // 2
+                    
+                    # Map to original coordinates
+                    if bin_x > 1 or bin_y > 1:
+                        orig_center_x = center_x * bin_x + bin_x // 2
+                        orig_center_y = center_y * bin_y + bin_y // 2
+                        orig_center_x = min(orig_center_x, self.data.shape[2] - 1)
+                        orig_center_y = min(orig_center_y, self.data.shape[1] - 1)
+                        orig_spectrum = self.data[:, orig_center_y, orig_center_x].values
+                    else:
+                        orig_spectrum = self.data[:, center_y, center_x].values
+                    
+                    # Get processed spectrum from center pixel of ROI
+                    proc_spectrum = processed_data[:, center_y, center_x].values
+                    
+                    # Get intermediate results for center pixel
+                    step1_spectrum = None
+                    step2_spectrum = None
+                    if 'intermediate_step1' in processing_stats:
+                        step1_spectrum = processing_stats['intermediate_step1'][:, center_y, center_x]
+                    if 'intermediate_step2' in processing_stats:
+                        step2_spectrum = processing_stats['intermediate_step2'][:, center_y, center_x]
+                    
+                    location_str = f"ROI ({x}, {y}, {width}, {height}) -> Center Pixel ({center_x}, {center_y})"
             else:
-                raise ValueError("pixel_location must be (x, y) for single pixel or (x1, y1, x2, y2) for ROI")
+                raise ValueError("pixel_location must be (x, y) for single pixel or (x, y, width, height) for ROI")
             
             # Create multi-step processing visualization similar to the attached format
             fig, axes = plt.subplots(1, 4, figsize=(20, 5))
@@ -3929,7 +3995,7 @@ class LariatDataProcessor:
                         label='Post-edge Norm Region')
             
             # Add slope line if pre-edge normalization was applied
-            if do_pre_edge_norm and is_roi == False and valid_pixels[y_pixel, x_pixel]:  # Only for single pixels
+            if do_pre_edge_norm and not is_roi and valid_pixels[y_pixel, x_pixel]:  # Only for single pixels
                 slope_val = slopes[y_pixel, x_pixel]
                 intercept_val = intercepts[y_pixel, x_pixel]
                 if not np.isnan(slope_val):
@@ -3938,8 +4004,6 @@ class LariatDataProcessor:
                         label=f'Pre-edge Slope: {slope_val:.2e}')
             
             title = f'Original Spectrum from {location_str}'
-            if bin_x > 1 or bin_y > 1:
-                title += f'\n[binned {bin_x}x{bin_y}]'
             ax.set_title(title)
             ax.set_xlabel('Energy (eV)')
             ax.set_ylabel('Intensity')
@@ -3950,14 +4014,13 @@ class LariatDataProcessor:
             if do_pre_edge_norm:
                 ax = axes[1]
                 
-                # Calculate what the spectrum looks like after just pre-edge normalization
-                if is_roi:
-                    # For ROI, we need to recalculate since we don't store intermediate steps
-                    temp_spectrum = orig_spectrum.copy()
-                    # This is approximate - we'd need to store intermediate results for exact reproduction
+                # Use stored intermediate result if available
+                if step1_spectrum is not None:
+                    temp_spectrum = step1_spectrum
                 else:
-                    # For single pixel, use stored slope/intercept
-                    if valid_pixels[y_pixel, x_pixel] and not np.isnan(slopes[y_pixel, x_pixel]):
+                    # Fallback: reconstruct using stored slope/intercept for the binned pixel
+                    # Note: This won't be exactly the same as the original pixel due to binning
+                    if not is_roi and valid_pixels[y_pixel, x_pixel] and not np.isnan(slopes[y_pixel, x_pixel]):
                         slope_val = slopes[y_pixel, x_pixel]
                         intercept_val = intercepts[y_pixel, x_pixel]
                         line_values = slope_val * energies + intercept_val
@@ -3991,28 +4054,33 @@ class LariatDataProcessor:
             if do_pre_edge_sub:
                 ax = axes[next_ax_idx]
                 
-                # Calculate spectrum after normalization and subtraction
-                if do_pre_edge_norm and not is_roi and valid_pixels[y_pixel, x_pixel]:
-                    slope_val = slopes[y_pixel, x_pixel]
-                    intercept_val = intercepts[y_pixel, x_pixel]
-                    if not np.isnan(slope_val):
-                        line_values = slope_val * energies + intercept_val
-                        temp_spectrum = orig_spectrum / np.maximum(line_values, 1e-10)
+                # Use stored intermediate result if available
+                if step2_spectrum is not None:
+                    temp_spectrum = step2_spectrum
+                else:
+                    # Fallback: reconstruct step by step
+                    # First apply pre-edge normalization if it was done
+                    if do_pre_edge_norm and not is_roi and valid_pixels[y_pixel, x_pixel]:
+                        slope_val = slopes[y_pixel, x_pixel]
+                        intercept_val = intercepts[y_pixel, x_pixel]
+                        if not np.isnan(slope_val):
+                            line_values = slope_val * energies + intercept_val
+                            temp_spectrum = orig_spectrum / np.maximum(line_values, 1e-10)
+                        else:
+                            temp_spectrum = orig_spectrum.copy()
                     else:
                         temp_spectrum = orig_spectrum.copy()
-                else:
-                    temp_spectrum = orig_spectrum.copy()
-                
-                # Apply pre-edge subtraction
-                if not is_roi and valid_pixels[y_pixel, x_pixel]:
-                    pre_val = pre_values[y_pixel, x_pixel]
-                    if not np.isnan(pre_val):
+                    
+                    # Then apply pre-edge subtraction
+                    if not is_roi and valid_pixels[y_pixel, x_pixel]:
+                        pre_val = pre_values[y_pixel, x_pixel]
+                        if not np.isnan(pre_val):
+                            temp_spectrum = temp_spectrum - pre_val
+                    else:
+                        # For ROI, calculate approximate pre-edge value
+                        sub_mask_local = (energies >= pre_edge_sub_range[0]) & (energies <= pre_edge_sub_range[1])
+                        pre_val = np.mean(temp_spectrum[sub_mask_local])
                         temp_spectrum = temp_spectrum - pre_val
-                else:
-                    # For ROI, calculate approximate pre-edge value
-                    sub_mask_local = (energies >= pre_edge_sub_range[0]) & (energies <= pre_edge_sub_range[1])
-                    pre_val = np.mean(temp_spectrum[sub_mask_local])
-                    temp_spectrum = temp_spectrum - pre_val
                 
                 ax.plot(energies, temp_spectrum, 'o-', color='blue', markersize=3, linewidth=2)
                 ax.axhline(y=0, color='red', linestyle='--', alpha=0.7, label='Pre-edge Level (0)')
@@ -4161,7 +4229,7 @@ class LariatDataProcessor:
         Parameters:
         -----------
         roi_list : list of tuples or single tuple
-            ROI(s) to extract spectra from. Each ROI as (x_min, y_min, x_max, y_max).
+            ROI(s) to extract spectra from. Each ROI as (x, y, width, height).
             Can also be a single tuple for one ROI.
         roi_labels : list of str, optional
             Labels for each ROI. If None, will use "ROI 1", "ROI 2", etc.
@@ -4211,7 +4279,7 @@ class LariatDataProcessor:
         # Validate ROI list
         for i, roi in enumerate(roi_list):
             if len(roi) != 4:
-                raise ValueError(f"ROI {i+1} must be (x_min, y_min, x_max, y_max)")
+                raise ValueError(f"ROI {i+1} must be (x, y, width, height)")
         
         # Set default labels
         if roi_labels is None:
@@ -4239,12 +4307,17 @@ class LariatDataProcessor:
         roi_info = {}
         
         for roi, label in zip(roi_list, roi_labels):
-            x_min, y_min, x_max, y_max = roi
+            x, y, width, height = roi
+            
+            # Calculate corner coordinates
+            x_min, y_min = x, y
+            x_max = x + width
+            y_max = y + height
             
             # Validate ROI bounds
             if (x_min < 0 or y_min < 0 or x_max > n_x or y_max > n_y or 
-                x_min >= x_max or y_min >= y_max):
-                print(f"Warning: ROI {label} ({x_min}, {y_min}, {x_max}, {y_max}) is outside bounds or invalid")
+                width <= 0 or height <= 0):
+                print(f"Warning: ROI {label} ({x}, {y}, {width}, {height}) is outside bounds or invalid")
                 print(f"Image bounds: (0, 0, {n_x}, {n_y})")
                 continue
             
@@ -4274,8 +4347,8 @@ class LariatDataProcessor:
             # Calculate ROI statistics
             roi_stats = {
                 'roi_bounds': roi,
-                'roi_size': ((x_max - x_min), (y_max - y_min)),
-                'n_pixels': (x_max - x_min) * (y_max - y_min),
+                'roi_size': (width, height),
+                'n_pixels': width * height,
                 'intensity_mean': float(np.mean(spectrum_array[:, 1])),
                 'intensity_std': float(np.std(spectrum_array[:, 1])),
                 'intensity_min': float(np.min(spectrum_array[:, 1])),
@@ -4339,17 +4412,15 @@ class LariatDataProcessor:
                     # Add ROI rectangles with different colors
                     colors = plt.cm.tab10(np.linspace(0, 1, len(roi_list)))
                     for i, (roi, label) in enumerate(zip(roi_list, roi_labels)):
-                        x_min, y_min, x_max, y_max = roi
-                        width = x_max - x_min
-                        height = y_max - y_min
+                        x, y, width, height = roi
                         
                         from matplotlib.patches import Rectangle
-                        rect = Rectangle((x_min, y_min), width, height, 
+                        rect = Rectangle((x, y), width, height, 
                                     edgecolor=colors[i], facecolor='none', linewidth=2)
                         ax_img.add_patch(rect)
                         
                         # Add label
-                        ax_img.text(x_min + width/2, y_min + height + 2, label, 
+                        ax_img.text(x + width/2, y + height + 2, label, 
                                 color=colors[i], fontweight='bold', ha='center',
                                 bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
                     
@@ -4433,17 +4504,15 @@ class LariatDataProcessor:
                     # Add ROI rectangles
                     colors = plt.cm.tab10(np.linspace(0, 1, len(roi_list)))
                     for i, (roi, label) in enumerate(zip(roi_list, roi_labels)):
-                        x_min, y_min, x_max, y_max = roi
-                        width = x_max - x_min
-                        height = y_max - y_min
+                        x, y, width, height = roi
                         
                         from matplotlib.patches import Rectangle
-                        rect = Rectangle((x_min, y_min), width, height, 
+                        rect = Rectangle((x, y), width, height, 
                                     edgecolor=colors[i], facecolor='none', linewidth=2)
                         ax_img.add_patch(rect)
                         
                         # Add label
-                        ax_img.text(x_min + width/2, y_min + height + 2, label, 
+                        ax_img.text(x + width/2, y + height + 2, label, 
                                 color=colors[i], fontweight='bold', ha='center',
                                 bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
                     
