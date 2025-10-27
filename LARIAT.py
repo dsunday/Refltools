@@ -5207,6 +5207,620 @@ class LariatDataProcessor:
         return pca_dataset, pca_info
 
 
+    def extract_rois_from_pca(self, pca_dataset, n_components_to_use=3, n_clusters=5,
+                             min_roi_pixels=100, enforce_spatial_locality=False,
+                             min_component_pixels=50, plot=True, random_state=42):
+        """
+        Extract ROIs from PCA results using k-means clustering on PCA component weights.
+        
+        This function performs k-means clustering on the PCA component weights (scores) to identify
+        spatially distinct regions. This approach is much faster than clustering on full spectra
+        while capturing the main variance patterns.
+        
+        Parameters:
+        -----------
+        pca_dataset : xarray.Dataset
+            Output from perform_pca_analysis() containing PCA weights and components
+        n_components_to_use : int, optional
+            Number of PCA components to use as features for clustering. Default is 3.
+        n_clusters : int, optional
+            Number of clusters for k-means. Default is 5.
+        min_roi_pixels : int, optional
+            Minimum number of pixels required for a valid ROI. Default is 100.
+        enforce_spatial_locality : bool, optional
+            If True, split non-contiguous clusters into separate ROIs. Default is False.
+        min_component_pixels : int, optional
+            Minimum pixels per connected component when enforcing spatial locality. Default is 50.
+        plot : bool, optional
+            If True, create visualization of PCA weights and segmentation. Default is True.
+        random_state : int, optional
+            Random seed for reproducible results. Default is 42.
+            
+        Returns:
+        --------
+        roi_list : list
+            List of ROI tuples (x_min, y_min, width, height)
+        roi_labels : list
+            List of ROI labels
+        cluster_info : dict
+            Dictionary containing clustering information and statistics
+        """
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+        
+        print(f"Extracting ROIs from PCA results using {n_components_to_use} components and {n_clusters} clusters...")
+        
+        # Get PCA weights (scores) for specified components
+        weights_data = pca_dataset['weights'].values  # Shape: (n_components, pix_y, pix_x)
+        n_total_components = weights_data.shape[0]
+        
+        # Validate n_components_to_use
+        if n_components_to_use > n_total_components:
+            print(f"Warning: Requested {n_components_to_use} components but only {n_total_components} available")
+            n_components_to_use = n_total_components
+        
+        print(f"Using PCA components 1-{n_components_to_use} out of {n_total_components} total components")
+        
+        # Extract weights for selected components
+        weights_subset = weights_data[:n_components_to_use]  # Shape: (n_use, pix_y, pix_x)
+        
+        # Reshape to (n_pixels, n_components)
+        n_y, n_x = weights_subset.shape[1], weights_subset.shape[2]
+        pixel_features = weights_subset.reshape(n_components_to_use, -1).T  # (n_pixels, n_components)
+        
+        # Create coordinate arrays
+        y_coords, x_coords = np.meshgrid(np.arange(n_y), np.arange(n_x), indexing='ij')
+        y_flat = y_coords.ravel()
+        x_flat = x_coords.ravel()
+        
+        # Remove NaN pixels
+        valid_pixels = ~np.isnan(pixel_features).any(axis=1)
+        pixel_features_clean = pixel_features[valid_pixels]
+        x_coords_clean = x_flat[valid_pixels]
+        y_coords_clean = y_flat[valid_pixels]
+        
+        print(f"Clustering {len(pixel_features_clean)} valid pixels using {n_components_to_use} PCA components")
+        
+        # Standardize features (important for PCA weights with different scales)
+        scaler = StandardScaler()
+        pixel_features_scaled = scaler.fit_transform(pixel_features_clean)
+        
+        # K-means clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+        cluster_labels = kmeans.fit_predict(pixel_features_scaled)
+        
+        # Create segmentation map
+        segmentation_map = np.full((n_y, n_x), -1, dtype=int)
+        for i, (x, y, label) in enumerate(zip(x_coords_clean, y_coords_clean, cluster_labels)):
+            segmentation_map[y, x] = label
+        
+        # Apply spatial locality enforcement if requested
+        n_clusters_original = n_clusters
+        if enforce_spatial_locality:
+            from scipy.ndimage import label as connected_components
+            print(f"\nEnforcing spatial locality (splitting non-contiguous clusters)...")
+            
+            # Process each cluster to find connected components
+            new_cluster_id = n_clusters  # Start new IDs after original clusters
+            updated_segmentation = segmentation_map.copy()
+            
+            for cluster_id in range(n_clusters):
+                # Create binary mask for this cluster
+                cluster_mask = (segmentation_map == cluster_id)
+                
+                # Find connected components
+                labeled_components, num_components = connected_components(cluster_mask)
+                
+                if num_components > 1:
+                    print(f"  Cluster {cluster_id}: Found {num_components} connected components")
+                    
+                    # Process each connected component
+                    for comp_id in range(1, num_components + 1):  # Skip background (0)
+                        component_mask = (labeled_components == comp_id)
+                        component_size = np.sum(component_mask)
+                        
+                        if component_size >= min_component_pixels:
+                            # Keep as separate cluster
+                            if comp_id == 1:
+                                # Keep original cluster ID for largest component
+                                updated_segmentation[component_mask] = cluster_id
+                            else:
+                                # Assign new cluster ID for additional components
+                                updated_segmentation[component_mask] = new_cluster_id
+                                new_cluster_id += 1
+                        else:
+                            # Remove small components (set to -1)
+                            updated_segmentation[component_mask] = -1
+                            print(f"    Removed small component {comp_id} ({component_size} pixels)")
+            
+            segmentation_map = updated_segmentation
+            n_clusters_actual = new_cluster_id
+            print(f"Spatial splitting complete: {n_clusters_original} → {n_clusters_actual} clusters")
+        else:
+            n_clusters_actual = n_clusters
+        
+        # Create ROI bounding boxes
+        roi_list = []
+        roi_labels = []
+        
+        # Get unique cluster IDs (excluding -1 for invalid pixels)
+        unique_clusters = np.unique(segmentation_map)
+        unique_clusters = unique_clusters[unique_clusters >= 0]
+        
+        for cluster_id in unique_clusters:
+            # Create mask for this cluster
+            cluster_mask = (segmentation_map == cluster_id)
+            
+            # Find bounding box
+            rows, cols = np.where(cluster_mask)
+            if len(rows) == 0:
+                continue
+                
+            y_min, y_max = np.min(rows), np.max(rows)
+            x_min, x_max = np.min(cols), np.max(cols)
+            
+            # Calculate dimensions
+            width = x_max - x_min + 1
+            height = y_max - y_min + 1
+            area = width * height
+            
+            # Check minimum size requirement
+            if area >= min_roi_pixels:
+                roi_list.append((x_min, y_min, width, height))
+                roi_labels.append(f'PCA_ROI_{cluster_id}')
+            else:
+                print(f"  Removed small ROI {cluster_id}: {area} pixels (< {min_roi_pixels})")
+        
+        print(f"\nROI Detection Complete:")
+        print(f"  {len(roi_list)} ROIs detected from {n_clusters_actual} clusters")
+        print(f"  Components used: {n_components_to_use}")
+        print(f"  Spatial locality: {'enforced' if enforce_spatial_locality else 'not enforced'}")
+        
+        # Create cluster info dictionary
+        cluster_info = {
+            'n_components_used': n_components_to_use,
+            'n_clusters': n_clusters_original,
+            'n_clusters_original': n_clusters_original,
+            'n_clusters_final': n_clusters_actual,
+            'n_rois_detected': len(roi_list),
+            'min_roi_pixels': min_roi_pixels,
+            'enforce_spatial_locality': enforce_spatial_locality,
+            'min_component_pixels': min_component_pixels if enforce_spatial_locality else None,
+            'clustering_method': 'pca_weights',
+            'random_state': random_state,
+            'roi_list': roi_list,
+            'roi_labels': roi_labels
+        }
+        
+        # Add explained variance information if available
+        if 'explained_variance_ratio' in pca_dataset.attrs:
+            total_variance = np.sum(pca_dataset.attrs['explained_variance_ratio'][:n_components_to_use])
+            cluster_info['explained_variance_used'] = float(total_variance)
+            print(f"  Explained variance captured: {total_variance:.1%}")
+        
+        # Visualization
+        if plot:
+            # Create figure with PCA components and segmentation
+            n_cols = n_components_to_use + 1  # +1 for segmentation map
+            fig, axes = plt.subplots(2, n_cols, figsize=(4*n_cols, 8))
+            
+            if n_cols == 1:
+                axes = axes.reshape(2, 1)
+            
+            # Plot PCA component weights
+            for i in range(n_components_to_use):
+                # Top row: PCA components
+                im = axes[0, i].imshow(weights_subset[i], cmap='RdBu_r', origin='lower')
+                axes[0, i].set_title(f'PC{i+1} Weights')
+                axes[0, i].set_xlabel('X (pixels)')
+                axes[0, i].set_ylabel('Y (pixels)')
+                plt.colorbar(im, ax=axes[0, i], shrink=0.8)
+            
+            # Plot segmentation map
+            im_seg = axes[0, n_components_to_use].imshow(segmentation_map, cmap='tab10', origin='lower')
+            axes[0, n_components_to_use].set_title(f'K-Means Segmentation\n({n_clusters_actual} clusters)')
+            axes[0, n_components_to_use].set_xlabel('X (pixels)')
+            axes[0, n_components_to_use].set_ylabel('Y (pixels)')
+            plt.colorbar(im_seg, ax=axes[0, n_components_to_use], shrink=0.8)
+            
+            # Bottom row: Show ROI overlays on segmentation
+            for i in range(n_cols):
+                axes[1, i].imshow(segmentation_map, cmap='tab10', origin='lower', alpha=0.7)
+                
+                # Overlay ROI bounding boxes
+                for j, (x_min, y_min, width, height) in enumerate(roi_list):
+                    rect = plt.Rectangle((x_min, y_min), width, height, 
+                                       linewidth=2, edgecolor='red', facecolor='none')
+                    axes[1, i].add_patch(rect)
+                    axes[1, i].text(x_min + width/2, y_min + height/2, f'{j+1}', 
+                                  ha='center', va='center', color='red', fontweight='bold')
+                
+                axes[1, i].set_xlabel('X (pixels)')
+                axes[1, i].set_ylabel('Y (pixels)')
+                
+                if i < n_components_to_use:
+                    axes[1, i].set_title(f'PC{i+1} + ROIs')
+                else:
+                    axes[1, i].set_title(f'Segmentation + ROIs\n({len(roi_list)} ROIs)')
+            
+            plt.tight_layout()
+            plt.show()
+        
+        return roi_list, roi_labels, cluster_info
+
+
+    def detect_spectral_rois_dbscan(self, eps=None, min_samples=5, min_roi_pixels=100,
+                                     use_pca=False, pca_dataset=None, n_components_to_use=3,
+                                     energy=None, plot=True):
+        """
+        Automatically detect ROIs using DBSCAN (Density-Based Spatial Clustering of Applications with Noise).
+        
+        DBSCAN is a density-based clustering algorithm that naturally enforces spatial locality
+        and can discover arbitrary-shaped clusters. Unlike k-means, it doesn't require specifying
+        the number of clusters in advance and automatically identifies outliers as noise.
+        
+        This function can work on:
+        - Full spectral data (each pixel's complete spectrum)
+        - Single energy slice (intensity at one energy)
+        - PCA component weights (dimensionality-reduced features)
+        
+        Parameters:
+        -----------
+        eps : float or None, optional
+            Maximum distance between two samples for them to be considered in the same neighborhood.
+            If None, automatically estimates a reasonable value using nearest neighbor distances.
+            Smaller values = more/smaller clusters. Default is None (auto-estimate).
+        min_samples : int, optional
+            Minimum number of samples in a neighborhood for a point to be considered a core point.
+            Larger values = fewer, denser clusters. Default is 5.
+        min_roi_pixels : int, optional
+            Minimum number of pixels required for a cluster to be returned as an ROI.
+            Small clusters are filtered out. Default is 100.
+        use_pca : bool, optional
+            If True, cluster based on PCA component weights.
+            If False, cluster based on full spectra or single energy. Default is False.
+        pca_dataset : xarray.Dataset, optional
+            PCA results from perform_pca_analysis(). Required when use_pca=True.
+        n_components_to_use : int, optional
+            Number of PCA components to use for clustering when use_pca=True. Default is 3.
+        energy : float, optional
+            If provided (and use_pca=False), cluster based on intensity at this energy value (eV).
+            If None (and use_pca=False), cluster based on full spectral similarity.
+        plot : bool, optional
+            If True, display visualizations of clustering results. Default is True.
+            
+        Returns:
+        --------
+        roi_list : list
+            List of ROI tuples (x_min, y_min, width, height)
+        roi_labels : list
+            List of ROI labels (e.g., 'DBSCAN_ROI_0', 'DBSCAN_ROI_1', ...)
+        cluster_info : dict
+            Dictionary containing clustering information and statistics including:
+            - algorithm, eps, min_samples, n_clusters_detected, n_rois_detected
+            - n_noise_pixels, clustering_mode
+            
+        Notes:
+        ------
+        DBSCAN advantages:
+        - Automatically enforces spatial locality (density-based)
+        - Discovers arbitrary-shaped clusters
+        - No need to specify number of clusters
+        - Automatically identifies and excludes noise/outliers
+        - More robust to varying cluster densities
+        
+        Examples:
+        ---------
+        # Full spectra clustering with auto eps
+        roi_list, roi_labels, info = processor.detect_spectral_rois_dbscan(
+            min_samples=10
+        )
+        
+        # Single energy clustering
+        roi_list, roi_labels, info = processor.detect_spectral_rois_dbscan(
+            energy=285.0,
+            eps=0.3,
+            min_samples=20
+        )
+        
+        # PCA-based clustering
+        pca_dataset, _ = processor.perform_pca_analysis(n_components=10)
+        roi_list, roi_labels, info = processor.detect_spectral_rois_dbscan(
+            use_pca=True,
+            pca_dataset=pca_dataset,
+            n_components_to_use=3,
+            min_samples=15
+        )
+        """
+        from sklearn.cluster import DBSCAN
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.neighbors import NearestNeighbors
+        
+        # Determine clustering mode
+        if use_pca:
+            mode = 'pca_weights'
+            if pca_dataset is None:
+                raise ValueError("pca_dataset is required when use_pca=True. Run perform_pca_analysis() first.")
+            print(f"Starting DBSCAN ROI detection on PCA weights ({n_components_to_use} components)...")
+        elif energy is not None:
+            mode = 'single_energy'
+            print(f"Starting DBSCAN ROI detection at single energy: {energy} eV...")
+        else:
+            mode = 'full_spectra'
+            print("Starting DBSCAN ROI detection on full spectra...")
+        
+        # Feature extraction based on mode
+        if use_pca:
+            # Extract PCA weights
+            weights_data = pca_dataset['weights'].values  # Shape: (n_components, pix_y, pix_x)
+            n_total_components = weights_data.shape[0]
+            
+            # Validate n_components_to_use
+            if n_components_to_use > n_total_components:
+                print(f"Warning: Requested {n_components_to_use} components but only {n_total_components} available")
+                n_components_to_use = n_total_components
+            
+            print(f"Using PCA components 1-{n_components_to_use} out of {n_total_components} total components")
+            
+            # Extract weights for selected components
+            weights_subset = weights_data[:n_components_to_use]  # Shape: (n_use, pix_y, pix_x)
+            
+            # Reshape to (n_pixels, n_components)
+            n_y, n_x = weights_subset.shape[1], weights_subset.shape[2]
+            pixel_features = weights_subset.reshape(n_components_to_use, -1).T  # (n_pixels, n_components)
+            
+        elif energy is not None:
+            # Single energy slice
+            actual_energy = float(self.data.sel(energy=energy, method='nearest').energy.values)
+            if abs(actual_energy - energy) > 1.0:
+                print(f"Warning: Requested energy {energy} eV, using closest available: {actual_energy:.2f} eV")
+            else:
+                print(f"Using energy: {actual_energy:.2f} eV")
+            
+            energy_slice = self.data.sel(energy=energy, method='nearest').values
+            n_y, n_x = energy_slice.shape
+            pixel_features = energy_slice.ravel().reshape(-1, 1)  # (n_pixels, 1)
+            
+        else:
+            # Full spectra
+            n_energies, n_y, n_x = self.data.shape
+            pixel_features = self.data.values.reshape(n_energies, -1).T  # (n_pixels, n_energies)
+            print(f"Clustering {n_y * n_x} pixels using {n_energies} energy points per spectrum")
+        
+        # Create coordinate arrays
+        y_coords, x_coords = np.meshgrid(np.arange(n_y), np.arange(n_x), indexing='ij')
+        y_flat = y_coords.ravel()
+        x_flat = x_coords.ravel()
+        
+        # Remove NaN pixels
+        valid_pixels = ~np.isnan(pixel_features).any(axis=1)
+        pixel_features_clean = pixel_features[valid_pixels]
+        x_coords_clean = x_flat[valid_pixels]
+        y_coords_clean = y_flat[valid_pixels]
+        
+        n_valid = len(pixel_features_clean)
+        n_invalid = len(pixel_features) - n_valid
+        
+        if n_invalid > 0:
+            print(f"Removed {n_invalid} pixels with NaN values, clustering {n_valid} valid pixels")
+        else:
+            print(f"Clustering {n_valid} valid pixels")
+        
+        # Standardize features
+        print("Standardizing features...")
+        scaler = StandardScaler()
+        pixel_features_scaled = scaler.fit_transform(pixel_features_clean)
+        
+        # Auto-estimate eps if not provided
+        eps_auto_estimated = False
+        if eps is None:
+            print(f"Auto-estimating eps using {min_samples}-nearest neighbor distances...")
+            # Use k-nearest neighbor distance heuristic
+            nbrs = NearestNeighbors(n_neighbors=min_samples).fit(pixel_features_scaled)
+            distances, indices = nbrs.kneighbors(pixel_features_scaled)
+            
+            # Sort k-distances (distance to the kth nearest neighbor)
+            k_distances = np.sort(distances[:, -1])
+            
+            # Use 90th percentile as a reasonable default
+            # (catches most points while allowing some outliers)
+            eps = np.percentile(k_distances, 90)
+            eps_auto_estimated = True
+            print(f"Auto-estimated eps: {eps:.4f} (90th percentile of {min_samples}-NN distances)")
+        else:
+            print(f"Using provided eps: {eps}")
+        
+        # Apply DBSCAN
+        print(f"Running DBSCAN (eps={eps:.4f}, min_samples={min_samples})...")
+        dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+        cluster_labels = dbscan.fit_predict(pixel_features_scaled)
+        
+        # Count clusters and noise
+        unique_labels = np.unique(cluster_labels)
+        n_clusters = len(unique_labels[unique_labels >= 0])  # Exclude -1 (noise)
+        n_noise = np.sum(cluster_labels == -1)
+        
+        print(f"DBSCAN detected {n_clusters} clusters")
+        print(f"Noise points excluded: {n_noise} ({100*n_noise/n_valid:.1f}% of valid pixels)")
+        
+        # Create segmentation map (excluding noise)
+        segmentation_map = np.full((n_y, n_x), -1, dtype=int)
+        for i, (x, y, label) in enumerate(zip(x_coords_clean, y_coords_clean, cluster_labels)):
+            segmentation_map[y, x] = label  # -1 for noise, >= 0 for clusters
+        
+        # Create ROI bounding boxes
+        roi_list = []
+        roi_labels = []
+        
+        # Get unique cluster IDs (excluding -1 for noise)
+        cluster_ids = unique_labels[unique_labels >= 0]
+        
+        for cluster_id in cluster_ids:
+            # Create mask for this cluster
+            cluster_mask = (segmentation_map == cluster_id)
+            
+            # Find bounding box
+            rows, cols = np.where(cluster_mask)
+            if len(rows) == 0:
+                continue
+            
+            y_min, y_max = np.min(rows), np.max(rows)
+            x_min, x_max = np.min(cols), np.max(cols)
+            
+            # Calculate dimensions
+            width = x_max - x_min + 1
+            height = y_max - y_min + 1
+            area = width * height
+            
+            # Check minimum size requirement
+            if area >= min_roi_pixels:
+                roi_list.append((x_min, y_min, width, height))
+                roi_labels.append(f'DBSCAN_ROI_{cluster_id}')
+            else:
+                print(f"  Removed small ROI {cluster_id}: {area} pixels (< {min_roi_pixels})")
+        
+        print(f"\nROI Detection Complete:")
+        print(f"  {len(roi_list)} ROIs detected from {n_clusters} clusters")
+        print(f"  Mode: {mode}")
+        
+        # Create cluster info dictionary
+        cluster_info = {
+            'algorithm': 'dbscan',
+            'eps': float(eps),
+            'eps_auto_estimated': eps_auto_estimated,
+            'min_samples': min_samples,
+            'n_clusters_detected': n_clusters,
+            'n_rois_detected': len(roi_list),
+            'n_noise_pixels': int(n_noise),
+            'min_roi_pixels': min_roi_pixels,
+            'clustering_mode': mode,
+            'roi_list': roi_list,
+            'roi_labels': roi_labels
+        }
+        
+        # Add mode-specific information
+        if use_pca:
+            cluster_info['n_components_used'] = n_components_to_use
+            if 'explained_variance_ratio' in pca_dataset.attrs:
+                total_variance = np.sum(pca_dataset.attrs['explained_variance_ratio'][:n_components_to_use])
+                cluster_info['explained_variance_used'] = float(total_variance)
+                print(f"  Explained variance captured: {total_variance:.1%}")
+        elif energy is not None:
+            cluster_info['energy_used'] = float(actual_energy)
+        
+        # Visualization
+        if plot:
+            if use_pca:
+                # Show PCA components + segmentation
+                weights_subset = pca_dataset['weights'].values[:n_components_to_use]
+                n_cols = n_components_to_use + 1  # +1 for segmentation
+                fig, axes = plt.subplots(2, n_cols, figsize=(4*n_cols, 8))
+                
+                if n_cols == 1:
+                    axes = axes.reshape(2, 1)
+                
+                # Top row: PCA components
+                for i in range(n_components_to_use):
+                    im = axes[0, i].imshow(weights_subset[i], cmap='RdBu_r', origin='lower')
+                    axes[0, i].set_title(f'PC{i+1} Weights')
+                    axes[0, i].set_xlabel('X (pixels)')
+                    axes[0, i].set_ylabel('Y (pixels)')
+                    plt.colorbar(im, ax=axes[0, i], shrink=0.8)
+                
+                # Segmentation map
+                im_seg = axes[0, n_components_to_use].imshow(segmentation_map, cmap='tab10', origin='lower')
+                axes[0, n_components_to_use].set_title(f'DBSCAN Segmentation\n({n_clusters} clusters, {n_noise} noise pts)')
+                axes[0, n_components_to_use].set_xlabel('X (pixels)')
+                axes[0, n_components_to_use].set_ylabel('Y (pixels)')
+                plt.colorbar(im_seg, ax=axes[0, n_components_to_use], shrink=0.8)
+                
+                # Bottom row: ROI overlays
+                for i in range(n_cols):
+                    axes[1, i].imshow(segmentation_map, cmap='tab10', origin='lower', alpha=0.7)
+                    
+                    # Overlay ROI bounding boxes
+                    for j, (x_min, y_min, width, height) in enumerate(roi_list):
+                        rect = plt.Rectangle((x_min, y_min), width, height,
+                                           linewidth=2, edgecolor='red', facecolor='none')
+                        axes[1, i].add_patch(rect)
+                        axes[1, i].text(x_min + width/2, y_min + height/2, f'{j+1}',
+                                      ha='center', va='center', color='red', fontweight='bold')
+                    
+                    axes[1, i].set_xlabel('X (pixels)')
+                    axes[1, i].set_ylabel('Y (pixels)')
+                    
+                    if i < n_components_to_use:
+                        axes[1, i].set_title(f'PC{i+1} + ROIs')
+                    else:
+                        axes[1, i].set_title(f'Segmentation + ROIs\n({len(roi_list)} ROIs)')
+                
+            elif energy is not None:
+                # Show energy slice + segmentation
+                fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+                
+                # Energy slice
+                im1 = axes[0].imshow(energy_slice, cmap='viridis', origin='lower')
+                axes[0].set_title(f'Intensity at {actual_energy:.2f} eV')
+                axes[0].set_xlabel('X (pixels)')
+                axes[0].set_ylabel('Y (pixels)')
+                plt.colorbar(im1, ax=axes[0])
+                
+                # Segmentation with ROIs
+                im2 = axes[1].imshow(segmentation_map, cmap='tab10', origin='lower', alpha=0.7)
+                axes[1].set_title(f'DBSCAN Segmentation\n{len(roi_list)} ROIs from {n_clusters} clusters ({n_noise} noise pts)')
+                axes[1].set_xlabel('X (pixels)')
+                axes[1].set_ylabel('Y (pixels)')
+                plt.colorbar(im2, ax=axes[1])
+                
+                # Overlay ROI bounding boxes
+                for j, (x_min, y_min, width, height) in enumerate(roi_list):
+                    rect = plt.Rectangle((x_min, y_min), width, height,
+                                       linewidth=2, edgecolor='red', facecolor='none')
+                    axes[1].add_patch(rect)
+                    axes[1].text(x_min + width/2, y_min + height/2, f'{j+1}',
+                              ha='center', va='center', color='red', fontweight='bold')
+                
+            else:
+                # Show first/last energy images + segmentation
+                fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+                
+                # First energy image
+                im1 = axes[0].imshow(self.data.isel(energy=0).values, cmap='viridis', origin='lower')
+                first_energy = float(self.data.energy.values[0])
+                axes[0].set_title(f'First Energy: {first_energy:.2f} eV')
+                axes[0].set_xlabel('X (pixels)')
+                axes[0].set_ylabel('Y (pixels)')
+                plt.colorbar(im1, ax=axes[0])
+                
+                # Last energy image
+                im2 = axes[1].imshow(self.data.isel(energy=-1).values, cmap='viridis', origin='lower')
+                last_energy = float(self.data.energy.values[-1])
+                axes[1].set_title(f'Last Energy: {last_energy:.2f} eV')
+                axes[1].set_xlabel('X (pixels)')
+                axes[1].set_ylabel('Y (pixels)')
+                plt.colorbar(im2, ax=axes[1])
+                
+                # Segmentation with ROIs
+                im3 = axes[2].imshow(segmentation_map, cmap='tab10', origin='lower', alpha=0.7)
+                axes[2].set_title(f'DBSCAN Spectral Segmentation\n{len(roi_list)} ROIs from {n_clusters} clusters ({n_noise} noise pts)')
+                axes[2].set_xlabel('X (pixels)')
+                axes[2].set_ylabel('Y (pixels)')
+                plt.colorbar(im3, ax=axes[2])
+                
+                # Overlay ROI bounding boxes
+                for j, (x_min, y_min, width, height) in enumerate(roi_list):
+                    rect = plt.Rectangle((x_min, y_min), width, height,
+                                       linewidth=2, edgecolor='red', facecolor='none')
+                    axes[2].add_patch(rect)
+                    axes[2].text(x_min + width/2, y_min + height/2, f'{j+1}',
+                              ha='center', va='center', color='red', fontweight='bold')
+            
+            plt.tight_layout()
+            plt.show()
+        
+        return roi_list, roi_labels, cluster_info
+
+
     def perform_nmf_analysis(self, n_components=8, normalize_illumination=True,
                         low_energy_range=(525, 530), high_energy_range=(575, 580),
                         random_state=42, max_iter=1000, plot=True, 
@@ -5660,7 +6274,8 @@ class LariatDataProcessor:
 
 
     def detect_spectral_rois_kmeans(self, n_clusters=5, min_roi_pixels=100, 
-                                    plot=True, random_state=42, energy=None):
+                                    plot=True, random_state=42, energy=None,
+                                    enforce_spatial_locality=False, min_component_pixels=50):
         """
         Automatically detect regions with distinct spectral signatures using k-means clustering.
         Returns a list of ROI bounding boxes that can be used with existing extraction functions.
@@ -5682,6 +6297,15 @@ class LariatDataProcessor:
         energy : float, optional
             If provided, cluster based on intensity at this single energy value (eV).
             If None (default), cluster based on full spectral similarity.
+        enforce_spatial_locality : bool, optional
+            If True, split each k-means cluster into spatially contiguous regions using
+            connected component analysis. This prevents grouping disconnected areas with
+            similar spectra into the same cluster. May result in more ROIs than n_clusters.
+            Default is False.
+        min_component_pixels : int, optional
+            When enforce_spatial_locality=True, minimum number of pixels for a connected
+            component to be kept as an ROI. Smaller components are discarded.
+            Default is 50.
             
         Returns:
         --------
@@ -5769,13 +6393,113 @@ class LariatDataProcessor:
         for i, (x, y, label) in enumerate(zip(x_coords_clean, y_coords_clean, cluster_labels)):
             segmentation_map[y, x] = label
         
+        # Store original number of clusters
+        n_clusters_original = n_clusters
+        
+        # Post-process clusters for spatial locality if requested
+        if enforce_spatial_locality:
+            from scipy.ndimage import label as connected_components
+            
+            print(f"\nEnforcing spatial locality (splitting non-contiguous clusters)...")
+            print(f"Minimum component size: {min_component_pixels} pixels")
+            
+            # Process each cluster to find connected components
+            new_cluster_labels = np.copy(cluster_labels)
+            next_cluster_id = n_clusters
+            split_info = {}  # Track which clusters were split
+            
+            for cluster_id in range(n_clusters):
+                # Create binary mask for this cluster
+                cluster_mask_2d = (segmentation_map == cluster_id)
+                
+                # Find connected components
+                labeled_array, num_features = connected_components(cluster_mask_2d)
+                
+                if num_features > 1:
+                    # Calculate sizes of each component
+                    component_sizes = []
+                    for comp_id in range(1, num_features + 1):
+                        comp_size = np.sum(labeled_array == comp_id)
+                        component_sizes.append((comp_id, comp_size))
+                    
+                    # Sort by size descending
+                    component_sizes.sort(key=lambda x: x[1], reverse=True)
+                    
+                    # Count valid components (large enough)
+                    valid_components = [c for c in component_sizes if c[1] >= min_component_pixels]
+                    
+                    if len(valid_components) > 1:
+                        print(f"  Cluster {cluster_id + 1}: Splitting into {len(valid_components)} regions " +
+                              f"(discarding {len(component_sizes) - len(valid_components)} small components)")
+                        
+                        # Keep largest as original cluster_id (it's component_sizes[0])
+                        split_info[cluster_id] = []
+                        
+                        # Reassign other components to new cluster IDs
+                        for i, (comp_id, comp_size) in enumerate(component_sizes[1:]):
+                            if comp_size >= min_component_pixels:
+                                # Find pixels in this component and reassign
+                                comp_pixels = labeled_array == comp_id
+                                y_comp, x_comp = np.where(comp_pixels)
+                                
+                                # Update cluster labels for these pixels
+                                for y, x in zip(y_comp, x_comp):
+                                    # Find this pixel in the clean coordinates
+                                    pixel_idx = np.where((y_coords_clean == y) & 
+                                                       (x_coords_clean == x))[0]
+                                    if len(pixel_idx) > 0:
+                                        new_cluster_labels[pixel_idx[0]] = next_cluster_id
+                                
+                                # Update segmentation map
+                                segmentation_map[comp_pixels] = next_cluster_id
+                                split_info[cluster_id].append((next_cluster_id, comp_size))
+                                next_cluster_id += 1
+                            else:
+                                # Remove small components
+                                comp_pixels = labeled_array == comp_id
+                                segmentation_map[comp_pixels] = -1
+                                # Remove from cluster_labels
+                                y_comp, x_comp = np.where(comp_pixels)
+                                for y, x in zip(y_comp, x_comp):
+                                    pixel_idx = np.where((y_coords_clean == y) & 
+                                                       (x_coords_clean == x))[0]
+                                    if len(pixel_idx) > 0:
+                                        new_cluster_labels[pixel_idx[0]] = -1
+                    elif len(valid_components) == 1 and valid_components[0][0] != component_sizes[0][0]:
+                        # Only one valid component but it's not the largest - keep it but discard small ones
+                        print(f"  Cluster {cluster_id + 1}: Keeping main component, " +
+                              f"discarding {len(component_sizes) - 1} small components")
+                        for comp_id, comp_size in component_sizes[1:]:
+                            comp_pixels = labeled_array == comp_id
+                            segmentation_map[comp_pixels] = -1
+                            y_comp, x_comp = np.where(comp_pixels)
+                            for y, x in zip(y_comp, x_comp):
+                                pixel_idx = np.where((y_coords_clean == y) & 
+                                                   (x_coords_clean == x))[0]
+                                if len(pixel_idx) > 0:
+                                    new_cluster_labels[pixel_idx[0]] = -1
+            
+            # Update cluster labels
+            cluster_labels = new_cluster_labels
+            
+            # Get unique cluster IDs (excluding -1 for invalid)
+            valid_mask = cluster_labels >= 0
+            cluster_labels_valid = cluster_labels[valid_mask]
+            unique_clusters = np.unique(cluster_labels_valid)
+            n_clusters_actual = len(unique_clusters)
+            
+            print(f"  Total ROIs after spatial splitting: {n_clusters_actual} (from {n_clusters_original} original clusters)")
+        else:
+            unique_clusters = range(n_clusters)
+            n_clusters_actual = n_clusters
+        
         # Create ROI bounding boxes for each cluster
         roi_list = []
         roi_labels = []
         cluster_stats = []
         
-        print(f"\nCreating ROI bounding boxes for each cluster:")
-        for cluster_id in range(n_clusters):
+        print(f"\nCreating ROI bounding boxes:")
+        for cluster_id in unique_clusters:
             # Find all pixels in this cluster
             cluster_mask = cluster_labels == cluster_id
             cluster_x = x_coords_clean[cluster_mask]
@@ -5818,16 +6542,23 @@ class LariatDataProcessor:
         if len(roi_list) == 0:
             raise ValueError(f"No clusters with >= {min_roi_pixels} pixels found")
         
-        print(f"\nDetected {len(roi_list)} ROIs from {n_clusters} clusters")
+        if enforce_spatial_locality:
+            print(f"\nDetected {len(roi_list)} ROIs from {n_clusters_original} original clusters (after spatial splitting)")
+        else:
+            print(f"\nDetected {len(roi_list)} ROIs from {n_clusters} clusters")
         
         # Store clustering information
         cluster_info = {
-            'n_clusters': n_clusters,
+            'n_clusters': n_clusters_original if enforce_spatial_locality else n_clusters,
+            'n_clusters_original': n_clusters_original,
+            'n_clusters_final': n_clusters_actual,
             'n_rois_detected': len(roi_list),
             'n_valid_pixels': len(pixel_spectra_clean),
             'n_total_pixels': n_y * n_x,
             'valid_pixel_fraction': len(pixel_spectra_clean) / (n_y * n_x),
             'min_roi_pixels': min_roi_pixels,
+            'enforce_spatial_locality': enforce_spatial_locality,
+            'min_component_pixels': min_component_pixels if enforce_spatial_locality else None,
             'cluster_stats': cluster_stats,
             'inertia': float(kmeans.inertia_),
             'segmentation_map': segmentation_map,
@@ -5887,11 +6618,17 @@ class LariatDataProcessor:
             ax.set_xlabel('Pixel X')
             ax.set_ylabel('Pixel Y')
             
-            # Set title based on clustering method
+            # Set title based on clustering method and spatial locality enforcement
             if energy is not None:
-                title = f'K-Means Segmentation at {actual_energy:.2f} eV\n{len(roi_list)} ROIs detected from {n_clusters} clusters'
+                base_title = f'K-Means Segmentation at {actual_energy:.2f} eV'
             else:
-                title = f'K-Means Spectral Segmentation\n{len(roi_list)} ROIs detected from {n_clusters} clusters'
+                base_title = f'K-Means Spectral Segmentation'
+            
+            if enforce_spatial_locality:
+                title = f'{base_title}\n{len(roi_list)} ROIs from {n_clusters_original} clusters (spatially split)'
+            else:
+                title = f'{base_title}\n{len(roi_list)} ROIs detected from {n_clusters} clusters'
+            
             ax.set_title(title)
             
             plt.tight_layout()
