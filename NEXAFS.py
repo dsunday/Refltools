@@ -8,11 +8,13 @@ import xarray as xr
 import matplotlib.pyplot as plt
 from matplotlib import rc, gridspec
 import os
+import tempfile
 import json
 import re
 from typing import Dict, Tuple, Optional, Union, List
 import matplotlib.colors as mcolors
 import pandas as pd
+from pathlib import Path
 
 from scipy.optimize import curve_fit, least_squares, minimize, differential_evolution, dual_annealing
 
@@ -51,18 +53,78 @@ def calculate_refractive_index(input_file, chemical_formula, density, x_min=None
     if x_min is not None and x_max is not None:
         merge_points = [x_min, x_max]
     
-    # Calculate the real part using Kramers-Kronig transform
-    output = kk.kk_calculate_real(
-        input_file,
-        chemical_formula,
-        load_options=None,
-        input_data_type='Beta',
-        merge_points=merge_points,
-        add_background=False,
-        fix_distortions=False,
-        curve_tolerance=0.05,
-        curve_recursion=100
-    )
+    # Prepare input data for kkcalc. The loader in kkcalc expects
+    # whitespace-separated columns, so handle common CSV inputs by
+    # converting them to a temporary space-delimited file.
+    prepared_input = input_file
+    temp_file = None
+    try:
+        if isinstance(input_file, (str, os.PathLike)):
+            path = Path(input_file)
+
+            # Detect comma-separated content (including CSV files)
+            needs_conversion = path.suffix.lower() == '.csv'
+            if not needs_conversion:
+                try:
+                    with open(path, 'r') as fh:
+                        for line in fh:
+                            stripped = line.strip()
+                            if not stripped or stripped.startswith('#'):
+                                continue
+                            needs_conversion = ',' in stripped
+                            break
+                except FileNotFoundError:
+                    pass
+
+            if needs_conversion:
+                df = pd.read_csv(path)
+                if df.shape[1] < 2:
+                    raise ValueError(
+                        f"Expected at least two columns in {path}, found {df.shape[1]}"
+                    )
+                array = df.iloc[:, :2].to_numpy(dtype=float)
+                array = array[np.all(np.isfinite(array), axis=1)]
+
+                temp = tempfile.NamedTemporaryFile(delete=False, suffix='.dat')
+                np.savetxt(temp.name, array, fmt='%.12e')
+                temp_file = temp.name
+                temp.close()
+                prepared_input = temp_file
+            else:
+                prepared_input = str(path)
+        else:
+            # Assume array-like input
+            array = np.asarray(input_file, dtype=float)
+            if array.ndim != 2 or array.shape[1] < 2:
+                raise ValueError(
+                    "input_file must be a path or an array with at least two columns"
+                )
+            array = array[:, :2]
+            array = array[np.all(np.isfinite(array), axis=1)]
+            temp = tempfile.NamedTemporaryFile(delete=False, suffix='.dat')
+            np.savetxt(temp.name, array, fmt='%.12e')
+            temp_file = temp.name
+            temp.close()
+            prepared_input = temp_file
+
+        # Calculate the real part using Kramers-Kronig transform
+        output = kk.kk_calculate_real(
+            prepared_input,
+            chemical_formula,
+            load_options=None,
+            input_data_type='Beta',
+            merge_points=merge_points,
+            add_background=False,
+            fix_distortions=False,
+            curve_tolerance=0.05,
+            curve_recursion=100
+        )
+    finally:
+        if temp_file is not None:
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
     
     # Convert ASF to refractive index components
     Delta = data.convert_data(
