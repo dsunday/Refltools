@@ -1,0 +1,6 @@
+Group,Sample,Energy (eV),Filename,Detector,Angle Range,Count Time,Trim Start,Trim End,Position X,Position Y,Min Angle,Max Angle
+1,UVSTack,270.0042,UVSTack_C_000000.dat,photodiode,0.00 - 12.00,,0,-27,19.503,5.0128,0.0005,11.9995
+1,UVSTack,270.0042,UVSTack_C_000001.dat,cem digital,10.00 - 20.00,0.25,0,-12,19.503,5.0128,10.0,20.0
+1,UVSTack,270.0042,UVSTack_C_000003.dat,cem digital,29.00 - 40.00,2.0,2,-53,19.503,5.0128,29.0,40.0
+2,UVSTack,270.0061,UVSTack_C_000002.dat,cem digital,19.00 - 30.00,1.0,0,-36,19.5,5.0178,19.0,30.0
+3,UVStack,720.0284,UVStack_Fluorine000000.dat,photodiode,679.95 - 720.03,,0,-1,22.499,5.0075,679.952153,720.028411
