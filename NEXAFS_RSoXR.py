@@ -399,6 +399,320 @@ def generate_batch_models(data_dict, energy_list, material_sld_arrays, constant_
     return models_dict, structures_dict, objectives_dict
 
 
+def simulate_reflectivity_profiles(energy_list, material_sld_arrays, constant_materials,
+                                   base_layer_params, layer_order, q_values,
+                                   sample_name="Sample", dq=1.6, scale=1.0, bkg=0.0,
+                                   return_models=False, return_structures=False,
+                                   verbose=True):
+    """Simulate reflectivity profiles for a set of energies without fitting.
+
+    Args:
+        energy_list (list[float]): Energies (eV) to simulate.
+        material_sld_arrays (dict): Maps material names to arrays with
+            columns [Energy, Real SLD, Imag SLD].
+        constant_materials (dict or None): Constant SLD definitions
+            formatted like ``{"air": {"real": 0.0, "imag": 0.0}}``.
+        base_layer_params (dict): Layer parameter templates keyed by
+            material name (thickness, roughness, optional bounds).
+        layer_order (list[str]): Order of layers from top to bottom.
+        q_values (array-like): 1D Q range (Å⁻¹) for the simulation.
+        sample_name (str): Name prefix for generated models.
+        dq (float or None): Resolution parameter supplied to
+            :class:`~refnx.reflect.ReflectModel`. If ``None`` the default
+            in refnx is used.
+        scale (float): Multiplicative scale factor for the simulation.
+        bkg (float): Constant background offset for the simulation.
+        return_models (bool): Also return the instantiated
+            :class:`~refnx.reflect.ReflectModel` objects.
+        return_structures (bool): Also return the constructed structures.
+        verbose (bool): Emit progress messages.
+
+    Returns:
+        tuple: ``(reflectivity_dict, structures_dict, models_dict)`` where
+
+            - ``reflectivity_dict`` maps energy to a dict containing
+              ``q`` and ``reflectivity`` arrays plus the model name.
+            - ``structures_dict`` maps energy to the structure (only if
+              ``return_structures``).
+            - ``models_dict`` maps energy to the model (only if
+              ``return_models``).
+
+        If a dictionary is not requested it is returned as ``None``.
+    """
+
+    q_array = np.asarray(q_values, dtype=float)
+    if q_array.ndim != 1:
+        raise ValueError("q_values must be a 1D sequence of momentum transfer values")
+    if q_array.size == 0:
+        raise ValueError("q_values must contain at least one point")
+
+    if verbose:
+        print("Generating materials for each energy...")
+
+    energy_materials = generate_materials_from_sld_arrays(
+        energy_list,
+        material_sld_arrays,
+        constant_materials
+    )
+
+    if verbose:
+        print("\nPreparing layer parameters...")
+
+    energy_layer_params = generate_layer_params_with_flexible_bounds(
+        energy_materials,
+        base_layer_params,
+        sld_offset_bounds=None
+    )
+
+    reflectivity_dict = {}
+    structures_dict = {} if return_structures else None
+    models_dict = {} if return_models else None
+
+    for energy in energy_list:
+        if energy not in energy_materials or energy not in energy_layer_params:
+            if verbose:
+                print(f"Warning: Missing materials/parameters for energy {energy} eV. Skipping.")
+            continue
+
+        materials_list = energy_materials[energy]
+        layer_params = energy_layer_params[energy]
+
+        try:
+            materials, layers, structure, model_name = create_reflectometry_model(
+                materials_list=materials_list,
+                layer_params=layer_params,
+                layer_order=layer_order,
+                sample_name=sample_name,
+                energy=energy
+            )
+
+            model = ReflectModel(structure, scale=scale, bkg=bkg, dq=dq, name=model_name)
+            model.scale.vary = False
+            model.bkg.vary = False
+            model.dq.vary = False
+
+            reflectivity = np.asarray(model(q_array), dtype=float)
+
+            reflectivity_dict[energy] = {
+                "model_name": model_name,
+                "q": q_array.copy(),
+                "reflectivity": reflectivity
+            }
+
+            if structures_dict is not None:
+                structures_dict[energy] = structure
+            if models_dict is not None:
+                models_dict[energy] = model
+
+            if verbose:
+                print(f"Simulated reflectivity for energy {energy} eV")
+
+        except Exception as exc:
+            if verbose:
+                print(f"Error simulating energy {energy} eV: {exc}")
+
+    return reflectivity_dict, structures_dict, models_dict
+
+
+def plot_simulated_reflectivity_and_sld(reflectivity_dict, structures_dict,
+                                        energies=None, profile_shift=-20,
+                                        fig_size_w=14, save_path=None,
+                                        sld_ylim=None, energy_tolerance=0.1):
+    """Plot simulated reflectivity (top) and SLD profiles (bottom).
+
+    Args:
+        reflectivity_dict (dict): Mapping of energy to dictionaries produced
+            by :func:`simulate_reflectivity_profiles` (expects ``q`` and
+            ``reflectivity`` keys).
+        structures_dict (dict): Mapping of energy to refnx structures (often
+            returned when ``return_structures=True`` was requested).
+        energies (list or float, optional): Energies to plot. ``None`` uses
+            the intersection of available energies. When specific values are
+            provided the closest available simulated energy is used; if the
+            difference exceeds ``energy_tolerance`` a warning is printed.
+        profile_shift (float): Constant shift applied to the depth axis when
+            plotting SLD profiles (useful for aligning with substrate).
+        fig_size_w (float): Width of the matplotlib figure.
+        save_path (str, optional): Path to save the resulting figure.
+        sld_ylim (tuple, optional): Y-axis limits for SLD plots
+            (``(min, max)``). ``None`` lets matplotlib choose automatically.
+
+    Returns:
+        tuple: ``(fig, axes)`` where ``axes`` is a 2 x N array of matplotlib
+        axes objects corresponding to reflectivity (row 0) and SLD (row 1).
+    """
+
+    available_energies = sorted(set(reflectivity_dict.keys()) & set(structures_dict.keys()))
+
+    if energies is None:
+        matched_energies = available_energies
+    else:
+        requested = energies if isinstance(energies, (list, tuple, np.ndarray)) else [energies]
+        matched_energies = []
+        for requested_energy in requested:
+            if not available_energies:
+                continue
+            closest_energy = min(available_energies, key=lambda e: abs(e - requested_energy))
+            difference = abs(closest_energy - requested_energy)
+            if difference > energy_tolerance:
+                print(
+                    f"Warning: requested energy {requested_energy} eV not available; "
+                    f"using closest {closest_energy} eV (Δ = {difference:.3f} eV)."
+                )
+            if closest_energy not in matched_energies:
+                matched_energies.append(closest_energy)
+
+    energies = matched_energies
+
+    if not energies:
+        print("No overlapping energies between reflectivity and structures data.")
+        return None, None
+
+    num_cols = len(energies)
+    fig, axes = plt.subplots(2, num_cols, figsize=(fig_size_w, 6), sharey=False)
+    axes = np.array(axes).reshape(2, num_cols)
+
+    for idx, energy in enumerate(energies):
+        data_entry = reflectivity_dict[energy]
+        structure = structures_dict[energy]
+
+        ax_reflect = axes[0, idx]
+        ax_sld = axes[1, idx]
+
+        # Reflectivity plot
+        ax_reflect.semilogy(data_entry["q"], data_entry["reflectivity"], color='C0')
+        ax_reflect.set_xlabel("Q (Å⁻¹)")
+        if idx == 0:
+            ax_reflect.set_ylabel("Reflectivity")
+        ax_reflect.set_title(f"{energy} eV")
+        ax_reflect.grid(True, which="both", alpha=0.2)
+
+        # SLD profile plot
+        Real_depth, Real_SLD, Imag_depth, Imag_SLD = profileflip(structure, depth_shift=0)
+        Real_depth = Real_depth + profile_shift
+        Imag_depth = Imag_depth + profile_shift
+
+        ax_sld.plot(Real_depth, Real_SLD, color='C1', label='Real SLD')
+        ax_sld.plot(Imag_depth, Imag_SLD, color='C1', linestyle='--', label='Imag SLD')
+        ax_sld.set_xlabel("Distance from Si (Å)")
+        if idx == 0:
+            ax_sld.set_ylabel(r"SLD ($10^{-6}$ Å$^{-2}$)")
+        if sld_ylim is not None:
+            ax_sld.set_ylim(*sld_ylim)
+        ax_sld.grid(True, alpha=0.2)
+        if idx == num_cols - 1:
+            ax_sld.legend(loc='best')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    return fig, axes
+
+from NEXAFS import binary_contrast_numpy
+def plot_optical_constants_comparison(n1_array, n2_array=None, energy_list=None,
+                                      bound_threshold=0.02, figsize=(15, 5),
+                                      save_path=None, x_limits=None,
+                                      labels=None):
+    """Plot real, imaginary, and binary contrast panels for optical constants.
+
+    Args:
+        n1_array (numpy.ndarray): First component array of shape (N, 3)
+            containing columns [Energy, Delta, Beta].
+        n2_array (numpy.ndarray, optional): Second component array of shape
+            (N, 3). If ``None``, vacuum is assumed in the binary contrast.
+        energy_list (list, optional): Energies for plotting. Default uses
+            the energy values from ``n1_array``.
+        bound_threshold (float): Passed to :func:`binary_contrast_numpy` to
+            highlight values near bounds in the resulting contrast plot.
+        figsize (tuple): Matplotlib figure size.
+        save_path (str, optional): If provided, the figure is saved to this
+            path (with ``dpi=300``).
+        x_limits (tuple, optional): X-axis limits for the energy axis.
+        labels (list, optional): Labels for the materials. Defaults to
+            ['Material 1', 'Material 2'] if n2_array is not None,
+            otherwise ['Material 1'].
+
+    Returns:
+        tuple: ``(fig, axes)`` containing the matplotlib figure and axes.
+    """
+
+    if n1_array is None or len(n1_array) == 0:
+        raise ValueError("n1_array must be a non-empty array of SLD data")
+
+    energy = n1_array[:, 0]
+    delta1 = n1_array[:, 1]
+    beta1 = n1_array[:, 2]
+
+    if energy_list is None:
+        energy_list = energy
+    else:
+        energy_list = np.asarray(energy_list)
+
+    if labels is None:
+        labels = ['Material 1', 'Material 2'] if n2_array is not None else ['Material 1']
+    else:
+        labels = list(labels)
+        if n2_array is None:
+            labels = labels[:1]
+        elif len(labels) < 2:
+            labels = labels + ['Material 2']
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    # Real component
+    axes[0].plot(energy, delta1, color='tab:blue', label=labels[0])
+    if n2_array is not None:
+        axes[0].plot(n2_array[:, 0], n2_array[:, 1], color='tab:cyan', linestyle='--', label=labels[1])
+    axes[0].set_title('Real Component')
+    axes[0].set_xlabel('Energy (eV)')
+    axes[0].set_ylabel('Delta (Real SLD)')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc='best')
+ 
+    # Imaginary component
+    axes[1].plot(energy, beta1, color='tab:orange', label=labels[0])
+    if n2_array is not None:
+        axes[1].plot(n2_array[:, 0], n2_array[:, 2], color='tab:red', linestyle='--', label=labels[1])
+    axes[1].set_title('Imaginary Component')
+    axes[1].set_xlabel('Energy (eV)')
+    axes[1].set_ylabel('Beta (Imag SLD)')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(loc='best')
+ 
+    # Binary contrast
+    contrast = binary_contrast_numpy(n1_array, n2_array, plot=False)
+    axes[2].plot(contrast[:, 0], contrast[:, 1], color='tab:green')
+    axes[2].set_title('Binary Contrast')
+    axes[2].set_xlabel('Energy (eV)')
+    axes[2].set_ylabel('Contrast')
+    axes[2].grid(True, alpha=0.3)
+
+    if x_limits is not None:
+        axes[0].set_xlim(x_limits)
+        axes[1].set_xlim(x_limits)
+        axes[2].set_xlim(x_limits)
+
+        mask = (contrast[:, 0] >= x_limits[0]) & (contrast[:, 0] <= x_limits[1])
+        if np.any(mask):
+            contrast_segment = contrast[mask, 1]
+            ymin = np.min(contrast_segment)
+            ymax = np.max(contrast_segment)
+            if np.isfinite(ymin) and np.isfinite(ymax):
+                if np.isclose(ymin, ymax):
+                    padding = abs(ymin) * 0.05 if ymin != 0 else 1e-6
+                    axes[2].set_ylim(ymin - padding, ymax + padding)
+                else:
+                    margin = (ymax - ymin) * 0.05
+                    axes[2].set_ylim(ymin - margin, ymax + margin)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    return fig, axes
 def visualize_batch_models(objectives_dict, structures_dict, energies=None, 
                           shade_start=None, profile_shift=-20, xlim=None, 
                           fig_size_w=16, colors=None, save_path=None):
