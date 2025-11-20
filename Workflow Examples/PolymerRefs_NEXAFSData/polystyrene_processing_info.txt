@@ -1,0 +1,11 @@
+Processing Information for polystyrene
+ROI: (350, 790, 200, 200)
+Pre-edge normalization: True
+Pre-edge subtraction: True
+Post-edge normalization: True
+Pre-edge norm range: (276, 277)
+Pre-edge sub range: (276, 277)
+Post-edge range: (325, 330)
+pre_edge_slope_params: (-0.6049097321540537, 268.77301154778036)
+pre_edge_value: 0.9999999969873248
+post_edge_value: 1.5799360878970372
