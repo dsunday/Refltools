@@ -9,7 +9,7 @@ from typing import Dict, Tuple, Optional, Union, List
 import matplotlib.colors as mcolors
 import pandas as pd
 
-from NEXAFS import load_spectrum_data,  edge_bl_func, gaussian,  plot_simulated_nexafs_spectrum, simulate_nexafs_spectrum_for_fitting, simulate_nexafs_spectrum_for_plotting
+from NEXAFS import load_spectrum_data,  edge_bl_func, gaussian    #plot_simulated_nexafs_spectrum,  simulate_nexafs_spectrum_for_plotting
 from scipy.optimize import curve_fit, least_squares, minimize, differential_evolution, dual_annealing
 
 
@@ -89,11 +89,12 @@ def validate_peak_params(peak_params: Dict) -> bool:
 
 
 
-def simulate_nexafs_spectrum(x: np.ndarray, 
-                           peak_params: Dict,
+def simulate_nexafs_spectrum(x: np.ndarray = None, 
+                           peak_params: Dict = None,
                            edge_params: Optional[Dict] = None,
                            baseline: float = 0.0,
                            experimental_intensity: Optional[np.ndarray] = None,
+                           data: Optional[np.ndarray] = None,
                            plot: bool = False,
                            plot_kwargs: Optional[Dict] = None) -> Union[Tuple[np.ndarray, np.ndarray], plt.Figure]:
     """
@@ -101,16 +102,19 @@ def simulate_nexafs_spectrum(x: np.ndarray,
     Automatically uses high-density energy axis if input has sparse spacing.
     
     Parameters:
-    x : numpy array
-        Energy values (experimental energy axis)
-    peak_params : dict
-        Peak parameters dictionary
+    x : numpy array, optional
+        Energy values (experimental energy axis). If not provided, will be extracted from 'data' parameter.
+    peak_params : dict, optional
+        Peak parameters dictionary. If not provided, will be extracted from 'data' parameter.
     edge_params : dict, optional
         Edge parameters dictionary
     baseline : float
         Baseline value
     experimental_intensity : numpy array, optional
-        Experimental intensity data for plotting comparison
+        Experimental intensity data for plotting comparison. If not provided, will be extracted from 'data' parameter.
+    data : numpy array, optional
+        2D array with shape (N, 2) where first column is energy and second column is intensity.
+        If provided, will override x and experimental_intensity parameters.
     plot : bool
         If True, automatically create plot and return figure instead of data
     plot_kwargs : dict, optional
@@ -121,6 +125,18 @@ def simulate_nexafs_spectrum(x: np.ndarray,
         If plot=False: (energy_sim, spectrum_sim) tuple
         If plot=True: matplotlib Figure object
     """
+    # Handle data parameter - extract energy and intensity if provided
+    if data is not None:
+        if data.shape[1] != 2:
+            raise ValueError("Data array must have 2 columns (energy, intensity)")
+        x = data[:, 0]
+        experimental_intensity = data[:, 1]
+    
+    # Validate required parameters
+    if x is None:
+        raise ValueError("Either 'x' parameter or 'data' parameter must be provided")
+    if peak_params is None:
+        raise ValueError("peak_params must be provided")
     # Check energy spacing
     energy_spacing = np.median(np.diff(x))
     
@@ -378,7 +394,9 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
     """
     
     # Load experimental data
-    energy_exp, intensity_exp = load_spectrum_data(data)
+    spectrum_data = load_spectrum_data(data)
+    energy_exp = spectrum_data[:, 0]
+    intensity_exp = spectrum_data[:, 1]
     
     print(f"Experimental data: {len(energy_exp)} points, energy spacing: {np.median(np.diff(energy_exp)):.3f} eV")
     
@@ -1119,31 +1137,153 @@ def plot_nexafs_fit(results: Dict,
     
     return fig
 
-def print_fit_results(results: Dict):
+def print_fit_results(fitted_peak_params, fitted_edge_params, fitted_baseline, 
+                     tolerance_percent=10, color_threshold_percent=5):
     """
-    Print a summary of fitting results.
+    Print fit results in a formatted table with color-coded text based on bound proximity.
     
     Parameters:
-    results : dict
-        Results dictionary from fit_nexafs_spectrum
+    -----------
+    fitted_peak_params : dict
+        Dictionary containing fitted peak parameters with bounds
+    fitted_edge_params : dict
+        Dictionary containing fitted edge parameters
+    fitted_baseline : float
+        Fitted baseline value
+    tolerance_percent : float, default 10
+        Percentage threshold for orange warning (fitted value within X% of bounds)
+    color_threshold_percent : float, default 5
+        Percentage threshold for red warning (fitted value very close to bounds)
     """
-    fit_result = results['fit_result']
     
-    if fit_result['success']:
-        print("=== NEXAFS Fitting Results ===")
-        print(f"R-squared: {results['r_squared']:.6f}")
-        print(f"RMSE: {results['rmse']:.6f}")
-        print(f"Degrees of freedom: {fit_result['degrees_of_freedom']}")
-        print("\nFitted Parameters:")
-        print("-" * 50)
+    def get_color_code(value, lower_bound, upper_bound, fit_flag, tolerance=tolerance_percent, threshold=color_threshold_percent):
+        """Determine color based on proximity to bounds and fit status"""
+        # If parameter is not being fitted, color it grey
+        if not fit_flag:
+            return "grey"
         
-        for param_name, value in fit_result['fitted_values'].items():
-            uncertainty = fit_result['parameter_uncertainties'].get(param_name, 0)
-            print(f"{param_name:25s}: {value:10.4f} ± {uncertainty:8.4f}")
-            
-    else:
-        print("=== Fitting Failed ===")
-        print(f"Error: {fit_result['error_message']}")
+        range_size = upper_bound - lower_bound
+        if range_size == 0:
+            return "red"  # No range, at bounds
+        
+        # Calculate how close the value is to each bound
+        lower_distance = abs(value - lower_bound) / range_size * 100
+        upper_distance = abs(value - upper_bound) / range_size * 100
+        
+        # Check if within threshold of either bound
+        if lower_distance <= threshold or upper_distance <= threshold:
+            return "red"
+        elif lower_distance <= tolerance or upper_distance <= tolerance:
+            return "orange"
+        else:
+            return "green"
+    
+    def colorize_text(text, color):
+        """Apply color formatting to text"""
+        color_codes = {
+            "red": "\033[91m",      # Red
+            "orange": "\033[93m",    # Yellow/Orange
+            "green": "\033[92m",     # Green
+            "grey": "\033[90m",      # Grey/Dark Gray
+            "reset": "\033[0m"      # Reset
+        }
+        return f"{color_codes[color]}{text}{color_codes['reset']}"
+    
+    print("=" * 120)
+    print("FIT RESULTS SUMMARY")
+    print("=" * 120)
+    print(f"Fitted Baseline: {fitted_baseline:.1f}")
+    print()
+    
+    # Print header with proper spacing - headers are 6 characters each
+    print(f"{'Peak':<6} {'Energy (eV)':<30} {'Width':<30} {'Intensity':<30}")
+    print(f"{'#':<6} {'Lower':<6} {'Fitted':<6} {'Upper':<6} {'Lower':<6} {'Fitted':<6} {'Upper':<6} {'Lower':<6} {'Fitted':<6} {'Upper':<6}")
+    print("-" * 120)
+    
+    # Extract and sort peaks by energy
+    peak_data = []
+    for key in fitted_peak_params.keys():
+        if key.endswith('_energy'):
+            peak_num = key.split('_')[1]
+            energy_val = fitted_peak_params[f"peak_{peak_num}_energy"]
+            peak_data.append((peak_num, energy_val))
+    
+    # Sort by energy value
+    peak_data.sort(key=lambda x: x[1])
+    
+    # Print each peak with proper alignment
+    for peak_num, energy_val in peak_data:
+        # Get energy data
+        energy_val = fitted_peak_params[f"peak_{peak_num}_energy"]
+        energy_bounds = fitted_peak_params[f"peak_{peak_num}_energy_bounds"]
+        energy_lower, energy_upper, energy_fit_flag = energy_bounds
+        
+        # Get intensity data
+        intensity_val = fitted_peak_params[f"peak_{peak_num}_height"]
+        intensity_bounds = fitted_peak_params[f"peak_{peak_num}_height_bounds"]
+        intensity_lower, intensity_upper, intensity_fit_flag = intensity_bounds
+        
+        # Get width data
+        width_val = fitted_peak_params[f"peak_{peak_num}_width"]
+        width_bounds = fitted_peak_params[f"peak_{peak_num}_width_bounds"]
+        width_lower, width_upper, width_fit_flag = width_bounds
+        
+        # Determine colors
+        energy_color = get_color_code(energy_val, energy_lower, energy_upper, energy_fit_flag)
+        intensity_color = get_color_code(intensity_val, intensity_lower, intensity_upper, intensity_fit_flag)
+        width_color = get_color_code(width_val, width_lower, width_upper, width_fit_flag)
+        
+        # Format values with proper alignment - pad to match header width (6 characters)
+        energy_lower_str = f"{energy_lower:6.1f}"
+        energy_val_str = f"{energy_val:6.1f}"
+        energy_upper_str = f"{energy_upper:6.1f}"
+        
+        intensity_lower_str = f"{intensity_lower:6.1f}"
+        intensity_val_str = f"{intensity_val:6.1f}"
+        intensity_upper_str = f"{intensity_upper:6.1f}"
+        
+        width_lower_str = f"{width_lower:6.1f}"
+        width_val_str = f"{width_val:6.1f}"
+        width_upper_str = f"{width_upper:6.1f}"
+        
+        # Apply colors after formatting
+        energy_lower_colored = colorize_text(energy_lower_str, energy_color)
+        energy_val_colored = colorize_text(energy_val_str, energy_color)
+        energy_upper_colored = colorize_text(energy_upper_str, energy_color)
+        
+        width_lower_colored = colorize_text(width_lower_str, width_color)
+        width_val_colored = colorize_text(width_val_str, width_color)
+        width_upper_colored = colorize_text(width_upper_str, width_color)
+        
+        intensity_lower_colored = colorize_text(intensity_lower_str, intensity_color)
+        intensity_val_colored = colorize_text(intensity_val_str, intensity_color)
+        intensity_upper_colored = colorize_text(intensity_upper_str, intensity_color)
+        
+        # Print with proper spacing using the pre-formatted strings
+        print(f"{peak_num:<6} {energy_lower_colored} {energy_val_colored} {energy_upper_colored} {width_lower_colored} {width_val_colored} {width_upper_colored} {intensity_lower_colored} {intensity_val_colored} {intensity_upper_colored}")
+    
+    print("-" * 120)
+    
+    # Print edge parameters
+    print("\nEDGE PARAMETERS:")
+    print("-" * 60)
+    edge_location = fitted_edge_params["location"]
+    edge_height = fitted_edge_params["height"]
+    edge_width = fitted_edge_params["width"]
+    edge_decay = fitted_edge_params["decay"]
+    
+    print(f"Location: {edge_location:.1f}")
+    print(f"Height:   {edge_height:.1f}")
+    print(f"Width:    {edge_width:.1f}")
+    print(f"Decay:    {edge_decay:.3f}")
+    
+    print("\n" + "=" * 120)
+    print("COLOR LEGEND:")
+    print(f"{colorize_text('Green', 'green')}: Fitted value well within bounds")
+    print(f"{colorize_text('Orange', 'orange')}: Fitted value within {tolerance_percent}% of bounds")
+    print(f"{colorize_text('Red', 'red')}: Fitted value within {color_threshold_percent}% of bounds (at bounds)")
+    print(f"{colorize_text('Grey', 'grey')}: Parameter not being fitted (fixed)")
+    print("=" * 120)
 
 
 
@@ -1411,3 +1551,117 @@ def simulate_nexafs_spectrum_for_plotting(x: np.ndarray,
     spectrum = simulate_nexafs_spectrum_for_fitting(energy_sim, peak_params, edge_params, baseline)
     
     return energy_sim, spectrum
+
+
+def generate_fitted_params_from_results(results, 
+                                      energy_tolerance=0.1, 
+                                      width_tolerance=0.2, 
+                                      height_tolerance=0.3,
+                                      edge_location_tolerance=0.1,
+                                      edge_height_tolerance=0.2,
+                                      edge_width_tolerance=0.2,
+                                      edge_decay_tolerance=0.01):
+    """
+    Generate new fitted parameter sets from fitting results with updated bounds.
+    
+    Parameters:
+    -----------
+    results : dict
+        Results dictionary from fit_nexafs_spectrum containing fitted parameters
+    energy_tolerance : float, default 0.1
+        +/- range for energy bounds (eV)
+    width_tolerance : float, default 0.2
+        +/- range for width bounds
+    height_tolerance : float, default 0.3
+        +/- range for height bounds
+    edge_location_tolerance : float, default 0.1
+        +/- range for edge location bounds (eV)
+    edge_height_tolerance : float, default 0.2
+        +/- range for edge height bounds
+    edge_width_tolerance : float, default 0.2
+        +/- range for edge width bounds
+    edge_decay_tolerance : float, default 0.01
+        +/- range for edge decay bounds
+    
+    Returns:
+    --------
+    tuple
+        (fitted_peak_params_new, fitted_edge_params_new)
+    """
+    
+    # Extract fitted parameters from results
+    fitted_peak_params = results['fitted_peak_params']
+    fitted_edge_params = results['fitted_edge_params']
+    
+    # Generate new peak parameters with updated bounds
+    fitted_peak_params_new = {}
+    
+    # Extract and sort peaks by energy to maintain order
+    peak_data = []
+    for key in fitted_peak_params.keys():
+        if key.endswith('_energy'):
+            peak_num = key.split('_')[1]
+            energy_val = fitted_peak_params[f"peak_{peak_num}_energy"]
+            peak_data.append((peak_num, energy_val))
+    
+    # Sort by energy value
+    peak_data.sort(key=lambda x: x[1])
+    
+    # Generate new parameters for each peak
+    for peak_num, energy_val in peak_data:
+        # Get fitted values
+        energy_val = fitted_peak_params[f"peak_{peak_num}_energy"]
+        width_val = fitted_peak_params[f"peak_{peak_num}_width"]
+        height_val = fitted_peak_params[f"peak_{peak_num}_height"]
+        
+        # Get original bounds to extract fit flags
+        energy_bounds = fitted_peak_params[f"peak_{peak_num}_energy_bounds"]
+        width_bounds = fitted_peak_params[f"peak_{peak_num}_width_bounds"]
+        height_bounds = fitted_peak_params[f"peak_{peak_num}_height_bounds"]
+        
+        # Extract fit flags (third element of bounds tuple)
+        energy_fit_flag = energy_bounds[2]
+        width_fit_flag = width_bounds[2]
+        height_fit_flag = height_bounds[2]
+        
+        # Generate new bounds with specified tolerances
+        fitted_peak_params_new[f"peak_{peak_num}_energy"] = energy_val
+        fitted_peak_params_new[f"peak_{peak_num}_energy_bounds"] = (
+            energy_val - energy_tolerance, 
+            energy_val + energy_tolerance, 
+            energy_fit_flag
+        )
+        
+        fitted_peak_params_new[f"peak_{peak_num}_width"] = width_val
+        fitted_peak_params_new[f"peak_{peak_num}_width_bounds"] = (
+            width_val - width_tolerance, 
+            width_val + width_tolerance, 
+            width_fit_flag
+        )
+        
+        fitted_peak_params_new[f"peak_{peak_num}_height"] = height_val
+        fitted_peak_params_new[f"peak_{peak_num}_height_bounds"] = (
+            height_val - height_tolerance, 
+            height_val + height_tolerance, 
+            height_fit_flag
+        )
+    
+    # Generate new edge parameters with updated bounds
+    fitted_edge_params_new = {}
+    
+    if fitted_edge_params is not None:
+        # Get fitted edge values
+        edge_location = fitted_edge_params["location"]
+        edge_height = fitted_edge_params["height"]
+        edge_width = fitted_edge_params["width"]
+        edge_decay = fitted_edge_params["decay"]
+        
+        # Generate new edge parameters (edge parameters don't have bounds in the same format)
+        fitted_edge_params_new = {
+            "location": edge_location,
+            "height": edge_height,
+            "width": edge_width,
+            "decay": edge_decay
+        }
+    
+    return fitted_peak_params_new, fitted_edge_params_new
