@@ -775,6 +775,10 @@ class RSoXRTrimWidget:
         for i, group in enumerate(self.scan_groups):
             self.current_backgrounds[i] = [0.0] * len(group['files'])  # Default: no background subtraction
         
+        # Initialize scaling override storage
+        # Dictionary keyed by (group_idx, file_idx) tuple to store manual scaling overrides
+        self.scaling_overrides = {}
+        
         # Store loaded scan data for the current group
         self.current_group_data = None
         
@@ -880,6 +884,15 @@ class RSoXRTrimWidget:
             layout=widgets.Layout(width='20%')
         )
         
+        self.apply_trim_to_all_button = widgets.Button(
+            description='Apply Trim to All',
+            disabled=False,
+            button_style='primary',
+            tooltip='Apply trim values to all scans with matching angular range',
+            icon='check-circle',
+            layout=widgets.Layout(width='20%')
+        )
+        
         # Background subtraction controls
         self.background_value = widgets.FloatText(
             value=0.0,
@@ -896,6 +909,34 @@ class RSoXRTrimWidget:
             button_style='info',
             tooltip='Apply background subtraction value',
             icon='minus',
+            layout=widgets.Layout(width='20%')
+        )
+        
+        self.apply_background_to_all_button = widgets.Button(
+            description='Apply Background to All',
+            disabled=False,
+            button_style='info',
+            tooltip='Apply background value to all scans with matching angular range',
+            icon='minus-circle',
+            layout=widgets.Layout(width='20%')
+        )
+        
+        # Scaling override controls
+        self.scaling_override_value = widgets.FloatText(
+            value=1.0,
+            description='Scaling Override:',
+            disabled=False,
+            layout=widgets.Layout(width='20%'),
+            step=0.001,
+            tooltip='Manual scaling factor to override automatic calculation'
+        )
+        
+        self.override_scaling_button = widgets.Button(
+            description='Override Scaling',
+            disabled=False,
+            button_style='warning',
+            tooltip='Apply manual scaling factor to current scan',
+            icon='adjust',
             layout=widgets.Layout(width='20%')
         )
         
@@ -1070,13 +1111,20 @@ class RSoXRTrimWidget:
             self.trim_start_display, 
             self.trim_end_display, 
             self.apply_trim_button,
+            self.apply_trim_to_all_button,
             self.trim_info
         ])
         
         self.background_container = widgets.HBox([
             self.background_value,
             self.apply_background_button,
+            self.apply_background_to_all_button,
             self.background_info
+        ])
+        
+        self.scaling_override_container = widgets.HBox([
+            self.scaling_override_value,
+            self.override_scaling_button
         ])
         
         # Moved smoothing options to the left side, stacked vertically
@@ -1120,6 +1168,7 @@ class RSoXRTrimWidget:
             self.group_file_container,
             self.trim_display_container,
             self.background_container,  # New: Background subtraction controls
+            self.scaling_override_container,  # Scaling override controls
             widgets.HBox([
                 self.smoothing_container,  # Left side
                 self.processing_options_container  # Right side
@@ -1139,7 +1188,10 @@ class RSoXRTrimWidget:
         self.log_scale_checkbox.observe(self._on_log_scale_change, names='value')
         self.preview_smooth_button.on_click(self._on_preview_smooth)
         self.apply_trim_button.on_click(self._on_apply_trim)
+        self.apply_trim_to_all_button.on_click(self._on_apply_trim_to_all)
         self.apply_background_button.on_click(self._on_apply_background)
+        self.apply_background_to_all_button.on_click(self._on_apply_background_to_all)
+        self.override_scaling_button.on_click(self._on_override_scaling)
         self.preview_remove_zeros.observe(self._on_log_scale_change, names='value')
         self.preview_background.observe(self._on_log_scale_change, names='value')
         self.preview_stitching_button.on_click(self._on_preview_stitching)
@@ -1156,6 +1208,52 @@ class RSoXRTrimWidget:
         corrected_data = data.copy()
         corrected_data[:, 1] = corrected_data[:, 1] - background_value
         return corrected_data
+    
+    def _get_scan_angular_range(self, group_idx, file_idx):
+        """Get the angular range (min, max) for a specific scan"""
+        try:
+            filename = self.scan_groups[group_idx]['files'][file_idx]
+            data = self.processor.load_data_file(filename)
+            if data is None or len(data) == 0:
+                return None
+            min_angle = data[:, 0].min()
+            max_angle = data[:, 0].max()
+            return (min_angle, max_angle)
+        except Exception as e:
+            print(f"Error getting angular range for group {group_idx+1}, scan {file_idx+1}: {str(e)}")
+            return None
+    
+    def _find_matching_scans(self, current_group_idx, current_file_idx, tolerance=0.1):
+        """Find all scans across all groups that have the same angular range as the current scan"""
+        # Get the angular range of the current scan
+        current_range = self._get_scan_angular_range(current_group_idx, current_file_idx)
+        if current_range is None:
+            return []
+        
+        current_min, current_max = current_range
+        matching_scans = []
+        
+        # Iterate through all groups and all scans
+        for group_idx in range(len(self.scan_groups)):
+            group = self.scan_groups[group_idx]
+            for file_idx in range(len(group['files'])):
+                # Skip the current scan itself
+                if group_idx == current_group_idx and file_idx == current_file_idx:
+                    continue
+                
+                # Get angular range for this scan
+                scan_range = self._get_scan_angular_range(group_idx, file_idx)
+                if scan_range is None:
+                    continue
+                
+                scan_min, scan_max = scan_range
+                
+                # Check if ranges match within tolerance
+                if (abs(scan_min - current_min) <= tolerance and 
+                    abs(scan_max - current_max) <= tolerance):
+                    matching_scans.append((group_idx, file_idx))
+        
+        return matching_scans
     
     def _on_apply_background(self, b):
         """UPDATED: Apply manually entered background value with correct indexing"""
@@ -1176,6 +1274,64 @@ class RSoXRTrimWidget:
         self._on_file_change({'new': self.file_select.value})
         
         print(f"Applied background subtraction: {background_value}")
+        
+        # Automatically generate stitching preview
+        self._on_preview_stitching(None)
+    
+    def _on_apply_background_to_all(self, b):
+        """Apply background value to all scans with matching angular range"""
+        # Get current indices
+        group_str = self.group_select.value
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
+        
+        file_str = self.file_select.value
+        file_idx = int(file_str.split(':')[0]) - 1
+        
+        # Get the current background value
+        background_value = self.background_value.value
+        
+        # Find all matching scans
+        matching_scans = self._find_matching_scans(group_idx, file_idx)
+        
+        if not matching_scans:
+            print("No matching scans found with the same angular range.")
+            return
+        
+        # Apply background value to all matching scans
+        updated_count = 0
+        for match_group_idx, match_file_idx in matching_scans:
+            self.current_backgrounds[match_group_idx][match_file_idx] = background_value
+            updated_count += 1
+        
+        # Update the UI
+        self._on_file_change({'new': self.file_select.value})
+        
+        print(f"Applied background value ({background_value}) to {updated_count} matching scan(s) across all groups.")
+        
+        # Automatically generate stitching preview
+        self._on_preview_stitching(None)
+    
+    def _on_override_scaling(self, b):
+        """Apply manual scaling override to current scan"""
+        # Get current indices
+        group_str = self.group_select.value
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
+        
+        file_str = self.file_select.value
+        file_idx = int(file_str.split(':')[0]) - 1
+        
+        # Get the scaling override value
+        scaling_value = self.scaling_override_value.value
+        
+        # Store the override value
+        self.scaling_overrides[(group_idx, file_idx)] = scaling_value
+        
+        # Update UI and provide feedback
+        scan_number = self.scan_groups[group_idx]['scan_numbers'][file_idx]
+        print(f"Set scaling override for Scan #{scan_number}: {scaling_value:.3f}")
+        
+        # Automatically regenerate stitching preview
+        self._on_preview_stitching(None)
     
     def _load_group_data(self, group_idx):
         """Load all data files for the current group"""
@@ -1275,6 +1431,13 @@ class RSoXRTrimWidget:
         
         # Update background display
         self.background_value.value = current_background
+        
+        # Update scaling override display
+        override_key = (group_idx, file_idx)
+        if override_key in self.scaling_overrides:
+            self.scaling_override_value.value = self.scaling_overrides[override_key]
+        else:
+            self.scaling_override_value.value = 1.0
         
         # Update trim info display with scan number
         if current_trim != original_trim:
@@ -1424,9 +1587,78 @@ class RSoXRTrimWidget:
         self._on_file_change({'new': self.file_select.value})
         
         print(f"Applied trim: [{start_trim}, {end_trim if end_trim != -1 else 'end'}]")
+        
+        # Automatically generate stitching preview
+        self._on_preview_stitching(None)
+    
+    def _on_apply_trim_to_all(self, b):
+        """Apply trim values to all scans with matching angular range"""
+        # Get current indices
+        group_str = self.group_select.value
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
+        
+        file_str = self.file_select.value
+        file_idx = int(file_str.split(':')[0]) - 1
+        
+        # Get the current trim values
+        start_trim = self.trim_start_display.value
+        end_trim = self.trim_end_display.value
+        
+        # Validate and convert end trim (same logic as _on_apply_trim)
+        if self.current_data is not None:
+            if start_trim < 0:
+                start_trim = 0
+            elif start_trim >= len(self.current_data):
+                start_trim = len(self.current_data) - 1
+            
+            if end_trim == len(self.current_data):
+                end_trim = -1
+            elif end_trim > 0 and end_trim < len(self.current_data):
+                end_trim = end_trim - len(self.current_data)
+            
+            if end_trim != -1 and start_trim >= len(self.current_data) + end_trim:
+                end_trim = -1
+        
+        # Find all matching scans
+        matching_scans = self._find_matching_scans(group_idx, file_idx)
+        
+        if not matching_scans:
+            print("No matching scans found with the same angular range.")
+            return
+        
+        # Apply trim values to all matching scans
+        updated_count = 0
+        for match_group_idx, match_file_idx in matching_scans:
+            # Load the data to validate trim values for this scan
+            try:
+                filename = self.scan_groups[match_group_idx]['files'][match_file_idx]
+                data = self.processor.load_data_file(filename)
+                
+                # Adjust trim values if needed for this scan's data length
+                adjusted_start = min(start_trim, len(data) - 1) if len(data) > 0 else 0
+                adjusted_end = end_trim
+                
+                if adjusted_end != -1:
+                    if adjusted_end >= 0:
+                        adjusted_end = adjusted_end - len(data)
+                    if adjusted_start >= len(data) + adjusted_end:
+                        adjusted_end = -1
+                
+                self.current_trims[match_group_idx][match_file_idx] = (adjusted_start, adjusted_end)
+                updated_count += 1
+            except Exception as e:
+                print(f"Warning: Could not apply trim to group {match_group_idx+1}, scan {match_file_idx+1}: {str(e)}")
+        
+        # Update the UI
+        self._on_file_change({'new': self.file_select.value})
+        
+        print(f"Applied trim values to {updated_count} matching scan(s) across all groups.")
+        
+        # Automatically generate stitching preview
+        self._on_preview_stitching(None)
     
     def _on_reset_file(self, b):
-        """UPDATED: Reset trim and background for the current file with scan number reference"""
+        """UPDATED: Reset trim, background, and scaling override for the current file with scan number reference"""
         # Get current indices
         group_str = self.group_select.value
         group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
@@ -1441,15 +1673,21 @@ class RSoXRTrimWidget:
         self.current_trims[group_idx][file_idx] = self.original_trims[group_idx][file_idx]
         self.current_backgrounds[group_idx][file_idx] = 0.0
         
+        # Clear scaling override for this scan
+        override_key = (group_idx, file_idx)
+        if override_key in self.scaling_overrides:
+            del self.scaling_overrides[override_key]
+        
         # Update the UI
         self._on_file_change({'new': self.file_select.value})
         
         with self.output_area:
             print(f"Reset trim values for scan #{scan_number} to original: {self.original_trims[group_idx][file_idx]}")
             print(f"Reset background to 0.0")
+            print(f"Cleared scaling override for scan #{scan_number}")
     
     def _on_reset_group(self, b):
-        """UPDATED: Reset all trims and backgrounds for the current group with correct indexing"""
+        """UPDATED: Reset all trims, backgrounds, and scaling overrides for the current group with correct indexing"""
         # Get current group index
         group_str = self.group_select.value
         group_idx = int(group_str.split(':')[0].split()[1]) - 1  # Extract group number
@@ -1458,6 +1696,11 @@ class RSoXRTrimWidget:
         self.current_trims[group_idx] = deepcopy(self.original_trims[group_idx])
         self.current_backgrounds[group_idx] = [0.0] * len(self.scan_groups[group_idx]['files'])
         
+        # Clear scaling overrides for all scans in this group
+        keys_to_remove = [key for key in self.scaling_overrides.keys() if key[0] == group_idx]
+        for key in keys_to_remove:
+            del self.scaling_overrides[key]
+        
         # Update the UI
         self._on_file_change({'new': self.file_select.value})
         
@@ -1465,6 +1708,7 @@ class RSoXRTrimWidget:
             clear_output(wait=True)
             print(f"Reset all trim values for group {group_idx+1} to original values")
             print(f"Reset all background values to 0.0")
+            print(f"Cleared all scaling overrides for group {group_idx+1}")
             print("Use the 'Preview Stitching' button to see how the original values affect the stitching.")
             
     def _auto_preview_stitching(self):
@@ -1610,32 +1854,39 @@ class RSoXRTrimWidget:
                         # Store original data for plotting
                         orig_scan = scan.copy()
                         
-                        # Calculate scaling factor if there's overlap
-                        scale = 1.0
-                        if curr_min_angle <= prev_max_angle:
-                            # There's overlap - calculate scaling factor
-                            overlap_mask_combined = combined[:, 0] >= curr_min_angle
-                            overlap_mask_scan = scan[:, 0] <= prev_max_angle
-                            
-                            if np.any(overlap_mask_combined) and np.any(overlap_mask_scan):
-                                overlap_combined = combined[overlap_mask_combined]
-                                overlap_scan = scan[overlap_mask_scan]
+                        # Check if there's a manual override for this scan
+                        override_key = (group_idx, i)
+                        if override_key in self.scaling_overrides:
+                            # Use manual override
+                            scale = self.scaling_overrides[override_key]
+                            print(f"Scan {i+1}: scaling factor = {scale:.3f} (OVERRIDE)")
+                        else:
+                            # Calculate scaling factor if there's overlap
+                            scale = 1.0
+                            if curr_min_angle <= prev_max_angle:
+                                # There's overlap - calculate scaling factor
+                                overlap_mask_combined = combined[:, 0] >= curr_min_angle
+                                overlap_mask_scan = scan[:, 0] <= prev_max_angle
                                 
-                                if len(overlap_combined) > 0 and len(overlap_scan) > 0:
-                                    # Use median ratio for robust scaling
-                                    ratios = []
-                                    for angle in overlap_scan[:, 0]:
-                                        # Find closest angle in combined data
-                                        idx = np.argmin(np.abs(overlap_combined[:, 0] - angle))
-                                        scan_idx = np.argmin(np.abs(overlap_scan[:, 0] - angle))
-                                        if (overlap_combined[idx, 1] > 0 and 
-                                            overlap_scan[scan_idx, 1] > 0):  # Avoid division by zero
-                                            ratios.append(overlap_combined[idx, 1] / overlap_scan[scan_idx, 1])
+                                if np.any(overlap_mask_combined) and np.any(overlap_mask_scan):
+                                    overlap_combined = combined[overlap_mask_combined]
+                                    overlap_scan = scan[overlap_mask_scan]
                                     
-                                    if len(ratios) > 0:
-                                        scale = np.median(ratios)
-                        
-                        print(f"Scan {i+1}: scaling factor = {scale:.3f}")
+                                    if len(overlap_combined) > 0 and len(overlap_scan) > 0:
+                                        # Use median ratio for robust scaling
+                                        ratios = []
+                                        for angle in overlap_scan[:, 0]:
+                                            # Find closest angle in combined data
+                                            idx = np.argmin(np.abs(overlap_combined[:, 0] - angle))
+                                            scan_idx = np.argmin(np.abs(overlap_scan[:, 0] - angle))
+                                            if (overlap_combined[idx, 1] > 0 and 
+                                                overlap_scan[scan_idx, 1] > 0):  # Avoid division by zero
+                                                ratios.append(overlap_combined[idx, 1] / overlap_scan[scan_idx, 1])
+                                        
+                                        if len(ratios) > 0:
+                                            scale = np.median(ratios)
+                            
+                            print(f"Scan {i+1}: scaling factor = {scale:.3f} (auto-calculated)")
                         
                         # Apply scaling
                         scan[:, 1] = scan[:, 1] * scale
@@ -1806,6 +2057,57 @@ class RSoXRTrimWidget:
         except Exception as e:
             print(f"Error previewing smoothing: {str(e)}")
             print("Tip: Try adjusting the window size or polynomial order.")
+    def _save_angular_ranges(self, group, output_dir):
+        """Save angular ranges (after trimming) to CSV file"""
+        try:
+            # Calculate angular ranges for each trimmed scan
+            angular_ranges = []
+            
+            for i, filename in enumerate(group['files']):
+                try:
+                    # Load the data file
+                    data = self.processor.load_data_file(filename)
+                    
+                    # Apply trim
+                    trim_start, trim_end = group['trims'][i]
+                    end_idx = len(data) + trim_end if trim_end < 0 else trim_end
+                    trimmed_data = data[trim_start:end_idx]
+                    
+                    if len(trimmed_data) > 0:
+                        # Get min and max angles from the trimmed data
+                        min_angle = trimmed_data[:, 0].min()
+                        max_angle = trimmed_data[:, 0].max()
+                        angular_ranges.extend([min_angle, max_angle])
+                    else:
+                        # No data after trimming
+                        angular_ranges.extend([np.nan, np.nan])
+                except Exception as e:
+                    print(f"Warning: Could not calculate angular range for scan {i+1}: {str(e)}")
+                    angular_ranges.extend([np.nan, np.nan])
+            
+            # Create DataFrame with energy as first column, then angle pairs for each scan
+            columns = ['Energy (eV)']
+            for i in range(len(group['files'])):
+                columns.append(f'Scan{i+1}_StartAngle')
+                columns.append(f'Scan{i+1}_EndAngle')
+            
+            data_row = [group['energy']] + angular_ranges
+            df = pd.DataFrame([data_row], columns=columns)
+            
+            # Save to CSV (append if file exists, otherwise create new)
+            csv_filename = os.path.join(output_dir, 'angular_ranges.csv')
+            if os.path.exists(csv_filename):
+                # Append to existing file
+                df.to_csv(csv_filename, mode='a', header=False, index=False)
+                print(f"Appended angular ranges to {csv_filename}")
+            else:
+                # Create new file with header
+                df.to_csv(csv_filename, index=False)
+                print(f"Saved angular ranges to {csv_filename}")
+                
+        except Exception as e:
+            print(f"Warning: Could not save angular ranges: {str(e)}")
+    
     def _on_process_group(self, b):
         """UPDATED: Process the current group with scan number references and consistent open beam handling"""
         # Get current group index
@@ -1820,6 +2122,13 @@ class RSoXRTrimWidget:
         
         # Add background values to the group
         group['backgrounds'] = self.current_backgrounds[group_idx]
+        
+        # Add scaling overrides to the group (convert dict keys to list indices)
+        scaling_overrides_list = [None] * len(group['files'])
+        for (g_idx, f_idx), scale_value in self.scaling_overrides.items():
+            if g_idx == group_idx and f_idx < len(scaling_overrides_list):
+                scaling_overrides_list[f_idx] = scale_value
+        group['scaling_overrides'] = scaling_overrides_list
         
         # Create output directory if it doesn't exist
         output_dir = self.output_dir.value
@@ -1844,6 +2153,14 @@ class RSoXRTrimWidget:
             print(f"Scan numbers: {', '.join(f'#{num}' for num in group['scan_numbers'])}")
             print(f"Using trims: {group['trims']}")
             print(f"Using backgrounds: {group['backgrounds']}")
+            # Print scaling overrides if any exist
+            scaling_info = []
+            for i, scale_val in enumerate(group['scaling_overrides']):
+                if scale_val is not None:
+                    scan_num = group['scan_numbers'][i] if i < len(group['scan_numbers']) else i+1
+                    scaling_info.append(f"Scan #{scan_num}: {scale_val:.3f}")
+            if scaling_info:
+                print(f"Using scaling overrides: {', '.join(scaling_info)}")
             print(f"Output directory: {output_dir}")
             
             # Print normalization info
@@ -1863,23 +2180,213 @@ class RSoXRTrimWidget:
                 # Check if the processor has the enhanced open beam method
                 if hasattr(self.processor, 'process_scan_set_with_open_beam_option'):
                     # Use the enhanced processor with explicit open beam support
-                    result = self.processor.process_scan_set_with_open_beam_option(
-                        scan_group=group,
-                        output_filename=output_filename,
-                        normalize=self.normalize_checkbox.value,
-                        plot=True,
-                        convert_to_photons=self.convert_photons_checkbox.value,
-                        smooth_data=self.smooth_checkbox.value,
-                        savgol_window=window_size,
-                        savgol_order=polynomial_order,
-                        remove_zeros=self.remove_zeros_checkbox.value,
-                        estimate_thickness=False,  # Disabled thickness estimation
-                        output_dir=output_dir,
-                        use_open_beam=use_open_beam  # Explicitly pass open beam setting
-                    )
+                    # Check if we need to manually apply scaling overrides
+                    import inspect
+                    sig = inspect.signature(self.processor.process_scan_set_with_open_beam_option)
+                    processor_supports_scaling = 'scaling_overrides' in sig.parameters
+                    
+                    if processor_supports_scaling:
+                        # Processor supports scaling_overrides, pass them directly
+                        process_kwargs = {
+                            'scan_group': group,
+                            'output_filename': output_filename,
+                            'normalize': self.normalize_checkbox.value,
+                            'plot': True,
+                            'convert_to_photons': self.convert_photons_checkbox.value,
+                            'smooth_data': self.smooth_checkbox.value,
+                            'savgol_window': window_size,
+                            'savgol_order': polynomial_order,
+                            'remove_zeros': self.remove_zeros_checkbox.value,
+                            'estimate_thickness': False,  # Disabled thickness estimation
+                            'output_dir': output_dir,
+                            'use_open_beam': use_open_beam,  # Explicitly pass open beam setting
+                            'scaling_overrides': group['scaling_overrides']
+                        }
+                        print("Passing scaling overrides to process_scan_set_with_open_beam_option")
+                        result = self.processor.process_scan_set_with_open_beam_option(**process_kwargs)
+                    elif any(scale is not None for scale in group['scaling_overrides']):
+                        # Processor doesn't support scaling_overrides, manually apply them
+                        print("Processor doesn't support scaling_overrides parameter.")
+                        print("Manually applying scaling overrides during processing...")
+                        
+                        # Load scans and apply scaling manually (same logic as reduce_data path)
+                        scans = []
+                        for filename in group['files']:
+                            try:
+                                data = self.processor.load_data_file(filename)
+                                scans.append(data)
+                            except Exception as e:
+                                print(f"Error loading {os.path.basename(filename)}: {str(e)}")
+                                continue
+                        
+                        if not scans:
+                            print("Error: No valid scan data loaded")
+                            return
+                        
+                        # Apply normalization before stitching (same order as preview)
+                        use_open_beam_for_processing = (self.normalize_checkbox.value and
+                                                       hasattr(self.processor, 'open_beam_data') and 
+                                                       self.processor.open_beam_data is not None and
+                                                       len(self.processor.open_beam_data) > 0 and
+                                                       use_open_beam)
+                        
+                        open_beam_intensity = None
+                        if use_open_beam_for_processing:
+                            open_beam_intensity = self.processor.get_open_beam_intensity(group['energy'])
+                        
+                        processed_scans = []
+                        combined = None
+                        
+                        for i, scan_data in enumerate(scans):
+                            # Apply trim
+                            trim_start, trim_end = group['trims'][i]
+                            end_idx = len(scan_data) + trim_end if trim_end < 0 else trim_end
+                            trimmed_scan = scan_data[trim_start:end_idx].copy()
+                            
+                            # Apply background
+                            if i < len(group['backgrounds']):
+                                bg_value = group['backgrounds'][i]
+                                if bg_value != 0.0:
+                                    trimmed_scan = self._apply_background_subtraction(trimmed_scan, bg_value)
+                            
+                            # Apply open beam normalization BEFORE stitching (same as preview)
+                            if use_open_beam_for_processing and open_beam_intensity is not None and open_beam_intensity > 0:
+                                trimmed_scan[:, 1] = trimmed_scan[:, 1] / open_beam_intensity
+                            
+                            # Remove zeros if requested (before stitching)
+                            if self.remove_zeros_checkbox.value:
+                                non_zero_mask = trimmed_scan[:, 1] > 0
+                                if not all(non_zero_mask):
+                                    trimmed_scan = trimmed_scan[non_zero_mask]
+                            
+                            if i == 0:
+                                # First scan doesn't need scaling
+                                processed_scans.append(trimmed_scan)
+                                combined = trimmed_scan.copy()
+                            else:
+                                # Apply scaling if override exists
+                                scale = 1.0
+                                if i < len(group['scaling_overrides']) and group['scaling_overrides'][i] is not None:
+                                    # Use override
+                                    scale = group['scaling_overrides'][i]
+                                    print(f"  Applying scaling override to scan {i+1}: {scale:.3f}")
+                                elif combined is not None and len(combined) > 0 and len(trimmed_scan) > 0:
+                                    # Calculate scaling from overlap (same logic as preview)
+                                    prev_max_angle = combined[:, 0].max()
+                                    curr_min_angle = trimmed_scan[:, 0].min()
+                                    
+                                    if curr_min_angle <= prev_max_angle:
+                                        overlap_mask_combined = combined[:, 0] >= curr_min_angle
+                                        overlap_mask_scan = trimmed_scan[:, 0] <= prev_max_angle
+                                        
+                                        if np.any(overlap_mask_combined) and np.any(overlap_mask_scan):
+                                            overlap_combined = combined[overlap_mask_combined]
+                                            overlap_scan = trimmed_scan[overlap_mask_scan]
+                                            
+                                            if len(overlap_combined) > 0 and len(overlap_scan) > 0:
+                                                ratios = []
+                                                for angle in overlap_scan[:, 0]:
+                                                    idx = np.argmin(np.abs(overlap_combined[:, 0] - angle))
+                                                    scan_idx = np.argmin(np.abs(overlap_scan[:, 0] - angle))
+                                                    if (overlap_combined[idx, 1] > 0 and overlap_scan[scan_idx, 1] > 0):
+                                                        ratios.append(overlap_combined[idx, 1] / overlap_scan[scan_idx, 1])
+                                                
+                                                if len(ratios) > 0:
+                                                    scale = np.median(ratios)
+                                
+                                # Apply scaling
+                                trimmed_scan[:, 1] = trimmed_scan[:, 1] * scale
+                                processed_scans.append(trimmed_scan)
+                                
+                                # Update combined data
+                                combined = np.concatenate((combined, trimmed_scan))
+                        
+                        # Update group to use pre-stitched data
+                        # Create a modified group with a single "scan" that is the combined data
+                        modified_group = deepcopy(group)
+                        # Save original files for reference, but we'll process the combined data
+                        # We need to create a temporary file or pass the data differently
+                        # For now, let's modify the group to have a single file that represents the combined data
+                        # Actually, we should use reduce_data_with_open_beam_option instead since it accepts scans directly
+                        print("  Switching to reduce_data_with_open_beam_option for pre-stitched data")
+                        reduce_kwargs = {
+                            'scans': [combined],
+                            'trims': [(0, -1)],
+                            'backgrounds': [0.0],
+                            'energy': group['energy'],
+                            'normalize': False,  # Already normalized
+                            'plot': True,
+                            'convert_to_photons': self.convert_photons_checkbox.value,
+                            'smooth_data': self.smooth_checkbox.value,
+                            'savgol_window': window_size,
+                            'savgol_order': polynomial_order,
+                            'remove_zeros': False,  # Already removed
+                            'output_dir': output_dir,
+                            'plot_prefix': f"{group['sample_name']}_{group['energy']:.1f}eV",
+                            'use_open_beam': False  # Already normalized
+                        }
+                        result = self.processor.reduce_data_with_open_beam_option(**reduce_kwargs)
+                        
+                        if result is not None:
+                            # Save the data manually
+                            output_path = os.path.join(output_dir, output_filename)
+                            
+                            # Handle tuple result (smoothed, raw)
+                            if isinstance(result, tuple) and self.smooth_checkbox.value:
+                                data_to_save = result[0]  # Use smoothed data
+                            else:
+                                data_to_save = result
+                            
+                            # Create header with processing info
+                            header = f"# Processed RSoXR data\n# Sample: {group['sample_name']}\n# Energy: {group['energy']:.1f} eV"
+                            header += f"\n# Normalization: {'Open Beam' if use_open_beam_for_processing else 'Standard'}"
+                            if use_open_beam_for_processing:
+                                header += f"\n# Open beam I0: {open_beam_intensity:.3e}"
+                            header += "\n# Columns: Q(Å⁻¹), Intensity, Error"
+                            
+                            # Add background information to header
+                            bg_info = [f"Scan #{scan_num}: -{bg:.3f}" for scan_num, bg in zip(group['scan_numbers'], group['backgrounds']) if bg != 0.0]
+                            if bg_info:
+                                header += f"\n# Background subtractions: {', '.join(bg_info)}"
+                            
+                            # Add scaling override info
+                            scaling_info = [f"Scan #{scan_num}: {scale:.3f}" for scan_num, scale in zip(group['scan_numbers'], group['scaling_overrides']) if scale is not None]
+                            if scaling_info:
+                                header += f"\n# Scaling overrides: {', '.join(scaling_info)}"
+                            
+                            np.savetxt(output_path, data_to_save, delimiter='\t', 
+                                    header=header, fmt='%.6e')
+                            
+                            print(f"Data saved to {output_path}")
+                            print("Processing completed successfully with scaling overrides applied!")
+                            
+                            # Save angular ranges
+                            self._save_angular_ranges(group, output_dir)
+                        else:
+                            print("Error: Processing returned no data")
+                    else:
+                        # No scaling overrides, use normal processing
+                        process_kwargs = {
+                            'scan_group': group,
+                            'output_filename': output_filename,
+                            'normalize': self.normalize_checkbox.value,
+                            'plot': True,
+                            'convert_to_photons': self.convert_photons_checkbox.value,
+                            'smooth_data': self.smooth_checkbox.value,
+                            'savgol_window': window_size,
+                            'savgol_order': polynomial_order,
+                            'remove_zeros': self.remove_zeros_checkbox.value,
+                            'estimate_thickness': False,
+                            'output_dir': output_dir,
+                            'use_open_beam': use_open_beam
+                        }
+                        result = self.processor.process_scan_set_with_open_beam_option(**process_kwargs)
                     
                     print("\nProcessing completed successfully with explicit open beam handling!")
                     print(f"Data saved to {os.path.join(output_dir, output_filename)}")
+                    
+                    # Save angular ranges
+                    self._save_angular_ranges(group, output_dir)
                     
                 elif hasattr(self.processor, 'reduce_data_with_open_beam_option'):
                     # Use the enhanced reduce_data method directly with plotting
@@ -1900,22 +2407,132 @@ class RSoXRTrimWidget:
                         return
                     
                     # Process using the enhanced method WITH PLOTTING ENABLED
-                    result = self.processor.reduce_data_with_open_beam_option(
-                        scans=scans,
-                        trims=group['trims'],
-                        backgrounds=group['backgrounds'],
-                        energy=group['energy'],
-                        normalize=self.normalize_checkbox.value,
-                        plot=True,  # IMPORTANT: Enable plotting
-                        convert_to_photons=self.convert_photons_checkbox.value,
-                        smooth_data=self.smooth_checkbox.value,
-                        savgol_window=window_size,
-                        savgol_order=polynomial_order,
-                        remove_zeros=self.remove_zeros_checkbox.value,
-                        output_dir=output_dir,
-                        plot_prefix=f"{group['sample_name']}_{group['energy']:.1f}eV",
-                        use_open_beam=use_open_beam  # Explicitly control open beam
-                    )
+                    # Check if method accepts scaling_overrides parameter
+                    import inspect
+                    sig = inspect.signature(self.processor.reduce_data_with_open_beam_option)
+                    reduce_kwargs = {
+                        'scans': scans,
+                        'trims': group['trims'],
+                        'backgrounds': group['backgrounds'],
+                        'energy': group['energy'],
+                        'normalize': self.normalize_checkbox.value,
+                        'plot': True,  # IMPORTANT: Enable plotting
+                        'convert_to_photons': self.convert_photons_checkbox.value,
+                        'smooth_data': self.smooth_checkbox.value,
+                        'savgol_window': window_size,
+                        'savgol_order': polynomial_order,
+                        'remove_zeros': self.remove_zeros_checkbox.value,
+                        'output_dir': output_dir,
+                        'plot_prefix': f"{group['sample_name']}_{group['energy']:.1f}eV",
+                        'use_open_beam': use_open_beam  # Explicitly control open beam
+                    }
+                    # Check if processor supports scaling_overrides
+                    processor_supports_scaling = 'scaling_overrides' in sig.parameters
+                    
+                    if processor_supports_scaling:
+                        reduce_kwargs['scaling_overrides'] = group['scaling_overrides']
+                        print("Passing scaling overrides to processor method")
+                    elif any(scale is not None for scale in group['scaling_overrides']):
+                        # Processor doesn't support scaling_overrides parameter
+                        # We need to manually apply scaling by processing scans with scaling applied
+                        print("Processor doesn't support scaling_overrides parameter.")
+                        print("Manually applying scaling overrides during processing...")
+                        
+                        # Manually process scans with scaling applied
+                        # This mimics the stitching logic from preview but applies it to the actual processing
+                        # Apply normalization before stitching (same order as preview)
+                        # Only apply if normalization is enabled
+                        use_open_beam_for_processing = (self.normalize_checkbox.value and
+                                                       hasattr(self.processor, 'open_beam_data') and 
+                                                       self.processor.open_beam_data is not None and
+                                                       len(self.processor.open_beam_data) > 0 and
+                                                       use_open_beam)
+                        
+                        open_beam_intensity = None
+                        if use_open_beam_for_processing:
+                            open_beam_intensity = self.processor.get_open_beam_intensity(group['energy'])
+                        
+                        processed_scans = []
+                        combined = None
+                        
+                        for i, scan_data in enumerate(scans):
+                            # Apply trim
+                            trim_start, trim_end = group['trims'][i]
+                            end_idx = len(scan_data) + trim_end if trim_end < 0 else trim_end
+                            trimmed_scan = scan_data[trim_start:end_idx].copy()
+                            
+                            # Apply background
+                            if i < len(group['backgrounds']):
+                                bg_value = group['backgrounds'][i]
+                                if bg_value != 0.0:
+                                    trimmed_scan = self._apply_background_subtraction(trimmed_scan, bg_value)
+                            
+                            # Apply open beam normalization BEFORE stitching (same as preview)
+                            if use_open_beam_for_processing and open_beam_intensity is not None and open_beam_intensity > 0:
+                                trimmed_scan[:, 1] = trimmed_scan[:, 1] / open_beam_intensity
+                            
+                            # Remove zeros if requested (before stitching)
+                            if self.remove_zeros_checkbox.value:
+                                non_zero_mask = trimmed_scan[:, 1] > 0
+                                if not all(non_zero_mask):
+                                    trimmed_scan = trimmed_scan[non_zero_mask]
+                            
+                            if i == 0:
+                                # First scan doesn't need scaling
+                                processed_scans.append(trimmed_scan)
+                                combined = trimmed_scan.copy()
+                            else:
+                                # Apply scaling if override exists
+                                scale = 1.0
+                                if i < len(group['scaling_overrides']) and group['scaling_overrides'][i] is not None:
+                                    # Use override
+                                    scale = group['scaling_overrides'][i]
+                                    print(f"  Applying scaling override to scan {i+1}: {scale:.3f}")
+                                elif combined is not None and len(combined) > 0 and len(trimmed_scan) > 0:
+                                    # Calculate scaling from overlap (same logic as preview)
+                                    prev_max_angle = combined[:, 0].max()
+                                    curr_min_angle = trimmed_scan[:, 0].min()
+                                    
+                                    if curr_min_angle <= prev_max_angle:
+                                        overlap_mask_combined = combined[:, 0] >= curr_min_angle
+                                        overlap_mask_scan = trimmed_scan[:, 0] <= prev_max_angle
+                                        
+                                        if np.any(overlap_mask_combined) and np.any(overlap_mask_scan):
+                                            overlap_combined = combined[overlap_mask_combined]
+                                            overlap_scan = trimmed_scan[overlap_mask_scan]
+                                            
+                                            if len(overlap_combined) > 0 and len(overlap_scan) > 0:
+                                                ratios = []
+                                                for angle in overlap_scan[:, 0]:
+                                                    idx = np.argmin(np.abs(overlap_combined[:, 0] - angle))
+                                                    scan_idx = np.argmin(np.abs(overlap_scan[:, 0] - angle))
+                                                    if (overlap_combined[idx, 1] > 0 and overlap_scan[scan_idx, 1] > 0):
+                                                        ratios.append(overlap_combined[idx, 1] / overlap_scan[scan_idx, 1])
+                                                
+                                                if len(ratios) > 0:
+                                                    scale = np.median(ratios)
+                                
+                                # Apply scaling
+                                trimmed_scan[:, 1] = trimmed_scan[:, 1] * scale
+                                processed_scans.append(trimmed_scan)
+                                
+                                # Update combined data
+                                combined = np.concatenate((combined, trimmed_scan))
+                        
+                        # Instead of passing individual scans (which the processor will re-stitch),
+                        # pass the already-stitched combined data as a single scan
+                        # This prevents the processor from recalculating scaling
+                        print("  Passing pre-stitched data to processor (scaling overrides applied)")
+                        reduce_kwargs['scans'] = [combined]  # Pass as single combined scan
+                        # Update trims and backgrounds to match the single combined scan
+                        reduce_kwargs['trims'] = [(0, -1)]  # Use all of the combined data
+                        reduce_kwargs['backgrounds'] = [0.0]  # Backgrounds already applied
+                        # Disable normalization since we've already applied it before stitching
+                        if use_open_beam_for_processing:
+                            reduce_kwargs['normalize'] = False
+                            print("  Normalization already applied before stitching, disabling processor normalization")
+                    
+                    result = self.processor.reduce_data_with_open_beam_option(**reduce_kwargs)
                     
                     if result is not None:
                         # Save the data manually
@@ -1945,6 +2562,9 @@ class RSoXRTrimWidget:
                         
                         print(f"Data saved to {output_path}")
                         print("Processing completed successfully with consistent open beam handling!")
+                        
+                        # Save angular ranges
+                        self._save_angular_ranges(group, output_dir)
                     else:
                         print("Error: Processing returned no data")
                     
@@ -1970,6 +2590,9 @@ class RSoXRTrimWidget:
                         print(f"\nProcessing completed, but open beam normalization may not match preview!")
                         print(f"Data saved to {os.path.join(output_dir, output_filename)}")
                         print("To ensure consistent open beam handling, update the processor with enhanced methods.")
+                        
+                        # Save angular ranges
+                        self._save_angular_ranges(group, output_dir)
                 
                 # Show processing summary
                 if result is not None:
