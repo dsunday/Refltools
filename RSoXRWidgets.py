@@ -848,7 +848,26 @@ class RSoXRTrimWidget:
             options=group_options,
             description='Group:',
             disabled=False,
-            layout=widgets.Layout(width='80%')
+            layout=widgets.Layout(width='60%')
+        )
+        
+        # Navigation buttons for groups
+        self.previous_group_button = widgets.Button(
+            description='◄ Previous',
+            disabled=False,
+            button_style='',
+            tooltip='Go to previous group',
+            icon='arrow-left',
+            layout=widgets.Layout(width='15%')
+        )
+        
+        self.next_group_button = widgets.Button(
+            description='Next ►',
+            disabled=False,
+            button_style='',
+            tooltip='Go to next group',
+            icon='arrow-right',
+            layout=widgets.Layout(width='15%')
         )
         
         # Select file within group widget - Updated to show scan numbers
@@ -1104,7 +1123,12 @@ class RSoXRTrimWidget:
         )
         
         # Arrange widgets in containers
-        self.group_file_container = widgets.HBox([self.group_select, self.file_select])
+        self.group_file_container = widgets.HBox([
+            self.group_select, 
+            self.previous_group_button,
+            self.next_group_button,
+            self.file_select
+        ])
         
         # Modified trim display container to include background controls
         self.trim_display_container = widgets.HBox([
@@ -1181,6 +1205,11 @@ class RSoXRTrimWidget:
         # Register callbacks
         self.group_select.observe(self._on_group_change, names='value')
         self.file_select.observe(self._on_file_change, names='value')
+        self.previous_group_button.on_click(self._on_previous_group)
+        self.next_group_button.on_click(self._on_next_group)
+        
+        # Update button states based on current group
+        self._update_group_navigation_buttons()
         self.reset_file_button.on_click(self._on_reset_file)
         self.reset_group_button.on_click(self._on_reset_group)
         self.process_button.on_click(self._on_process_group)
@@ -1199,6 +1228,8 @@ class RSoXRTrimWidget:
         # Initialize by selecting the first group
         if group_options:
             self._on_group_change({'new': group_options[0]})
+            # Update navigation button states after initial group selection
+            self._update_group_navigation_buttons()
     
     def _apply_background_subtraction(self, data, background_value):
         """Apply background subtraction to data"""
@@ -1345,11 +1376,73 @@ class RSoXRTrimWidget:
                 print(f"Error loading data for {os.path.basename(filename)}: {str(e)}")
                 self.current_group_data.append(None)
     
+    def _update_group_navigation_buttons(self):
+        """Update the enabled/disabled state of previous/next group buttons"""
+        if not hasattr(self, 'group_select') or not self.group_select.options:
+            return
+        
+        current_idx = self.group_select.index if hasattr(self.group_select, 'index') else None
+        if current_idx is None:
+            # Find current index from value
+            try:
+                current_value = self.group_select.value
+                current_idx = self.group_select.options.index(current_value)
+            except (ValueError, AttributeError):
+                current_idx = 0
+        
+        total_groups = len(self.group_select.options)
+        
+        # Disable previous button if on first group
+        self.previous_group_button.disabled = (current_idx == 0)
+        
+        # Disable next button if on last group
+        self.next_group_button.disabled = (current_idx >= total_groups - 1)
+    
+    def _on_previous_group(self, b):
+        """Navigate to previous group"""
+        if not self.group_select.options:
+            return
+        
+        current_idx = self.group_select.index if hasattr(self.group_select, 'index') else None
+        if current_idx is None:
+            try:
+                current_value = self.group_select.value
+                current_idx = self.group_select.options.index(current_value)
+            except (ValueError, AttributeError):
+                return
+        
+        if current_idx > 0:
+            # Move to previous group
+            self.group_select.index = current_idx - 1
+            self._update_group_navigation_buttons()
+    
+    def _on_next_group(self, b):
+        """Navigate to next group"""
+        if not self.group_select.options:
+            return
+        
+        current_idx = self.group_select.index if hasattr(self.group_select, 'index') else None
+        if current_idx is None:
+            try:
+                current_value = self.group_select.value
+                current_idx = self.group_select.options.index(current_value)
+            except (ValueError, AttributeError):
+                return
+        
+        total_groups = len(self.group_select.options)
+        if current_idx < total_groups - 1:
+            # Move to next group
+            self.group_select.index = current_idx + 1
+            self._update_group_navigation_buttons()
+    
     def _on_group_change(self, change):
         """UPDATED: Handle group selection change with scan numbers"""
         group_str = change['new']
         # Extract group number from "Group X: ..." format
         group_idx = int(group_str.split(':')[0].split()[1]) - 1
+        
+        # Update navigation button states
+        self._update_group_navigation_buttons()
         
         group = self.scan_groups[group_idx]
         energy = group['energy']
