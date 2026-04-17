@@ -313,69 +313,6 @@ def visualize_fit_results(results_dict, structures_dict, energies=None,
     return fig, axes
 
 
-def visualize_before_after_fitting(results_dict, original_objectives,
-                                    structures_dict, energy_list=None,
-                                    figsize=(16, 12), max_cols=3,
-                                    title_prefix=''):
-    """
-    Grid of before/after reflectivity comparisons for each energy.
-
-    Args:
-        results_dict         : {energy: {'objective': fitted_Objective, …}}
-        original_objectives  : {energy: original_Objective}
-        structures_dict      : {energy: Structure}
-        energy_list          : energies to include (None = all available)
-        figsize              : figure dimensions
-        max_cols             : maximum columns in the grid
-        title_prefix         : optional string prepended to subplot titles
-
-    Returns:
-        matplotlib Figure
-    """
-    fitted = {e: r['objective']
-              for e, r in results_dict.items() if 'objective' in r}
-
-    if energy_list is None:
-        avail = sorted(set(original_objectives) & set(fitted) & set(structures_dict))
-    else:
-        avail = [e for e in energy_list
-                 if e in original_objectives and e in fitted
-                 and e in structures_dict]
-
-    if not avail:
-        print("No valid energies for comparison.")
-        return None
-
-    n_rows = (len(avail) + max_cols - 1) // max_cols
-    fig, axes = plt.subplots(n_rows, max_cols,
-                              figsize=(figsize[0], figsize[1] * n_rows / 2))
-    axes = np.array(axes).reshape(-1)
-
-    for idx, energy in enumerate(avail):
-        ax = axes[idx]
-        orig = original_objectives[energy]
-        fit  = fitted[energy]
-        data = orig.data
-        q    = data.data[0]
-
-        ax.semilogy(q, data.data[1], 'k.', markersize=3,
-                    label='Data', alpha=0.6)
-        ax.semilogy(q, orig.model(q), 'r-', linewidth=1.5, label='Original')
-        ax.semilogy(q, fit.model(q),  'b-', linewidth=1.5, label='Fitted')
-        ax.set_xlabel(r'Q ($\AA^{-1}$)')
-        ax.set_ylabel('Reflectivity')
-        chi_orig = orig.chisqr()
-        chi_fit  = fit.chisqr()
-        ax.set_title(f'{title_prefix}{energy} eV\n'
-                     f'χ²: {chi_orig:.3g} → {chi_fit:.3g}')
-        ax.legend(fontsize=7)
-        ax.grid(True, alpha=0.3)
-
-    for idx in range(len(avail), len(axes)):
-        axes[idx].axis('off')
-
-    plt.tight_layout()
-    return fig
 
 
 def analyze_model_parameters_by_energy(objectives_dict, energy_list=None,
