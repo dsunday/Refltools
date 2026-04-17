@@ -1427,23 +1427,75 @@ def get_batch_results_info(file_path):
     }
 
 
-def save_material_sld(sld_array, material_name, filename, save_dir=None,
-                      include_header=True):
+def save_material_sld(objectives_dict, material_name, filename, save_dir=None,
+                      include_header=True, plot=False, figsize=(10, 6)):
     """
-    Save a [Energy, Real_SLD, Imag_SLD] array to a CSV file.
+    Extract SLD vs energy for a material from fitted objectives and save to CSV.
+
+    Args:
+        objectives_dict : {energy: Objective}
+        material_name   : material to extract (e.g. 'MOX')
+        filename        : output CSV filename (with or without .csv extension)
+        save_dir        : optional directory (None = use filename as-is)
+        include_header  : write column header row
+        plot            : show a plot of the SLD vs energy after saving
+        figsize         : figure size if plot=True
 
     Returns:
-        Full path to the saved file.
+        ndarray, shape (n, 3) – [Energy_eV, Real_SLD, Imag_SLD]
     """
-    fname = filename if filename.endswith('.csv') else f"{filename}.csv"
+    rows = []
+    for energy in sorted(objectives_dict):
+        obj = objectives_dict[energy]
+        real_val = imag_val = None
+        for param in obj.parameters.flattened():
+            pn = param.name.lower()
+            if f'{material_name.lower()} - ' not in pn:
+                continue
+            if 'isld' in pn:
+                imag_val = param.value
+            elif 'sld' in pn:
+                real_val = param.value
+
+        if real_val is not None and imag_val is not None:
+            rows.append([energy, real_val, imag_val])
+        else:
+            print(f'Warning: could not find SLD params for {material_name} at {energy} eV')
+
+    if not rows:
+        print(f'No SLD data found for {material_name}.')
+        return None
+
+    arr = np.array(rows, dtype=float)
+
+    # save
+    fname = filename if filename.endswith('.csv') else f'{filename}.csv'
     path  = os.path.join(save_dir, fname) if save_dir else fname
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
-    header = f"{material_name} SLD data\nEnergy_eV,Real_SLD,Imag_SLD" if include_header else ""
-    np.savetxt(path, sld_array, delimiter=',', header=header, comments='')
-    print(f"Saved SLD array → {path}")
-    return path
+    header = f'{material_name} SLD data\nEnergy_eV,Real_SLD,Imag_SLD' if include_header else ''
+    np.savetxt(path, arr, delimiter=',', header=header, comments='')
+    print(f'Saved {material_name} SLD ({len(arr)} energies) → {path}')
+
+    if plot:
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        axes[0].plot(arr[:, 0], arr[:, 1], 'o-', color='C0')
+        axes[0].set_xlabel('Energy (eV)')
+        axes[0].set_ylabel(r'Real SLD ($10^{-6}$ Å$^{-2}$)')
+        axes[0].set_title(f'{material_name} – Real SLD')
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(arr[:, 0], arr[:, 2], 'o-', color='C1')
+        axes[1].set_xlabel('Energy (eV)')
+        axes[1].set_ylabel(r'Imag SLD ($10^{-6}$ Å$^{-2}$)')
+        axes[1].set_title(f'{material_name} – Imaginary SLD')
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    return arr
 
 
 def load_material_sld_array(file_path, has_header=True, verbose=True):
