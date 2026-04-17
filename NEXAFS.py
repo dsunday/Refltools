@@ -10,6 +10,7 @@ from matplotlib import rc, gridspec
 import os
 import tempfile
 import json
+import pickle
 import re
 from typing import Dict, Tuple, Optional, Union, List
 import matplotlib.colors as mcolors
@@ -210,6 +211,97 @@ def DeltaBetatoSLD(DeltaBeta):
     SLD[:,2] = 2 * np.pi * DeltaBeta[:,2] / (np.power(Wavelength, 2))*1000000   # SLD imag (Å^-2)
     
     return SLD
+
+def process_nexafs_to_SLD_from_array(energy, intensity, chemical_formula, density,
+                                      x_min=None, x_max=None):
+    """
+    Process a NEXAFS spectrum supplied as in-memory arrays and return the
+    refractive index components and SLD.
+
+    This is a convenience wrapper around process_nexafs_to_SLD for use when
+    the spectrum is already loaded into numpy arrays rather than sitting in a
+    file — for example, after calling load_spectrum_data() on a CSV file.
+
+    The arrays are written to a temporary file internally so that kkcalc can
+    process them; the file is deleted automatically on return.
+
+    Parameters
+    ----------
+    energy : array-like
+        Energy values in eV.
+    intensity : array-like
+        Absorption intensity values corresponding to each energy point.
+        These are treated as Beta (the imaginary part of the refractive index
+        decrement) by kkcalc, consistent with process_nexafs_to_SLD.
+    chemical_formula : str
+        Chemical formula of the material, e.g. 'C8H8' for polystyrene.
+        Used by kkcalc to stitch Henke background scattering factors.
+    density : float
+        Mass density of the material in g/cm³.
+    x_min : float, optional
+        Lower merge point in eV — the energy at which the measured spectrum
+        begins to replace the Henke background tabulation.  Should be just
+        below the first feature of interest in the spectrum.
+    x_max : float, optional
+        Upper merge point in eV — the energy at which the measured spectrum
+        hands back to the Henke background.  Should be just above the last
+        feature of interest.
+
+    Returns
+    -------
+    DeltaBeta : numpy.ndarray, shape (n, 3)
+        Columns: Energy (eV), Delta (dimensionless), Beta (dimensionless).
+        Spans the full kkcalc output energy grid, which extends well beyond
+        the input energy range due to Henke background stitching.
+    SLD : numpy.ndarray, shape (n, 4)
+        Columns: Energy (eV), SLD_real, SLD_imag, Wavelength (Å).
+        SLD values are in units of 10^-6 Å^-2.
+
+    Examples
+    --------
+    Load a CSV spectrum with load_spectrum_data then transform to SLD:
+
+    >>> from NEXAFS import load_spectrum_data, process_nexafs_to_SLD_from_array
+    >>> energy, intensity = load_spectrum_data('my_carbon_spectrum.csv')
+    >>> DeltaBeta, SLD = process_nexafs_to_SLD_from_array(
+    ...     energy, intensity,
+    ...     chemical_formula='C8H8',
+    ...     density=1.05,
+    ...     x_min=270.0,
+    ...     x_max=330.0
+    ... )
+
+    Pass a numpy array directly:
+
+    >>> import numpy as np
+    >>> data = np.loadtxt('spectrum.txt')
+    >>> DeltaBeta, SLD = process_nexafs_to_SLD_from_array(
+    ...     data[:, 0], data[:, 1],
+    ...     chemical_formula='C8H8',
+    ...     density=1.05
+    ... )
+    """
+    import tempfile
+
+    energy    = np.asarray(energy,    dtype=float)
+    intensity = np.asarray(intensity, dtype=float)
+
+    if energy.shape != intensity.shape or energy.ndim != 1:
+        raise ValueError(
+            "energy and intensity must be 1-D arrays of the same length. "
+            f"Got shapes {energy.shape} and {intensity.shape}."
+        )
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.txt', delete=False, prefix='nexafs_kk_'
+    )
+    try:
+        for e, i in zip(energy, intensity):
+            tmp.write(f"{e:.6f}  {i:.10e}\n")
+        tmp.close()
+        return process_nexafs_to_SLD(tmp.name, chemical_formula, density, x_min, x_max)
+    finally:
+        os.unlink(tmp.name)
 
 def process_nexafs_to_SLD(input_file, chemical_formula, density, x_min=None, x_max=None):
     """
@@ -495,6 +587,9 @@ def plot_spectra(spectra: Union[np.ndarray, List[np.ndarray]],
                  title: Optional[str] = None,
                  xlabel: str = 'Energy (eV)',
                  ylabel: str = 'Intensity (a.u.)',
+                 colors: Optional[List[str]] = None,
+                 xlim: Optional[Tuple[float, float]] = None,
+                 ylim: Optional[Tuple[float, float]] = None,
                  save_path: Optional[str] = None,
                  dpi: int = 300,
                  show: bool = True) -> plt.Figure:
@@ -523,6 +618,14 @@ def plot_spectra(spectra: Union[np.ndarray, List[np.ndarray]],
         X-axis label
     ylabel : str, default 'Intensity (a.u.)'
         Y-axis label
+    colors : list of str, optional
+        List of colors for each spectrum. If None, auto-generates colors.
+        Can be matplotlib color names (e.g., 'red', 'blue') or hex codes (e.g., '#FF0000').
+        If provided, length must match number of spectra.
+    xlim : tuple, optional
+        X-axis limits as (xmin, xmax). If None, uses energy_min and energy_max.
+    ylim : tuple, optional
+        Y-axis limits as (ymin, ymax). If None, auto-scales based on data.
     save_path : str, optional
         Path to save the figure. If None, figure is not saved.
     dpi : int, default 300
@@ -545,6 +648,9 @@ def plot_spectra(spectra: Union[np.ndarray, List[np.ndarray]],
     
     >>> # Multiple spectra stacked
     >>> plot_spectra([Peptoid1, Peptoid2], stacked=True)
+    
+    >>> # Specify colors and axis limits
+    >>> plot_spectra([Peptoid1, Peptoid2], colors=['red', 'blue'], xlim=(280, 300), ylim=(0, 1))
     """
     
     # Normalize input to list of arrays
@@ -592,14 +698,17 @@ def plot_spectra(spectra: Union[np.ndarray, List[np.ndarray]],
         fig, ax = plt.subplots(1, 1, figsize=figsize)
         axes = [ax] * n_spectra
     
-    # Generate colors for overlaid plot
-    if not stacked and n_spectra > 1:
-        if n_spectra <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, max(n_spectra, 3)))
+    # Generate colors for overlaid plot if not provided
+    if colors is None:
+        if not stacked and n_spectra > 1:
+            if n_spectra <= 10:
+                colors = plt.cm.tab10(np.linspace(0, 1, max(n_spectra, 3)))
+            else:
+                colors = plt.cm.tab20(np.linspace(0, 1, n_spectra))
         else:
-            colors = plt.cm.tab20(np.linspace(0, 1, n_spectra))
-    else:
-        colors = ['C0'] * n_spectra
+            colors = ['C0'] * n_spectra
+    elif len(colors) != n_spectra:
+        raise ValueError(f"Number of colors ({len(colors)}) must match number of spectra ({n_spectra})")
     
     # Plot each spectrum
     for i, (spec, label, color) in enumerate(zip(filtered_spectra, labels, colors)):
@@ -608,13 +717,21 @@ def plot_spectra(spectra: Union[np.ndarray, List[np.ndarray]],
         intensity = spec[:, 1]
         ax.plot(energy, intensity, 'o-', color=color, markersize=3, 
                 linewidth=1.5, label=label, alpha=0.8)
-        ax.set_ylabel(ylabel)
+        ax.set_ylabel(ylabel, fontsize=18)
         if stacked:
             ax.legend(loc='best')
     
     # Set common properties
-    axes[-1].set_xlabel(xlabel)
-    axes[-1].set_xlim(energy_min, energy_max)
+    axes[-1].set_xlabel(xlabel, fontsize=18)
+    if xlim is not None:
+        axes[-1].set_xlim(xlim)
+    else:
+        axes[-1].set_xlim(energy_min, energy_max)
+    
+    # Apply ylim if provided
+    if ylim is not None:
+        for ax in axes:
+            ax.set_ylim(ylim)
     
     # Add legend for overlaid plot
     if not stacked and n_spectra > 1:
@@ -989,7 +1106,261 @@ def plot_spectra_with_fixed_params(target_spectrum, spectrum1, spectrum2,
     
     return fig, ax, rmse
 
-
+import tempfile
+import os
+ 
+ 
+def imag_SLD_to_beta(SLD_array):
+    """
+    Convert imaginary SLD values from a reflectometry fit to the optical constant beta (β).
+ 
+    This is the inverse of the SLD_imag calculation in DeltaBetatoSLD:
+        SLD_imag [10^-6 Å^-2] = 2π * β / λ²  * 10^6
+    so:
+        β = SLD_imag * λ² / (2π * 10^6)
+ 
+    Parameters
+    ----------
+    SLD_array : numpy.ndarray
+        Array with columns [Energy (eV), SLD_real, SLD_imag, Wavelength (Å)].
+        SLD values are in units of 10^-6 Å^-2.
+        This is the format returned by DeltaBetatoSLD / process_nexafs_to_SLD,
+        or from reflectometry fit results stored in the same convention.
+ 
+    Returns
+    -------
+    numpy.ndarray
+        Array with columns [Energy (eV), Beta (dimensionless)].
+    """
+    energy     = SLD_array[:, 0]         # eV
+    SLD_imag   = SLD_array[:, 2]         # 10^-6 Å^-2
+    wavelength = SLD_array[:, 3]         # Å
+ 
+    # Invert SLD_imag = 2π * β / λ² * 1e6
+    beta = SLD_imag * wavelength**2 / (2.0 * np.pi * 1e6)
+ 
+    return np.column_stack((energy, beta))
+ 
+ 
+def beta_to_delta_kk(energy_beta, chemical_formula, density,
+                     merge_points=None,
+                     add_background=False,
+                     fix_distortions=False,
+                     curve_tolerance=0.05,
+                     curve_recursion=100):
+    """
+    Apply the Kramers-Kronig transform to a beta (β) spectrum to obtain delta (δ),
+    using kkcalc.  The input is an in-memory numpy array; it is written to a
+    temporary file internally so that kkcalc's file-based API can be used.
+ 
+    Parameters
+    ----------
+    energy_beta : numpy.ndarray
+        Array with columns [Energy (eV), Beta (dimensionless)], as returned by
+        imag_SLD_to_beta().
+    chemical_formula : str
+        Chemical formula of the material, e.g. 'C8H8' for polystyrene.
+        Used by kkcalc to stitch background scattering factors.
+    density : float
+        Mass density of the material in g/cm³.
+    merge_points : list of two floats, optional
+        [E_min, E_max] energy range (eV) within which the measured beta data
+        replaces the tabulated background.  Typically set to bracket the
+        absorption edge region.  If None, kkcalc chooses merge points
+        automatically.
+    add_background : bool, optional
+        Whether kkcalc should add back a removed background (default False).
+    fix_distortions : bool, optional
+        Whether to apply kkcalc's distortion correction (default False).
+        Requires scipy.
+    curve_tolerance : float, optional
+        Tolerance for the KK transform recursion (default 0.05).
+    curve_recursion : int, optional
+        Maximum recursion depth for the KK transform (default 100).
+ 
+    Returns
+    -------
+    numpy.ndarray
+        Array with columns [Energy (eV), Delta (dimensionless), Beta (dimensionless)].
+        The energy axis matches the output grid produced by kkcalc (which may differ
+        from the input grid due to stitching with tabulated data).
+    """
+    from kkcalc import data as kkdata
+    from kkcalc import kk
+ 
+    # Parse formula and compute formula mass for unit conversion
+    stoichiometry = kkdata.ParseChemicalFormula(chemical_formula)
+    formula_mass  = kkdata.calculate_FormulaMass(stoichiometry)
+ 
+    # Write beta spectrum to a temporary two-column text file
+    tmp = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.txt', delete=False, prefix='kkcalc_beta_'
+    )
+    try:
+        for row in energy_beta:
+            tmp.write(f"{row[0]:.6f}  {row[1]:.10e}\n")
+        tmp.close()
+ 
+        # Run the Kramers-Kronig transform
+        # Output columns from kk_calculate_real are [Energy, f1_ASF, f2_ASF]
+        output = kk.kk_calculate_real(
+            tmp.name,
+            chemical_formula,
+            load_options=None,
+            input_data_type='Beta',
+            merge_points=merge_points,
+            add_background=add_background,
+            fix_distortions=fix_distortions,
+            curve_tolerance=curve_tolerance,
+            curve_recursion=curve_recursion
+        )
+    finally:
+        os.unlink(tmp.name)
+ 
+    # Convert ASF columns to refractive index (delta, beta)
+    delta_col = kkdata.convert_data(
+        output[:, [0, 1]],
+        'ASF',
+        'refractive_index',
+        Density=density,
+        Formula_Mass=formula_mass
+    )
+    beta_col = kkdata.convert_data(
+        output[:, [0, 2]],
+        'ASF',
+        'refractive_index',
+        Density=density,
+        Formula_Mass=formula_mass
+    )
+ 
+    # delta_col[:,0] and beta_col[:,0] are the same energy axis
+    energy = delta_col[:, 0]
+    delta  = delta_col[:, 1]
+    beta   = beta_col[:, 1]
+ 
+    return np.column_stack((energy, delta, beta))
+ 
+ 
+def delta_to_real_SLD(energy_delta):
+    """
+    Convert delta (δ) values to real SLD.
+ 
+    Uses the same formula as DeltaBetatoSLD:
+        SLD_real [10^-6 Å^-2] = 2π * δ / λ²  * 10^6
+ 
+    Parameters
+    ----------
+    energy_delta : numpy.ndarray
+        Array with columns [Energy (eV), Delta (dimensionless)].
+ 
+    Returns
+    -------
+    numpy.ndarray
+        Array with columns [Energy (eV), SLD_real (10^-6 Å^-2), Wavelength (Å)].
+    """
+    energy     = energy_delta[:, 0]
+    delta      = energy_delta[:, 1]
+    wavelength = EnergytoWavelength(energy)
+ 
+    SLD_real = 2.0 * np.pi * delta / (wavelength**2) * 1e6
+ 
+    return np.column_stack((energy, SLD_real, wavelength))
+ 
+ 
+def imag_SLD_to_real_SLD(SLD_array, chemical_formula, density,
+                          merge_points=None,
+                          add_background=False,
+                          fix_distortions=False,
+                          curve_tolerance=0.05,
+                          curve_recursion=100):
+    """
+    Full pipeline: convert imaginary SLD from a reflectometry fit into the
+    corresponding real SLD via the Kramers-Kronig transform.
+ 
+    Pipeline:
+        imaginary SLD  →  β  →  KK transform  →  δ  →  real SLD
+ 
+    Parameters
+    ----------
+    SLD_array : numpy.ndarray
+        Array with columns [Energy (eV), SLD_real, SLD_imag, Wavelength (Å)],
+        as produced by DeltaBetatoSLD() or stored from a reflectometry fit.
+        SLD values are in units of 10^-6 Å^-2.
+        Only the imaginary SLD column is used as input to the KK transform.
+    chemical_formula : str
+        Chemical formula of the material, e.g. 'C8H8' for polystyrene.
+    density : float
+        Mass density of the material in g/cm³.
+    merge_points : list of two floats, optional
+        [E_min, E_max] energy range (eV) over which the measured data is
+        merged into the background scattering factors.  Should bracket the
+        absorption edge of interest.  If None, kkcalc selects merge points
+        automatically.
+    add_background : bool, optional
+        Whether kkcalc should reconstruct a removed background (default False).
+    fix_distortions : bool, optional
+        Apply kkcalc's linear distortion correction (default False).
+    curve_tolerance : float, optional
+        KK transform recursion tolerance (default 0.05).
+    curve_recursion : int, optional
+        KK transform maximum recursion depth (default 100).
+ 
+    Returns
+    -------
+    tuple
+        (DeltaBeta, SLD_kk) where:
+ 
+        DeltaBeta : numpy.ndarray, shape (n, 3)
+            Columns [Energy (eV), Delta, Beta] on the kkcalc output energy grid.
+ 
+        SLD_kk : numpy.ndarray, shape (n, 4)
+            Columns [Energy (eV), SLD_real_kk, SLD_imag_kk, Wavelength (Å)]
+            with SLD values in 10^-6 Å^-2.
+            SLD_real_kk is the KK-derived real SLD from the fitted imaginary SLD.
+            SLD_imag_kk is the beta back-converted to SLD units on the kkcalc
+            output energy grid (consistent with the SLD_real_kk column).
+ 
+    Notes
+    -----
+    The kkcalc output energy grid typically extends well beyond the input range
+    (it stitches in Henke tabulated data), so the returned arrays will usually
+    span a much wider energy range than the input SLD_array.  Use merge_points
+    to control where the measured data is spliced in.
+ 
+    Example
+    -------
+    >>> # SLD_fit comes from a reflectometry fit at the carbon edge
+    >>> DeltaBeta_kk, SLD_kk = imag_SLD_to_real_SLD(
+    ...     SLD_fit,
+    ...     chemical_formula='C8H8',
+    ...     density=1.05,
+    ...     merge_points=[270.0, 320.0]
+    ... )
+    >>> # Plot result over the carbon edge
+    >>> mask = (SLD_kk[:, 0] >= 270) & (SLD_kk[:, 0] <= 320)
+    >>> plt.plot(SLD_kk[mask, 0], SLD_kk[mask, 1], label='Real SLD (KK)')
+    >>> plt.plot(SLD_kk[mask, 0], SLD_kk[mask, 2], label='Imag SLD (fit)')
+    """
+    # Step 1: imaginary SLD → beta
+    energy_beta = imag_SLD_to_beta(SLD_array)
+ 
+    # Step 2: beta → delta via KK transform (also returns consistent beta)
+    DeltaBeta = beta_to_delta_kk(
+        energy_beta,
+        chemical_formula,
+        density,
+        merge_points=merge_points,
+        add_background=add_background,
+        fix_distortions=fix_distortions,
+        curve_tolerance=curve_tolerance,
+        curve_recursion=curve_recursion
+    )
+    # DeltaBeta columns: [Energy, Delta, Beta]
+ 
+    # Step 3: delta → real SLD, beta → imag SLD (reuse DeltaBetatoSLD)
+    SLD_kk = DeltaBetatoSLD(DeltaBeta)
+ 
+    return DeltaBeta, SLD_kk
 
 class NEXAFSDatabase:
     """
@@ -1467,5 +1838,289 @@ class NEXAFSDatabase:
         if sample:
             return list(sample["measurements"].keys())
         return []
+
+
+def plot_sld_four_panel(sld_data_dict, metadata_dict, spectrum_data_dict=None,
+                        energy_range=(280, 300), marker_color_file=None, figsize=(14, 10),
+                        save_path=None, full_range_only=False):
+    """
+    Create a four-panel plot showing SLD data from reflectivity fits and optionally NEXAFS spectrum data.
     
+    Parameters:
+    -----------
+    sld_data_dict : dict
+        Dictionary mapping scan names to SLD arrays from load_material_sld_array.
+        Format: {'scan1': array1, 'scan2': array2, ...}
+        Each array should have shape (n_points, 3) with columns [Energy, SLD_Real, SLD_Imag]
+    metadata_dict : dict
+        Dictionary mapping scan names to metadata.
+        Format: {'scan1': {'material': 'Carbon', 'process': 'Bake', 'sample': 'SOC'}, ...}
+    spectrum_data_dict : dict, optional
+        Dictionary mapping scan names to spectrum arrays from load_spectrum_data.
+        Format: {'scan1': array1, 'scan2': array2, ...}
+        Each array should have shape (n_points, 2) with columns [energy, intensity]
+        If None or not provided, spectrum data will not be plotted.
+    energy_range : tuple, optional
+        Tuple (min, max) for truncated energy range in right panels. Default: (280, 300)
+    marker_color_file : str, optional
+        Path to pickle file for saving marker/color assignments.
+        If None, uses 'marker_color_assignments.pkl' in the same directory as NEXAFS.py
+    figsize : tuple, optional
+        Figure size as (width, height) in inches. Default: (14, 10)
+    save_path : str, optional
+        Path to save the figure. If provided, the figure will be saved to this path.
+        Supports common image formats (png, pdf, svg, etc.). If None, figure is not saved.
+        Default: None
+    full_range_only : bool, optional
+        If True, only plot the full energy range panels (one column, two rows).
+        If False, plot all four panels (two columns, two rows). Default: False
+    
+    Returns:
+    --------
+    fig : matplotlib.figure.Figure
+        The figure object
+    axes : numpy.ndarray
+        Array of axes objects for the four panels
+    """
+    # Set default marker/color file path (use current working directory, typically the notebook directory)
+    if marker_color_file is None:
+        marker_color_file = os.path.join(os.getcwd(), 'marker_color_assignments.pkl')
+    
+    # Load existing marker/color assignments if file exists
+    marker_assignments = {}  # process -> marker
+    color_assignments = {}   # sample -> color
+    
+    # Initialize color_assignments to empty dict (will be set below if file exists)
+    if os.path.exists(marker_color_file):
+        try:
+            with open(marker_color_file, 'rb') as f:
+                saved_data = pickle.load(f)
+                marker_assignments = saved_data.get('markers', {})
+                color_assignments_loaded = saved_data.get('colors', {})
+                
+                # Migrate from old format (process, sample) tuples to new format (sample only)
+                # Check if we have old format (tuple keys)
+                if color_assignments_loaded:
+                    # Check if first key is a tuple (old format)
+                    first_key = next(iter(color_assignments_loaded.keys()), None)
+                    if first_key is not None and isinstance(first_key, tuple):
+                        # Old format: migrate to new format by extracting unique samples
+                        color_assignments = {}
+                        for key, color in color_assignments_loaded.items():
+                            if isinstance(key, tuple):
+                                # Old format: (process, sample) -> extract sample
+                                sample = key[1]
+                                # Only keep the first occurrence of each sample
+                                if sample not in color_assignments:
+                                    color_assignments[sample] = color
+                            else:
+                                # Already new format
+                                color_assignments[key] = color
+                    else:
+                        # Already new format
+                        color_assignments = color_assignments_loaded
+                else:
+                    # Empty dictionary
+                    color_assignments = {}
+        except Exception as e:
+            print(f"Warning: Could not load marker/color assignments: {e}")
+            color_assignments = {}
+    
+    # Available markers and colors
+    markers = ['o', 's', '^', 'v', 'D', 'p', '*', 'h', 'X', '8', '<', '>']
+    colors = plt.cm.tab20(np.linspace(0, 1, 20)).tolist()
+    colors.extend(plt.cm.Set3(np.linspace(0, 1, 12)).tolist())
+    
+    # Assign markers and colors for all scans (check both SLD and spectrum data)
+    marker_idx = 0
+    # Start color_idx from the number of already assigned samples
+    color_idx = len(color_assignments)
+    
+    # Collect all scan names from both dictionaries
+    if spectrum_data_dict is None:
+        spectrum_data_dict = {}
+    all_scan_names = set(sld_data_dict.keys()) | set(spectrum_data_dict.keys())
+    
+    for scan_name in all_scan_names:
+        if scan_name not in metadata_dict:
+            continue
+        
+        metadata = metadata_dict[scan_name]
+        process = metadata.get('process', 'Unknown')
+        sample = metadata.get('sample', 'Unknown')
+        
+        # Assign marker shape based on process (cycle through shapes for different processes)
+        if process not in marker_assignments:
+            marker_assignments[process] = markers[marker_idx % len(markers)]
+            marker_idx += 1
+        
+        # Assign color based on sample (different samples get different colors)
+        if sample not in color_assignments:
+            color_assignments[sample] = colors[color_idx % len(colors)]
+            color_idx += 1
+    
+    # Save updated assignments
+    try:
+        with open(marker_color_file, 'wb') as f:
+            pickle.dump({'markers': marker_assignments, 'colors': color_assignments}, f)
+    except Exception as e:
+        print(f"Warning: Could not save marker/color assignments: {e}")
+    
+    # Create layout based on full_range_only option
+    if full_range_only:
+        # One column, two rows (full range only)
+        fig, axes = plt.subplots(2, 1, figsize=(figsize[0]/2, figsize[1]))
+        ax_top = axes[0]      # Full range, real
+        ax_bottom = axes[1]   # Full range, imag
+        ax_top_left = ax_top
+        ax_bottom_left = ax_bottom
+        ax_top_right = None
+        ax_bottom_right = None
+    else:
+        # Two columns, two rows (four panels)
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        ax_top_left = axes[0, 0]      # Full range, real
+        ax_bottom_left = axes[1, 0]   # Full range, imag
+        ax_top_right = axes[0, 1]     # Truncated range, real
+        ax_bottom_right = axes[1, 1]  # Truncated range, imag
+    
+    # Plot SLD data
+    for scan_name, sld_array in sld_data_dict.items():
+        if scan_name not in metadata_dict:
+            continue
+        
+        metadata = metadata_dict[scan_name]
+        process = metadata.get('process', 'Unknown')
+        sample = metadata.get('sample', 'Unknown')
+        material = metadata.get('material', 'Unknown')
+        
+        marker = marker_assignments[process]
+        color = color_assignments[sample]
+        
+        # Determine marker style based on process
+        # "Bake" processes use open markers, "UV" processes use closed markers
+        if process == "Bake":
+            marker_style = {'marker': marker, 'fillstyle': 'none', 'markeredgecolor': color, 
+                          'markerfacecolor': 'none', 'markeredgewidth': 1.5, 'color': color}
+        else:
+            # Default to closed markers for UV and other processes
+            marker_style = {'marker': marker, 'color': color}
+        
+        # Create label
+        label = f"{material} - {process} - {sample}"
+        
+        # Extract energy, real, and imaginary components
+        energy = sld_array[:, 0]
+        sld_real = sld_array[:, 1]
+        sld_imag = sld_array[:, 2]
+        
+        # Filter for truncated range
+        mask_truncated = (energy >= energy_range[0]) & (energy <= energy_range[1])
+        energy_truncated = energy[mask_truncated]
+        sld_real_truncated = sld_real[mask_truncated]
+        sld_imag_truncated = sld_imag[mask_truncated]
+        
+        # Plot real component - full range
+        ax_top_left.plot(energy, sld_real, label=label, markersize=6, linewidth=1.5, 
+                        alpha=0.8, **marker_style)
+        
+        # Plot real component - truncated range (only if right panel exists)
+        if ax_top_right is not None:
+            ax_top_right.plot(energy_truncated, sld_real_truncated, label=label, markersize=6, 
+                             linewidth=1.5, alpha=0.8, **marker_style)
+        
+        # Plot imaginary component - full range
+        ax_bottom_left.plot(energy, sld_imag, label=label, markersize=6, linewidth=1.5, 
+                           alpha=0.8, **marker_style)
+        
+        # Plot imaginary component - truncated range (only if right panel exists)
+        if ax_bottom_right is not None:
+            ax_bottom_right.plot(energy_truncated, sld_imag_truncated, label=label, markersize=6, 
+                                linewidth=1.5, alpha=0.8, **marker_style)
+    
+    # Plot spectrum data (imaginary only, as lines) if provided
+    if spectrum_data_dict:
+        for scan_name, spectrum_array in spectrum_data_dict.items():
+            if scan_name not in metadata_dict:
+                continue
+            
+            metadata = metadata_dict[scan_name]
+            process = metadata.get('process', 'Unknown')
+            sample = metadata.get('sample', 'Unknown')
+            material = metadata.get('material', 'Unknown')
+            
+            color = color_assignments.get(sample, 'gray')
+            
+            # Create label
+            label = f"{material} - {process} - {sample} (NEXAFS)"
+            
+            # Extract energy and intensity
+            energy_spec = spectrum_array[:, 0]
+            intensity = spectrum_array[:, 1]
+            
+            # Filter for truncated range
+            mask_truncated = (energy_spec >= energy_range[0]) & (energy_spec <= energy_range[1])
+            energy_spec_truncated = energy_spec[mask_truncated]
+            intensity_truncated = intensity[mask_truncated]
+            
+            # Plot as lines only (no markers) on imaginary panels
+            ax_bottom_left.plot(energy_spec, intensity, color=color, 
+                               label=label, linewidth=2, alpha=0.7, linestyle='--')
+            
+            # Plot truncated range (only if right panel exists)
+            if ax_bottom_right is not None:
+                ax_bottom_right.plot(energy_spec_truncated, intensity_truncated, color=color, 
+                                    label=label, linewidth=2, alpha=0.7, linestyle='--')
+    
+    # Formatting
+    # Top - Full range, real
+    ax_top_left.set_xlabel('Energy (eV)')
+    ax_top_left.set_ylabel('Real SLD (10$^{-6}$ Å$^{-2}$)')
+    ax_top_left.set_title('Real SLD - Full Energy Range')
+    ax_top_left.grid(True, alpha=0.3)
+    ax_top_left.legend(fontsize=8, loc='best')
+    
+    # Bottom - Full range, imag
+    ax_bottom_left.set_xlabel('Energy (eV)')
+    ax_bottom_left.set_ylabel('Imaginary SLD (10$^{-6}$ Å$^{-2}$)')
+    ax_bottom_left.set_title('Imaginary SLD - Full Energy Range')
+    ax_bottom_left.grid(True, alpha=0.3)
+    ax_bottom_left.legend(fontsize=8, loc='best')
+    
+    # Top right - Truncated range, real (only if right panel exists)
+    if ax_top_right is not None:
+        ax_top_right.set_xlabel('Energy (eV)')
+        ax_top_right.set_ylabel('Real SLD (10$^{-6}$ Å$^{-2}$)')
+        ax_top_right.set_title(f'Real SLD - {energy_range[0]}-{energy_range[1]} eV')
+        ax_top_right.grid(True, alpha=0.3)
+        ax_top_right.legend(fontsize=8, loc='best')
+        ax_top_right.set_xlim(energy_range)
+    
+    # Bottom right - Truncated range, imag (only if right panel exists)
+    if ax_bottom_right is not None:
+        ax_bottom_right.set_xlabel('Energy (eV)')
+        ax_bottom_right.set_ylabel('Imaginary SLD (10$^{-6}$ Å$^{-2}$)')
+        ax_bottom_right.set_title(f'Imaginary SLD - {energy_range[0]}-{energy_range[1]} eV')
+        ax_bottom_right.grid(True, alpha=0.3)
+        ax_bottom_right.legend(fontsize=8, loc='best')
+        ax_bottom_right.set_xlim(energy_range)
+    
+    plt.tight_layout()
+    
+    # Save figure if save_path is provided
+    if save_path is not None:
+        try:
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Figure saved to: {save_path}")
+        except Exception as e:
+            print(f"Warning: Could not save figure to {save_path}: {e}")
+    
+    # Ensure figure is properly rendered (helps with copying/display)
+    try:
+        fig.canvas.draw()
+    except:
+        pass  # If canvas doesn't support draw, continue anyway
+    
+    return fig, axes
+
     

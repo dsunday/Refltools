@@ -12,6 +12,9 @@ import pandas as pd
 from NEXAFS import load_spectrum_data,  edge_bl_func, gaussian    #plot_simulated_nexafs_spectrum,  simulate_nexafs_spectrum_for_plotting
 from scipy.optimize import curve_fit, least_squares, minimize, differential_evolution, dual_annealing
 
+# Module-level dictionary to store peak energy to color mappings for synchronized plotting
+_peak_energy_color_map = {}  # Maps energy (rounded) -> color hex string
+
 
 def parse_peak_params(peak_params: Dict) -> Tuple[Dict, Dict]:
     """
@@ -96,7 +99,9 @@ def simulate_nexafs_spectrum(x: np.ndarray = None,
                            experimental_intensity: Optional[np.ndarray] = None,
                            data: Optional[np.ndarray] = None,
                            plot: bool = False,
-                           plot_kwargs: Optional[Dict] = None) -> Union[Tuple[np.ndarray, np.ndarray], plt.Figure]:
+                           plot_kwargs: Optional[Dict] = None,
+                           xlim: Optional[Tuple[float, float]] = None,
+                           ylim: Optional[Tuple[float, float]] = None) -> Union[Tuple[np.ndarray, np.ndarray], plt.Figure]:
     """
     Simulate a NEXAFS spectrum with Gaussian peaks and optional step edge.
     Automatically uses high-density energy axis if input has sparse spacing.
@@ -119,6 +124,10 @@ def simulate_nexafs_spectrum(x: np.ndarray = None,
         If True, automatically create plot and return figure instead of data
     plot_kwargs : dict, optional
         Additional keyword arguments for plotting function
+    xlim : tuple, optional
+        Tuple of (xmin, xmax) to set the x-axis limits. If None, uses automatic scaling.
+    ylim : tuple, optional
+        Tuple of (ymin, ymax) to set the y-axis limits. If None, uses automatic scaling.
         
     Returns:
     tuple or matplotlib.figure.Figure
@@ -194,6 +203,12 @@ def simulate_nexafs_spectrum(x: np.ndarray = None,
                 plot_kwargs['title'] = "NEXAFS Spectrum with Initial Parameters"
             else:
                 plot_kwargs['title'] = "Simulated NEXAFS Spectrum"
+        
+        # Add xlim and ylim to plot_kwargs if provided
+        if xlim is not None:
+            plot_kwargs['xlim'] = xlim
+        if ylim is not None:
+            plot_kwargs['ylim'] = ylim
         
         # Call plotting function with original experimental data
         fig = plot_simulated_nexafs_spectrum(
@@ -358,7 +373,8 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
                        max_iterations: int = 1000,
                        tolerance: float = 1e-8,
                        algorithm: str = 'curve_fit',
-                       global_opt_params: Optional[Dict] = None) -> Dict:
+                       global_opt_params: Optional[Dict] = None,
+                       energy_range: Optional[Tuple[Optional[float], Optional[float]]] = None) -> Dict:
     """
     Fit NEXAFS spectrum parameters to experimental data with multiple optimization algorithms.
     Fitting always uses experimental energy density, not high-density simulation axis.
@@ -387,6 +403,9 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
         - 'dual_annealing': Global optimization using dual annealing
     global_opt_params : dict, optional
         Additional parameters for global optimization algorithms
+    energy_range : tuple, optional
+        Optional (emin, emax) energy window in eV to restrict which points are used for fitting.
+        Either bound may be None to indicate no bound on that side. Window is inclusive.
     
     Returns:
     dict
@@ -395,10 +414,30 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
     
     # Load experimental data
     spectrum_data = load_spectrum_data(data)
-    energy_exp = spectrum_data[:, 0]
-    intensity_exp = spectrum_data[:, 1]
-    
-    print(f"Experimental data: {len(energy_exp)} points, energy spacing: {np.median(np.diff(energy_exp)):.3f} eV")
+    energy_exp_full = spectrum_data[:, 0]
+    intensity_exp_full = spectrum_data[:, 1]
+
+    # Restrict fit to an energy window if requested
+    fit_energy_range = None
+    if energy_range is not None:
+        if not isinstance(energy_range, (tuple, list)) or len(energy_range) != 2:
+            raise ValueError("energy_range must be a tuple/list of length 2: (emin, emax)")
+        emin, emax = energy_range
+        if emin is not None and emax is not None and emin > emax:
+            raise ValueError(f"energy_range has emin > emax ({emin} > {emax})")
+
+        mask = np.ones_like(energy_exp_full, dtype=bool)
+        if emin is not None:
+            mask &= (energy_exp_full >= float(emin))
+        if emax is not None:
+            mask &= (energy_exp_full <= float(emax))
+
+        energy_exp = energy_exp_full[mask]
+        intensity_exp = intensity_exp_full[mask]
+        fit_energy_range = (emin, emax)
+    else:
+        energy_exp = energy_exp_full
+        intensity_exp = intensity_exp_full
     
     # Create fitting function - this will use experimental energy axis for fitting
     fitting_func, fit_param_names = create_fitting_function(peak_params, edge_params, baseline)
@@ -424,6 +463,29 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
             raise ValueError(f"Parameter {param_name} not found in fit parameters")
     
     initial_values = np.array(initial_values)
+
+    # Validate fit data size (particularly important when restricting energy range)
+    if len(energy_exp) < 3:
+        raise ValueError(f"Not enough data points to fit ({len(energy_exp)} points).")
+    if len(energy_exp) <= len(initial_values):
+        raise ValueError(
+            f"Not enough degrees of freedom: {len(energy_exp)} points for {len(initial_values)} fit parameters. "
+            "Widen energy_range or reduce fitted parameters."
+        )
+
+    if len(energy_exp) >= 2:
+        energy_spacing = float(np.median(np.diff(energy_exp)))
+        spacing_str = f"{energy_spacing:.3f} eV"
+    else:
+        spacing_str = "N/A"
+
+    if fit_energy_range is not None:
+        print(
+            f"Experimental data (fit window {fit_energy_range} eV): {len(energy_exp)} points "
+            f"(from {len(energy_exp_full)} total), energy spacing: {spacing_str}"
+        )
+    else:
+        print(f"Experimental data: {len(energy_exp)} points, energy spacing: {spacing_str}")
     
     # Set default global optimization parameters
     if global_opt_params is None:
@@ -435,7 +497,7 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
             
             popt, pcov = curve_fit(
                 fitting_func, 
-                energy_exp, 
+                energy_exp,
                 intensity_exp,
                 p0=initial_values,
                 bounds=bounds,
@@ -536,7 +598,10 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
             'r_squared': r_squared,
             'rmse': rmse,
             'experimental_energy': energy_exp,
-            'experimental_intensity': intensity_exp
+            'experimental_intensity': intensity_exp,
+            'experimental_energy_full': energy_exp_full,
+            'experimental_intensity_full': intensity_exp_full,
+            'fit_energy_range': fit_energy_range
         }
         
         print(f"Fitting completed successfully using experimental energy axis ({len(energy_exp)} points)")
@@ -561,7 +626,10 @@ def fit_nexafs_spectrum(data: Union[str, np.ndarray, pd.DataFrame],
             'r_squared': 0,
             'rmse': np.inf,
             'experimental_energy': energy_exp,
-            'experimental_intensity': intensity_exp
+            'experimental_intensity': intensity_exp,
+            'experimental_energy_full': energy_exp_full,
+            'experimental_intensity_full': intensity_exp_full,
+            'fit_energy_range': fit_energy_range
         }
         return results
 
@@ -659,8 +727,14 @@ def plot_fit_results(results: Dict,
     """
     
     # Extract data from results
+    # `fit_nexafs_spectrum` may restrict the fit to an energy window; in that case
+    # `experimental_energy`/`experimental_intensity` are the fit-subset, while
+    # `*_full` contain the complete experimental arrays.
     energy_exp = results['experimental_energy']
     intensity_exp = results['experimental_intensity']
+    energy_exp_full = results.get('experimental_energy_full', energy_exp)
+    intensity_exp_full = results.get('experimental_intensity_full', intensity_exp)
+    fit_energy_range = results.get('fit_energy_range', None)
     fitted_spectrum = results['fitted_spectrum']
     residuals = results['residuals']
     fitted_peak_params = results.get('fitted_peak_params')
@@ -681,9 +755,16 @@ def plot_fit_results(results: Dict,
             colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
         peak_colors = [mcolors.to_hex(color) for color in colors]
     
-    # Plot experimental data
-    ax1.plot(energy_exp, intensity_exp, 'ko', markersize=3, alpha=0.7, 
+    # Plot experimental data (prefer full spectrum if available)
+    ax1.plot(energy_exp_full, intensity_exp_full, 'ko', markersize=3, alpha=0.7, 
              label='Experimental Data', zorder=1)
+
+    # Highlight fit window if used
+    if fit_energy_range is not None:
+        # Use the actual fit-subset extents for highlighting (handles None bounds)
+        ax1.axvspan(float(np.min(energy_exp)), float(np.max(energy_exp)),
+                    color='lightgrey', alpha=0.25, zorder=0,
+                    label='Fit Window')
     
     # Plot initial spectrum if provided (use experimental energy axis)
     if initial_peak_params is not None:
@@ -1192,12 +1273,12 @@ def print_fit_results(fitted_peak_params, fitted_edge_params, fitted_baseline,
     print("=" * 120)
     print("FIT RESULTS SUMMARY")
     print("=" * 120)
-    print(f"Fitted Baseline: {fitted_baseline:.1f}")
+    print(f"Fitted Baseline: {fitted_baseline:.2f}")
     print()
     
     # Print header with proper spacing - headers are 6 characters each
     print(f"{'Peak':<6} {'Energy (eV)':<30} {'Width':<30} {'Intensity':<30}")
-    print(f"{'#':<6} {'Lower':<6} {'Fitted':<6} {'Upper':<6} {'Lower':<6} {'Fitted':<6} {'Upper':<6} {'Lower':<6} {'Fitted':<6} {'Upper':<6}")
+    print(f"{'#':<6} {'Lower':<6} {'Fitted':<7} {'Upper':<6} {'Lower':<6} {'Fitted':<7} {'Upper':<6} {'Lower':<6} {'Fitted':<7} {'Upper':<6}")
     print("-" * 120)
     
     # Extract and sort peaks by energy
@@ -1235,15 +1316,15 @@ def print_fit_results(fitted_peak_params, fitted_edge_params, fitted_baseline,
         
         # Format values with proper alignment - pad to match header width (6 characters)
         energy_lower_str = f"{energy_lower:6.1f}"
-        energy_val_str = f"{energy_val:6.1f}"
+        energy_val_str = f"{energy_val:7.2f}"
         energy_upper_str = f"{energy_upper:6.1f}"
         
         intensity_lower_str = f"{intensity_lower:6.1f}"
-        intensity_val_str = f"{intensity_val:6.1f}"
+        intensity_val_str = f"{intensity_val:7.2f}"
         intensity_upper_str = f"{intensity_upper:6.1f}"
         
         width_lower_str = f"{width_lower:6.1f}"
-        width_val_str = f"{width_val:6.1f}"
+        width_val_str = f"{width_val:7.2f}"
         width_upper_str = f"{width_upper:6.1f}"
         
         # Apply colors after formatting
@@ -1272,9 +1353,9 @@ def print_fit_results(fitted_peak_params, fitted_edge_params, fitted_baseline,
     edge_width = fitted_edge_params["width"]
     edge_decay = fitted_edge_params["decay"]
     
-    print(f"Location: {edge_location:.1f}")
-    print(f"Height:   {edge_height:.1f}")
-    print(f"Width:    {edge_width:.1f}")
+    print(f"Location: {edge_location:.2f}")
+    print(f"Height:   {edge_height:.2f}")
+    print(f"Width:    {edge_width:.2f}")
     print(f"Decay:    {edge_decay:.3f}")
     
     print("\n" + "=" * 120)
@@ -1285,6 +1366,90 @@ def print_fit_results(fitted_peak_params, fitted_edge_params, fitted_baseline,
     print(f"{colorize_text('Grey', 'grey')}: Parameter not being fitted (fixed)")
     print("=" * 120)
 
+
+def _get_color_for_peak_energy(peak_energy: float, 
+                               energy_tolerance: Optional[float] = None,
+                               low_energy_threshold: float = 292.0,
+                               low_energy_tolerance: float = 0.1,
+                               high_energy_tolerance: float = 0.3) -> str:
+    """
+    Get color for a peak energy, matching to existing colors if within tolerance.
+    If no match found, assigns a new color from the colormap.
+    
+    Uses different tolerances based on energy:
+    - Below low_energy_threshold (default 292 eV): low_energy_tolerance (default 0.1 eV)
+    - Above low_energy_threshold: high_energy_tolerance (default 0.3 eV)
+    
+    Parameters:
+    -----------
+    peak_energy : float
+        Energy value of the peak (eV)
+    energy_tolerance : float, optional
+        Override tolerance for matching peak energies (eV). If None, uses energy-based tolerance.
+    low_energy_threshold : float, default 292.0
+        Energy threshold (eV) below which low_energy_tolerance is used
+    low_energy_tolerance : float, default 0.1
+        Tolerance for matching peak energies below threshold (eV)
+    high_energy_tolerance : float, default 0.3
+        Tolerance for matching peak energies above threshold (eV)
+        
+    Returns:
+    --------
+    str
+        Color hex string for the peak
+    """
+    global _peak_energy_color_map
+    
+    # Determine tolerance based on energy if not explicitly provided
+    if energy_tolerance is None:
+        if peak_energy < low_energy_threshold:
+            energy_tolerance = low_energy_tolerance
+        else:
+            energy_tolerance = high_energy_tolerance
+    
+    # Check if any existing mapped energy is within tolerance
+    # For matching, we need to check both the mapped energy's tolerance region
+    for mapped_energy, color in _peak_energy_color_map.items():
+        # Determine the appropriate tolerance for the mapped energy
+        if mapped_energy < low_energy_threshold:
+            mapped_tolerance = low_energy_tolerance
+        else:
+            mapped_tolerance = high_energy_tolerance
+        
+        # Use the larger tolerance to ensure symmetric matching
+        effective_tolerance = max(energy_tolerance, mapped_tolerance)
+        
+        if abs(peak_energy - mapped_energy) <= effective_tolerance:
+            return color
+    
+    # No match found - assign new color
+    # Count how many unique energy positions we have
+    n_unique_energies = len(_peak_energy_color_map)
+    
+    # Use tab10 for up to 10 unique energies, tab20 for more
+    if n_unique_energies < 10:
+        colors = plt.cm.tab10(np.linspace(0, 1, 10))
+        color = colors[n_unique_energies % 10]
+    else:
+        colors = plt.cm.tab20(np.linspace(0, 1, 20))
+        color = colors[n_unique_energies % 20]
+    
+    color_hex = mcolors.to_hex(color)
+    
+    # Store the mapping using the actual peak energy (not rounded)
+    # This allows for precise matching within tolerance
+    _peak_energy_color_map[peak_energy] = color_hex
+    
+    return color_hex
+
+
+def reset_peak_color_map():
+    """
+    Reset the global peak energy to color mapping.
+    Useful when starting a new analysis session or when you want to reset color assignments.
+    """
+    global _peak_energy_color_map
+    _peak_energy_color_map = {}
 
 
 def plot_simulated_nexafs_spectrum(energy: np.ndarray,
@@ -1298,7 +1463,11 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
                                  title: str = "NEXAFS Spectrum",
                                  save_path: Optional[str] = None,
                                  dpi: int = 300,
-                                 use_experimental_data: bool = True) -> plt.Figure:
+                                 use_experimental_data: bool = True,
+                                 xlim: Optional[Tuple[float, float]] = None,
+                                 ylim: Optional[Tuple[float, float]] = None,
+                                 show_peaks_subplot: bool = False,
+                                 peaks_subplot_height: float = 0.8) -> plt.Figure:
     """
     Plot NEXAFS spectrum with peak decomposition using separate energy axes for 
     experimental data and simulated components.
@@ -1329,6 +1498,15 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
     use_experimental_data : bool
         If True, plot intensity as experimental data without recalculation
         If False, treat intensity as simulated and recalculate components
+    xlim : tuple, optional
+        Tuple of (xmin, xmax) to set the x-axis limits. If None, uses automatic scaling.
+    ylim : tuple, optional
+        Tuple of (ymin, ymax) to set the y-axis limits. If None, uses automatic scaling.
+    show_peaks_subplot : bool, default False
+        If True, add a subplot below the main plot showing only the Gaussian peaks
+        (no baseline and no step edge contribution).
+    peaks_subplot_height : float, default 0.8
+        Height ratio for the peaks-only subplot relative to the main plot.
         
     Returns:
     matplotlib.figure.Figure
@@ -1336,7 +1514,14 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
     """
     
     # Create figure
-    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    if show_peaks_subplot:
+        fig, (ax, ax_peaks) = plt.subplots(
+            2, 1, figsize=figsize, sharex=True,
+            gridspec_kw={'height_ratios': [3, peaks_subplot_height], 'hspace': 0.05}
+        )
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        ax_peaks = None
     
     # Get peak names and set up colors
     peak_names = get_peak_names(peak_params)
@@ -1441,13 +1626,31 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
         # Fill area under peak
         ax.fill_between(energy_sim, peak_total, peak_spectrum_with_baseline,
                         color=color, alpha=peak_alpha, zorder=2)
+
+        # Peaks-only subplot (no baseline / no edge)
+        if ax_peaks is not None:
+            ax_peaks.plot(energy_sim, peak_spectrum, '-', color=color, linewidth=1.2, zorder=2)
+            ax_peaks.fill_between(energy_sim, 0.0, peak_spectrum, color=color, alpha=max(0.0, peak_alpha * 0.6), zorder=1)
     
     # Formatting
-    ax.set_xlabel('Energy (eV)', fontsize=12)
+    if ax_peaks is None:
+        ax.set_xlabel('Energy (eV)', fontsize=12)
     ax.set_ylabel('Intensity (arb. units)', fontsize=12)
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='upper left', fontsize=10) #bbox_to_anchor=(1.05, 1),
+
+    if ax_peaks is not None:
+        ax_peaks.set_xlabel('Energy (eV)', fontsize=12)
+        ax_peaks.set_ylabel('Peaks', fontsize=11)
+        ax_peaks.grid(True, alpha=0.2)
+        ax_peaks.set_ylim(bottom=0.0)
+    
+    # Set axis limits if provided
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
     
     # Add information about energy axes
     # energy_spacing_exp = np.median(np.diff(energy))
@@ -1456,6 +1659,488 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
     # ax.text(0.98, 0.02, info_text, transform=ax.transAxes, 
     #         fontsize=9, verticalalignment='bottom', horizontalalignment='right',
     #         bbox=dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.7))
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save figure if path provided
+    if save_path is not None:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+    
+    return fig
+
+def plot_simulated_nexafs_spectrum_synced(energy: np.ndarray,
+                                 intensity: np.ndarray,
+                                 peak_params: Dict,
+                                 edge_params: Optional[Dict] = None,
+                                 baseline: float = 0.0,
+                                 figsize: Tuple[float, float] = (12, 8),
+                                 peak_alpha: float = 0.3,
+                                 peak_colors: Optional[List[str]] = None,
+                                 title: str = "NEXAFS Spectrum",
+                                 save_path: Optional[str] = None,
+                                 dpi: int = 300,
+                                 use_experimental_data: bool = True,
+                                 energy_tolerance: Optional[float] = None,
+                                 low_energy_threshold: float = 292.0,
+                                 low_energy_tolerance: float = 0.1,
+                                 high_energy_tolerance: float = 0.3,
+                                 reset_color_map: bool = False,
+                                 show_components_in_legend: bool = False,
+                                 xlim: Optional[Tuple[float, float]] = None) -> plt.Figure:
+    """
+    Plot NEXAFS spectrum with peak decomposition using synchronized colors based on peak energy positions.
+    This function maintains color consistency across multiple plots by assigning the same color to peaks
+    at similar energies (within tolerance) across different plots.
+    
+    Uses different tolerances based on energy:
+    - Below low_energy_threshold (default 292 eV): low_energy_tolerance (default 0.1 eV)
+    - Above low_energy_threshold: high_energy_tolerance (default 0.3 eV)
+    
+    Parameters:
+    energy : numpy array
+        Energy values (experimental data axis)
+    intensity : numpy array
+        Intensity values (experimental data - plotted as-is if use_experimental_data=True)
+    peak_params : dict
+        Peak parameters dictionary (either initial guesses or fitted values)
+    edge_params : dict, optional
+        Edge parameters dictionary (either initial guesses or fitted values)
+    baseline : float
+        Baseline value
+    figsize : tuple
+        Figure size (width, height)
+    peak_alpha : float
+        Transparency for peak fill areas (0-1)
+    peak_colors : list, optional
+        List of colors for peaks. If None, uses synchronized color mapping based on energy.
+        Note: This parameter is ignored when using synchronized colors - colors are assigned by energy.
+    title : str
+        Plot title
+    save_path : str, optional
+        Path to save the figure
+    dpi : int
+        Resolution for saved figure
+    use_experimental_data : bool
+        If True, plot intensity as experimental data without recalculation
+        If False, treat intensity as simulated and recalculate components
+    energy_tolerance : float, optional
+        Override tolerance for matching peak energies (eV). If None, uses energy-based tolerance.
+        When None, peaks below low_energy_threshold use low_energy_tolerance,
+        and peaks above use high_energy_tolerance.
+    low_energy_threshold : float, default 292.0
+        Energy threshold (eV) below which low_energy_tolerance is used
+    low_energy_tolerance : float, default 0.1
+        Tolerance for matching peak energies below threshold (eV)
+    high_energy_tolerance : float, default 0.3
+        Tolerance for matching peak energies above threshold (eV)
+    reset_color_map : bool, default False
+        If True, reset the global color mapping before plotting this spectrum.
+    show_components_in_legend : bool, default False
+        If True, include individual Gaussian peaks and step edges in the legend.
+        If False (default), only show "Measured Spectrum" and "Simulated Spectrum" in the legend.
+    xlim : tuple, optional
+        Tuple of (xmin, xmax) to set the x-axis limits. If None, uses automatic scaling.
+        
+    Returns:
+    matplotlib.figure.Figure
+        The created figure object
+    """
+    global _peak_energy_color_map
+    
+    # Reset color map if requested
+    if reset_color_map:
+        _peak_energy_color_map = {}
+    
+    # Create figure
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    
+    # Get peak names and extract energies
+    peak_names = get_peak_names(peak_params)
+    
+    # Create list of (peak_name, peak_energy) tuples and sort by energy
+    peak_data = []
+    for peak_name in peak_names:
+        peak_energy = peak_params[f"{peak_name}_energy"]
+        peak_data.append((peak_name, peak_energy))
+    
+    # Sort peaks by energy to ensure consistent ordering
+    peak_data.sort(key=lambda x: x[1])
+    
+    # Plot experimental data using original energy axis (no recalculation)
+    if use_experimental_data:
+        ax.plot(energy, intensity, 'ko--', markersize=3, alpha=0.7, 
+                 label='Measured Spectrum', zorder=1)
+    else:
+        ax.plot(energy, intensity, 'ko--', markersize=3, alpha=0.7, 
+                 label='Data', zorder=1)
+    
+    # Create high-density energy axis for smooth simulation curves
+    energy_spacing = np.median(np.diff(energy))
+    if energy_spacing > 0.1:
+        energy_sim = np.arange(energy.min(), energy.max() + 0.1, 0.1)
+    else:
+        energy_sim = energy.copy()
+    
+    # Calculate simulated components using high-density axis
+    # Initialize spectrum with baseline
+    total_spectrum = np.full_like(energy_sim, baseline, dtype=float)
+    
+    # Add step edge if provided
+    if edge_params is not None:
+        edge_contribution = edge_bl_func(energy_sim, 
+                                       edge_params['location'],
+                                       edge_params['height'], 
+                                       edge_params['width'],
+                                       edge_params['decay'])
+        total_spectrum += edge_contribution
+    
+    # Add Gaussian peaks to total
+    for peak_name, peak_energy in peak_data:
+        width = peak_params[f"{peak_name}_width"]
+        height = peak_params[f"{peak_name}_height"]
+        
+        # Add Gaussian peak to total spectrum
+        peak_contribution = gaussian(energy_sim, height, peak_energy, width)
+        total_spectrum += peak_contribution
+    
+    # Plot total spectrum using high-density axis
+    ax.plot(energy_sim, total_spectrum, 'r-', linewidth=2, 
+             label='Simulated Spectrum', zorder=5)
+    
+    # Plot baseline if non-zero
+    if baseline != 0:
+        ax.axhline(y=baseline, color='gray', linestyle='--', alpha=0.7, 
+                   label=f'Baseline = {baseline:.3f}', zorder=2)
+    
+    # Plot step edge if present (using high-density axis)
+    if edge_params is not None:
+        edge_spectrum = edge_bl_func(energy_sim, 
+                                   edge_params['location'],
+                                   edge_params['height'],
+                                   edge_params['width'], 
+                                   edge_params['decay'])
+        edge_spectrum += baseline
+        edge_label = 'Step Edge' if show_components_in_legend else ''
+        ax.plot(energy_sim, edge_spectrum, 'b-', linewidth=2, alpha=0.8,
+                 label=edge_label, zorder=3)
+        
+        # Shade under the step edge with light grey
+        ax.fill_between(energy_sim, baseline, edge_spectrum,
+                        color='lightgrey', alpha=0.4, zorder=1)
+    
+    # Plot individual peaks (using high-density axis)
+    peak_total = np.full_like(energy_sim, baseline)
+    if edge_params is not None:
+        peak_total += edge_bl_func(energy_sim,
+                                 edge_params['location'],
+                                 edge_params['height'],
+                                 edge_params['width'],
+                                 edge_params['decay'])
+    
+    # Plot peaks in sorted order by energy, using synchronized colors
+    for peak_name, peak_energy in peak_data:
+        # Get peak parameters
+        width = peak_params[f"{peak_name}_width"]
+        height = peak_params[f"{peak_name}_height"]
+        
+        # Calculate individual peak using high-density axis
+        peak_spectrum = gaussian(energy_sim, height, peak_energy, width)
+        peak_spectrum_with_baseline = peak_spectrum + peak_total
+        
+        # Get color based on peak energy (synchronized across plots)
+        # Uses energy-based tolerance (different for low/high energy regions)
+        color = _get_color_for_peak_energy(
+            peak_energy, 
+            energy_tolerance=energy_tolerance,
+            low_energy_threshold=low_energy_threshold,
+            low_energy_tolerance=low_energy_tolerance,
+            high_energy_tolerance=high_energy_tolerance
+        )
+        peak_label = f'{peak_energy:.1f} eV' if show_components_in_legend else ''
+        ax.plot(energy_sim, peak_spectrum_with_baseline, '-', 
+                 color=color, linewidth=1.5, label=peak_label, zorder=4)
+        
+        # Fill area under peak
+        ax.fill_between(energy_sim, peak_total, peak_spectrum_with_baseline,
+                        color=color, alpha=peak_alpha, zorder=2)
+    
+    # Formatting
+    ax.set_xlabel('Energy (eV)', fontsize=18)
+    ax.set_ylabel('Intensity (a.u.)', fontsize=18)
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper left', fontsize=10)
+    
+    # Set x-axis limits if provided
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save figure if path provided
+    if save_path is not None:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+    
+    return fig
+
+def plot_simulated_nexafs_spectrum_synced_with_peaks(energy: np.ndarray,
+                                 intensity: np.ndarray,
+                                 peak_params: Dict,
+                                 edge_params: Optional[Dict] = None,
+                                 baseline: float = 0.0,
+                                 figsize: Tuple[float, float] = (12, 10),
+                                 peak_alpha: float = 0.3,
+                                 peak_colors: Optional[List[str]] = None,
+                                 title: str = "NEXAFS Spectrum",
+                                 save_path: Optional[str] = None,
+                                 dpi: int = 300,
+                                 use_experimental_data: bool = True,
+                                 energy_tolerance: Optional[float] = None,
+                                 low_energy_threshold: float = 292.0,
+                                 low_energy_tolerance: float = 0.1,
+                                 high_energy_tolerance: float = 0.3,
+                                 reset_color_map: bool = False,
+                                 show_components_in_legend: bool = False,
+                                 xlim: Optional[Tuple[float, float]] = None,
+                                 subplot_height_ratio: Tuple[float, float] = (3, 1)) -> plt.Figure:
+    """
+    Plot NEXAFS spectrum with peak decomposition using synchronized colors, with two subplots:
+    - Top subplot: Full fitted spectrum with measured data, simulated spectrum, edge, and individual peaks
+    - Bottom subplot: Only individual Gaussian peaks
+    
+    This function maintains color consistency across multiple plots by assigning the same color to peaks
+    at similar energies (within tolerance) across different plots.
+    
+    Uses different tolerances based on energy:
+    - Below low_energy_threshold (default 292 eV): low_energy_tolerance (default 0.1 eV)
+    - Above low_energy_threshold: high_energy_tolerance (default 0.3 eV)
+    
+    Parameters:
+    energy : numpy array
+        Energy values (experimental data axis)
+    intensity : numpy array
+        Intensity values (experimental data - plotted as-is if use_experimental_data=True)
+    peak_params : dict
+        Peak parameters dictionary (either initial guesses or fitted values)
+    edge_params : dict, optional
+        Edge parameters dictionary (either initial guesses or fitted values)
+    baseline : float
+        Baseline value
+    figsize : tuple
+        Figure size (width, height)
+    peak_alpha : float
+        Transparency for peak fill areas (0-1)
+    peak_colors : list, optional
+        List of colors for peaks. If None, uses synchronized color mapping based on energy.
+        Note: This parameter is ignored when using synchronized colors - colors are assigned by energy.
+    title : str
+        Plot title (applied to top subplot)
+    save_path : str, optional
+        Path to save the figure
+    dpi : int
+        Resolution for saved figure
+    use_experimental_data : bool
+        If True, plot intensity as experimental data without recalculation
+        If False, treat intensity as simulated and recalculate components
+    energy_tolerance : float, optional
+        Override tolerance for matching peak energies (eV). If None, uses energy-based tolerance.
+        When None, peaks below low_energy_threshold use low_energy_tolerance,
+        and peaks above use high_energy_tolerance.
+    low_energy_threshold : float, default 292.0
+        Energy threshold (eV) below which low_energy_tolerance is used
+    low_energy_tolerance : float, default 0.1
+        Tolerance for matching peak energies below threshold (eV)
+    high_energy_tolerance : float, default 0.3
+        Tolerance for matching peak energies above threshold (eV)
+    reset_color_map : bool, default False
+        If True, reset the global color mapping before plotting this spectrum.
+    show_components_in_legend : bool, default False
+        If True, include individual Gaussian peaks and step edges in the legend.
+        If False (default), only show "Measured Spectrum" and "Simulated Spectrum" in the legend.
+    xlim : tuple, optional
+        Tuple of (xmin, xmax) to set the x-axis limits. If None, uses automatic scaling.
+    subplot_height_ratio : tuple, default (3, 1)
+        Ratio of heights for top and bottom subplots (top, bottom)
+        
+    Returns:
+    matplotlib.figure.Figure
+        The created figure object
+    """
+    global _peak_energy_color_map
+    
+    # Reset color map if requested
+    if reset_color_map:
+        _peak_energy_color_map = {}
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, 
+                                   gridspec_kw={'height_ratios': subplot_height_ratio, 'hspace': 0.1})
+    
+    # Get peak names and extract energies
+    peak_names = get_peak_names(peak_params)
+    
+    # Create list of (peak_name, peak_energy) tuples and sort by energy
+    peak_data = []
+    for peak_name in peak_names:
+        peak_energy = peak_params[f"{peak_name}_energy"]
+        peak_data.append((peak_name, peak_energy))
+    
+    # Sort peaks by energy to ensure consistent ordering
+    peak_data.sort(key=lambda x: x[1])
+    
+    # Create high-density energy axis for smooth simulation curves
+    energy_spacing = np.median(np.diff(energy))
+    if energy_spacing > 0.1:
+        energy_sim = np.arange(energy.min(), energy.max() + 0.1, 0.1)
+    else:
+        energy_sim = energy.copy()
+    
+    # Calculate simulated components using high-density axis
+    # Initialize spectrum with baseline
+    total_spectrum = np.full_like(energy_sim, baseline, dtype=float)
+    
+    # Add step edge if provided
+    if edge_params is not None:
+        edge_contribution = edge_bl_func(energy_sim, 
+                                       edge_params['location'],
+                                       edge_params['height'], 
+                                       edge_params['width'],
+                                       edge_params['decay'])
+        total_spectrum += edge_contribution
+    
+    # Add Gaussian peaks to total
+    for peak_name, peak_energy in peak_data:
+        width = peak_params[f"{peak_name}_width"]
+        height = peak_params[f"{peak_name}_height"]
+        
+        # Add Gaussian peak to total spectrum
+        peak_contribution = gaussian(energy_sim, height, peak_energy, width)
+        total_spectrum += peak_contribution
+    
+    # ========== TOP SUBPLOT: Full Spectrum ==========
+    # Plot experimental data using original energy axis
+    if use_experimental_data:
+        ax1.plot(energy, intensity, 'ko--', markersize=3, alpha=0.7, 
+                 label='Measured Spectrum', zorder=1)
+    else:
+        ax1.plot(energy, intensity, 'ko--', markersize=3, alpha=0.7, 
+                 label='Data', zorder=1)
+    
+    # Plot total spectrum using high-density axis
+    ax1.plot(energy_sim, total_spectrum, 'r-', linewidth=2, 
+             label='Simulated Spectrum', zorder=5)
+    
+    # Plot baseline if non-zero
+    if baseline != 0:
+        ax1.axhline(y=baseline, color='gray', linestyle='--', alpha=0.7, 
+                   label=f'Baseline = {baseline:.3f}', zorder=2)
+    
+    # Plot step edge if present (using high-density axis)
+    if edge_params is not None:
+        edge_spectrum = edge_bl_func(energy_sim, 
+                                   edge_params['location'],
+                                   edge_params['height'],
+                                   edge_params['width'], 
+                                   edge_params['decay'])
+        edge_spectrum += baseline
+        edge_label = 'Step Edge' if show_components_in_legend else ''
+        ax1.plot(energy_sim, edge_spectrum, 'b-', linewidth=2, alpha=0.8,
+                 label=edge_label, zorder=3)
+        
+        # Shade under the step edge with light grey
+        ax1.fill_between(energy_sim, baseline, edge_spectrum,
+                        color='lightgrey', alpha=0.4, zorder=1)
+    
+    # Plot individual peaks (using high-density axis)
+    peak_total = np.full_like(energy_sim, baseline)
+    if edge_params is not None:
+        peak_total += edge_bl_func(energy_sim,
+                                 edge_params['location'],
+                                 edge_params['height'],
+                                 edge_params['width'],
+                                 edge_params['decay'])
+    
+    # Plot peaks in sorted order by energy, using synchronized colors
+    for peak_name, peak_energy in peak_data:
+        # Get peak parameters
+        width = peak_params[f"{peak_name}_width"]
+        height = peak_params[f"{peak_name}_height"]
+        
+        # Calculate individual peak using high-density axis
+        peak_spectrum = gaussian(energy_sim, height, peak_energy, width)
+        peak_spectrum_with_baseline = peak_spectrum + peak_total
+        
+        # Get color based on peak energy (synchronized across plots)
+        color = _get_color_for_peak_energy(
+            peak_energy, 
+            energy_tolerance=energy_tolerance,
+            low_energy_threshold=low_energy_threshold,
+            low_energy_tolerance=low_energy_tolerance,
+            high_energy_tolerance=high_energy_tolerance
+        )
+        peak_label = f'{peak_energy:.1f} eV' if show_components_in_legend else ''
+        ax1.plot(energy_sim, peak_spectrum_with_baseline, '-', 
+                 color=color, linewidth=1.5, label=peak_label, zorder=4)
+        
+        # Fill area under peak
+        ax1.fill_between(energy_sim, peak_total, peak_spectrum_with_baseline,
+                        color=color, alpha=peak_alpha, zorder=2)
+    
+    # Formatting for top subplot
+    ax1.set_ylabel('Intensity (a.u.)', fontsize=18)
+    ax1.set_title(title, fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='upper left', fontsize=10)
+    
+    # Set x-axis limits if provided
+    if xlim is not None:
+        ax1.set_xlim(xlim)
+    
+    # ========== BOTTOM SUBPLOT: Individual Peaks Only ==========
+    # Plot only the individual Gaussian peaks (no baseline, edge, or total spectrum)
+    for peak_name, peak_energy in peak_data:
+        # Get peak parameters
+        width = peak_params[f"{peak_name}_width"]
+        height = peak_params[f"{peak_name}_height"]
+        
+        # Calculate individual peak using high-density axis (no baseline or edge)
+        peak_spectrum = gaussian(energy_sim, height, peak_energy, width)
+        
+        # Get color based on peak energy (synchronized - same as top plot)
+        color = _get_color_for_peak_energy(
+            peak_energy, 
+            energy_tolerance=energy_tolerance,
+            low_energy_threshold=low_energy_threshold,
+            low_energy_tolerance=low_energy_tolerance,
+            high_energy_tolerance=high_energy_tolerance
+        )
+        peak_label = f'{peak_energy:.1f} eV' if show_components_in_legend else ''
+        
+        # Plot peak line
+        ax2.plot(energy_sim, peak_spectrum, '-', 
+                 color=color, linewidth=1.5, label=peak_label, zorder=4)
+        
+        # Fill area under peak (from zero)
+        ax2.fill_between(energy_sim, 0, peak_spectrum,
+                        color=color, alpha=peak_alpha, zorder=2)
+    
+    # Formatting for bottom subplot
+    ax2.set_xlabel('Energy (eV)', fontsize=18)
+    ax2.set_ylabel('Intensity (a.u.)', fontsize=18)
+    ax2.grid(True, alpha=0.3)
+    if show_components_in_legend:
+        ax2.legend(loc='upper left', fontsize=10)
+    
+    # Set x-axis limits if provided (apply to both subplots)
+    if xlim is not None:
+        ax2.set_xlim(xlim)
+    
+    # Share x-axis (hide x-axis labels on top subplot)
+    ax1.set_xticklabels([])
     
     # Adjust layout
     plt.tight_layout()

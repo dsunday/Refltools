@@ -167,49 +167,73 @@ class LariatDataProcessor:
         if rotate not in valid_rotations:
             raise ValueError(f"rotate must be one of {valid_rotations}, got {rotate}")
         
-        f = h5py.File(filepath)
-        metadata = json.loads(f['File Version'].attrs['Meta Data'])
-        all_energies = np.arange(*metadata['BeamEnergy'])
+        with h5py.File(filepath, 'r') as f:
+            metadata = json.loads(f['File Version'].attrs['Meta Data'])
+            all_energies = np.arange(*metadata['BeamEnergy'])
+
+            # Build an explicit mapping from energy positions to actual HDF5 image keys.
+            # Some files may not have contiguous names (e.g., missing Image120), so
+            # indexing via f'Image{idx}' is not reliable.
+            image_group = f['Images']
+            image_keys = [k for k in image_group.keys() if k.startswith('Image')]
+            parsed_keys = []
+            for key in image_keys:
+                suffix = key[5:]
+                if suffix.isdigit():
+                    parsed_keys.append((int(suffix), key))
+
+            if not parsed_keys:
+                raise ValueError(f"No valid Image* groups found in {filepath}")
+
+            parsed_keys.sort(key=lambda x: x[0])
+            ordered_image_keys = [key for _, key in parsed_keys]
+            n_images = len(ordered_image_keys)
+
+            if len(all_energies) != n_images:
+                print(f"Warning: metadata has {len(all_energies)} energies but file has {n_images} image groups.")
+                print("Using the overlapping subset in acquisition order.")
+            n_common = min(len(all_energies), n_images)
+            all_energies = all_energies[:n_common]
+            ordered_image_keys = ordered_image_keys[:n_common]
         
-        # Apply energy range filter if specified
-        if energy_range is not None:
-            min_energy, max_energy = energy_range
-            energy_mask = (all_energies >= min_energy) & (all_energies <= max_energy)
-            energy_indices = np.where(energy_mask)[0]
-            energies = all_energies[energy_mask]
-            
-            if len(energies) == 0:
-                raise ValueError(f"No energies found in range {min_energy} - {max_energy} eV. "
-                            f"Available range: {all_energies.min():.2f} - {all_energies.max():.2f} eV")
-            
-            print(f"Loading {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
-            print(f"(Requested range: {min_energy:.2f} - {max_energy:.2f} eV)")
-        else:
-            energy_indices = np.arange(len(all_energies))
-            energies = all_energies
-            print(f"Loading all {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
-        
-        image_list = []
-        energy_list = []
-        for idx in energy_indices:
-            image = f['Images'][f'Image{idx}']['ImagePlane0'][()]
-            
-            # Apply axis inversions if requested
-            if invert_y:
-                image = np.flip(image, axis=0)  # Flip along y-axis (rows)
-            if invert_x:
-                image = np.flip(image, axis=1)  # Flip along x-axis (columns)
-            
-            # Apply rotation if requested
-            # np.rot90 rotates counterclockwise, k is number of 90-degree rotations
-            if rotate != 0:
-                k = rotate // 90  # Convert degrees to number of 90-degree rotations
-                image = np.rot90(image, k=k)
-            
-            image_list.append(image)
-            energy_list.append(energies[idx - energy_indices[0]])
-        
-        f.close()
+            # Apply energy range filter if specified
+            if energy_range is not None:
+                min_energy, max_energy = energy_range
+                energy_mask = (all_energies >= min_energy) & (all_energies <= max_energy)
+                selected_positions = np.where(energy_mask)[0]
+                energies = all_energies[energy_mask]
+
+                if len(energies) == 0:
+                    raise ValueError(f"No energies found in range {min_energy} - {max_energy} eV. "
+                                f"Available range: {all_energies.min():.2f} - {all_energies.max():.2f} eV")
+
+                print(f"Loading {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
+                print(f"(Requested range: {min_energy:.2f} - {max_energy:.2f} eV)")
+            else:
+                selected_positions = np.arange(len(all_energies))
+                energies = all_energies
+                print(f"Loading all {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
+
+            image_list = []
+            energy_list = []
+            for pos in selected_positions:
+                image_key = ordered_image_keys[pos]
+                image = image_group[image_key]['ImagePlane0'][()]
+
+                # Apply axis inversions if requested
+                if invert_y:
+                    image = np.flip(image, axis=0)  # Flip along y-axis (rows)
+                if invert_x:
+                    image = np.flip(image, axis=1)  # Flip along x-axis (columns)
+
+                # Apply rotation if requested
+                # np.rot90 rotates counterclockwise, k is number of 90-degree rotations
+                if rotate != 0:
+                    k = rotate // 90  # Convert degrees to number of 90-degree rotations
+                    image = np.rot90(image, k=k)
+
+                image_list.append(image)
+                energy_list.append(all_energies[pos])
         
         # Print information about transformations applied
         transformations = []
