@@ -831,96 +831,275 @@ def create_vscode_sld_explorer(objectives_dict, structures_dict,
 
 
 def create_vscode_parameter_explorer(objectives_dict, structures_dict,
-                                      energy_list=None, profile_shift=-20,
-                                      xlim=None, fig_size_w=16, colors=None,
+                                      energy_list=None, material_name='PS',
+                                      figsize=(14, 12), xlim=None,
                                       bound_threshold=0.02):
     """
-    Keyboard-navigable parameter explorer for VS Code.
-    Shows parameter values with bound proximity highlighting.
-    Arrow keys navigate; click a point to see that energy's model.
-    """
-    import ipywidgets as widgets
-    from IPython.display import clear_output
+    Interactive parameter-vs-energy explorer for VS Code / Jupyter.
 
+    Shows five trend panels (Real SLD, Imag SLD, Thickness, Roughness, χ²)
+    for a chosen material alongside a live reflectivity and SLD profile panel
+    that updates when you click any data point.
+
+    Red points and shading indicate parameters within bound_threshold of
+    their bounds.  Click any point to inspect that energy.
+
+    Args:
+        objectives_dict  : {energy: Objective}
+        structures_dict  : {energy: Structure}
+        energy_list      : energies to include (None = all)
+        material_name    : material whose parameters are trended
+        figsize          : (width, height) of the figure
+        xlim             : (min, max) energy axis limits (None = auto)
+        bound_threshold  : fraction of bound range used for near-bound
+                           highlighting (default 0.02 = 2 %)
+
+    Returns:
+        matplotlib Figure
+    """
     avail = (sorted(set(objectives_dict) & set(structures_dict))
              if energy_list is None
              else [e for e in energy_list
                    if e in objectives_dict and e in structures_dict])
     if not avail:
-        print('No valid energies.')
+        print('No valid energies found.')
         return None
 
-    state  = {'idx': 0}
-    output = widgets.Output()
+    param_strings = [
+        f'{material_name} - sld',
+        f'{material_name} - isld',
+        f'{material_name} - thick',
+        f'{material_name} - rough',
+    ]
+    param_colors = {'sld': 'blue', 'isld': 'orange',
+                    'thick': 'green', 'rough': 'purple', 'chi': 'red'}
 
-    def plot(idx):
-        energy = avail[idx]
-        obj    = objectives_dict[energy]
-        s      = structures_dict[energy]
-        with output:
-            clear_output(wait=True)
-            fig, axes = plt.subplots(1, 3, figsize=(fig_size_w, 5))
+    # ── collect data ──────────────────────────────────────────────────────
+    param_data = {ps: [] for ps in param_strings}
+    chi_data   = []
 
-            # reflectivity
-            data = obj.data
-            axes[0].semilogy(data.data[0], data.data[1], '.', markersize=3,
-                             label='Data')
-            axes[0].semilogy(data.data[0], obj.model(data.data[0]), '-',
-                             label='Model')
-            axes[0].set_title(f'{energy} eV  χ²={obj.chisqr():.4f}')
-            axes[0].set_xlabel(r'Q ($\AA^{-1}$)')
-            axes[0].legend()
+    for energy in avail:
+        obj  = objectives_dict[energy]
+        chi2 = obj.chisqr()
+        chi_data.append({'energy': energy, 'chi_squared': chi2})
 
-            # SLD profile
-            rd, rsl, id_, isl = profileflip(s, depth_shift=0)
-            axes[1].plot(rd + profile_shift, rsl, label='Real')
-            axes[1].plot(id_ + profile_shift, isl, '--', label='Imag')
-            if xlim:
-                axes[1].set_xlim(xlim)
-            axes[1].set_xlabel(r'Distance from Si ($\AA$)')
-            axes[1].legend()
+        for ps in param_strings:
+            found = False
+            for param in obj.parameters.flattened():
+                if param.name == ps:
+                    bl = bh = None
+                    try:
+                        b = getattr(param, 'bounds', None)
+                        if b is not None:
+                            bl = b.lb if hasattr(b, 'lb') else b[0]
+                            bh = b.ub if hasattr(b, 'ub') else b[1]
+                    except Exception:
+                        pass
+                    near = False
+                    if bl is not None and bh is not None and bh > bl:
+                        span = bh - bl
+                        near = (abs(param.value - bl) < bound_threshold * span
+                                or abs(bh - param.value) < bound_threshold * span)
+                    param_data[ps].append({
+                        'energy': energy,
+                        'value':  param.value,
+                        'stderr': getattr(param, 'stderr', None) or 0,
+                        'bound_low': bl, 'bound_high': bh,
+                        'near_bound': near, 'chi_squared': chi2,
+                    })
+                    found = True
+                    break
+            if not found:
+                print(f'  {ps} not found at {energy} eV')
 
-            # parameter bar chart
-            names, vals, clrs = [], [], []
-            for p in obj.parameters.flattened():
-                if not p.vary:
-                    continue
-                bl = bh = None
-                try:
-                    b = getattr(p, 'bounds', None)
-                    if b is not None:
-                        bl = b.lb if hasattr(b, 'lb') else b[0]
-                        bh = b.ub if hasattr(b, 'ub') else b[1]
-                except Exception:
-                    pass
-                near = False
-                if bl is not None and bh is not None and bh > bl:
-                    span  = bh - bl
-                    near  = (abs(p.value - bl) < bound_threshold * span or
-                             abs(bh - p.value) < bound_threshold * span)
-                names.append(p.name.split(' - ')[-1])
-                vals.append(p.value)
-                clrs.append('red' if near else 'steelblue')
-            axes[2].barh(names, vals, color=clrs)
-            axes[2].set_title('Varying parameters')
-            axes[2].set_xlabel('Value')
+    param_dfs  = {ps: pd.DataFrame(d).sort_values('energy')
+                  for ps, d in param_data.items() if d}
+    chi_df     = pd.DataFrame(chi_data).sort_values('energy')
 
-            def on_key(event):
-                if event.key == 'right' and state['idx'] < len(avail) - 1:
-                    state['idx'] += 1
-                    plot(state['idx'])
-                elif event.key == 'left' and state['idx'] > 0:
-                    state['idx'] -= 1
-                    plot(state['idx'])
+    # ── build figure ──────────────────────────────────────────────────────
+    fig = plt.figure(figsize=figsize)
+    gs  = GridSpec(5, 3, figure=fig, height_ratios=[1, 1, 1, 1, 1.5])
 
-            fig.canvas.mpl_connect('key_press_event', on_key)
-            plt.tight_layout()
-            plt.show()
+    ax_sld   = fig.add_subplot(gs[0, :2])
+    ax_isld  = fig.add_subplot(gs[1, :2])
+    ax_thick = fig.add_subplot(gs[2, :2])
+    ax_rough = fig.add_subplot(gs[3, :2])
+    ax_chi   = fig.add_subplot(gs[4, :2])
+    ax_refl  = fig.add_subplot(gs[3:5, 2])
+    ax_prof  = fig.add_subplot(gs[0:3, 2])
 
-    plot(0)
-    print('Use ← → arrow keys to navigate energies.  '
-          'Red bars = parameter near a bound.')
-    return output
+    scatter_plots   = {}
+    highlight_pts   = {}
+    energy_vlines   = {}
+
+    def _plot_param(ax, ps, ptype):
+        if ps not in param_dfs:
+            return None
+        df = param_dfs[ps]
+        c  = param_colors[ptype]
+
+        normal  = df[~df['near_bound']]
+        nearb   = df[ df['near_bound']]
+
+        sc_norm = ax.scatter(normal['energy'], normal['value'],
+                             s=64, color=c, picker=5) if not normal.empty else None
+        sc_near = ax.scatter(nearb['energy'],  nearb['value'],
+                             s=64, color='red', picker=5) if not nearb.empty else None
+
+        # bound shading
+        valid = df['bound_low'].notna() & df['bound_high'].notna()
+        if valid.any():
+            bd = df[valid]
+            ax.fill_between(bd['energy'], bd['bound_low'], bd['bound_high'],
+                            color=c, alpha=0.10)
+            ax.plot(bd['energy'], bd['bound_low'],  '--', color=c, alpha=0.5, lw=1)
+            ax.plot(bd['energy'], bd['bound_high'], '--', color=c, alpha=0.5, lw=1)
+
+        ax.errorbar(df['energy'], df['value'], yerr=df['stderr'],
+                    fmt='none', ecolor='gray', alpha=0.5)
+        ax.plot(df['energy'], df['value'], '-', color=c, alpha=0.5)
+
+        return sc_norm or sc_near
+
+    scatter_plots['sld']   = _plot_param(ax_sld,   f'{material_name} - sld',   'sld')
+    scatter_plots['isld']  = _plot_param(ax_isld,  f'{material_name} - isld',  'isld')
+    scatter_plots['thick'] = _plot_param(ax_thick, f'{material_name} - thick', 'thick')
+    scatter_plots['rough'] = _plot_param(ax_rough, f'{material_name} - rough', 'rough')
+
+    ax_sld.set_ylabel('Real SLD\n(10⁻⁶ Å⁻²)')
+    ax_sld.set_title(f'Real SLD – {material_name}')
+    ax_sld.grid(True, alpha=0.3)
+
+    ax_isld.set_ylabel('Imag SLD\n(10⁻⁶ Å⁻²)')
+    ax_isld.set_title(f'Imaginary SLD – {material_name}')
+    ax_isld.grid(True, alpha=0.3)
+
+    ax_thick.set_ylabel('Thickness (Å)')
+    ax_thick.set_title(f'Thickness – {material_name}')
+    ax_thick.grid(True, alpha=0.3)
+
+    ax_rough.set_ylabel('Roughness (Å)')
+    ax_rough.set_title(f'Roughness – {material_name}')
+    ax_rough.grid(True, alpha=0.3)
+
+    scatter_plots['chi'] = ax_chi.scatter(
+        chi_df['energy'], chi_df['chi_squared'], s=64, color='red', picker=5)
+    ax_chi.plot(chi_df['energy'], chi_df['chi_squared'], 'r-', alpha=0.5)
+    ax_chi.set_xlabel('Energy (eV)')
+    ax_chi.set_ylabel('χ²')
+    ax_chi.set_title('Goodness of Fit')
+    ax_chi.grid(True, alpha=0.3)
+    if (chi_df['chi_squared'].max() / (chi_df['chi_squared'].min() + 1e-30)) > 10:
+        ax_chi.set_yscale('log')
+
+    # vertical energy markers and highlight points
+    for ptype, ax_obj, ps in [
+        ('sld',   ax_sld,   f'{material_name} - sld'),
+        ('isld',  ax_isld,  f'{material_name} - isld'),
+        ('thick', ax_thick, f'{material_name} - thick'),
+        ('rough', ax_rough, f'{material_name} - rough'),
+        ('chi',   ax_chi,   None),
+    ]:
+        energy_vlines[ptype] = ax_obj.axvline(
+            x=avail[0], color='red', linestyle='--', alpha=0.7)
+        if ps and ps in param_dfs:
+            df = param_dfs[ps]
+            highlight_pts[ptype], = ax_obj.plot(
+                df['energy'].iloc[0], df['value'].iloc[0],
+                'o', color='red', markersize=12, alpha=0.7)
+
+    if xlim:
+        for ax_obj in [ax_sld, ax_isld, ax_thick, ax_rough, ax_chi]:
+            ax_obj.set_xlim(xlim)
+
+    # text annotations at the bottom
+    ann = {k: fig.text(x, 0.02, '', fontsize=9, transform=fig.transFigure)
+           for k, x in [('energy', 0.02), ('sld', 0.18), ('isld', 0.34),
+                         ('thick', 0.50), ('rough', 0.66), ('gof', 0.82)]}
+
+    # ── update callback ───────────────────────────────────────────────────
+    def update(energy):
+        obj = objectives_dict[energy]
+        s   = structures_dict[energy]
+
+        for ptype in energy_vlines:
+            energy_vlines[ptype].set_xdata([energy, energy])
+
+        def _get(ps):
+            if ps in param_dfs:
+                row = param_dfs[ps][param_dfs[ps]['energy'] == energy]
+                if not row.empty:
+                    return row['value'].iloc[0], row['near_bound'].iloc[0]
+            return None, False
+
+        sv, sn   = _get(f'{material_name} - sld')
+        iv, in_  = _get(f'{material_name} - isld')
+        tv, tn   = _get(f'{material_name} - thick')
+        rv, rn   = _get(f'{material_name} - rough')
+
+        for ptype, val in [('sld', sv), ('isld', iv),
+                            ('thick', tv), ('rough', rv)]:
+            if ptype in highlight_pts and val is not None:
+                highlight_pts[ptype].set_data([energy], [val])
+
+        chi_row = chi_df[chi_df['energy'] == energy]
+        chi2    = chi_row['chi_squared'].iloc[0] if not chi_row.empty else None
+
+        # reflectivity
+        ax_refl.clear()
+        data = obj.data
+        ax_refl.semilogy(data.data[0], data.data[1], 'o',
+                         markersize=3, label='Data')
+        ax_refl.semilogy(data.data[0], obj.model(data.data[0]), '-',
+                         label='Model')
+        ax_refl.set_xlabel(r'Q ($\AA^{-1}$)')
+        ax_refl.set_ylabel('Reflectivity')
+        ax_refl.set_title(f'{energy} eV' +
+                          (f'  χ²={chi2:.4f}' if chi2 is not None else ''))
+        ax_refl.grid(True, alpha=0.3)
+        ax_refl.legend(loc='best', fontsize=8)
+
+        # SLD profile
+        ax_prof.clear()
+        rd, rsl, id_, isl = profileflip(s, depth_shift=0)
+        ax_prof.plot(rd - 20, rsl, 'b-',  label='Real SLD')
+        ax_prof.plot(id_ - 20, isl, 'b--', label='Imag SLD')
+        ax_prof.set_xlabel(r'Distance from Si ($\AA$)')
+        ax_prof.set_ylabel(r'SLD $(10^{-6})\ \AA^{-2}$')
+        ax_prof.set_title(f'SLD Profile – {energy} eV')
+        ax_prof.grid(True, alpha=0.3)
+        ax_prof.legend(loc='best', fontsize=8)
+
+        # text footer
+        def _fmt(label, val, near):
+            return f'{label}: {val:.4g}{"*" if near else ""}' if val is not None else ''
+
+        ann['energy'].set_text(f'Energy: {energy} eV')
+        ann['sld'].set_text(_fmt('SLD',   sv, sn))
+        ann['isld'].set_text(_fmt('iSLD',  iv, in_))
+        ann['thick'].set_text(_fmt('Thick', tv, tn) + (' Å' if tv is not None else ''))
+        ann['rough'].set_text(_fmt('Rough', rv, rn) + (' Å' if rv is not None else ''))
+        ann['gof'].set_text(f'χ²: {chi2:.4g}' if chi2 is not None else '')
+
+        fig.canvas.draw_idle()
+
+    def on_pick(event):
+        if hasattr(event, 'ind') and len(event.ind) > 0:
+            xdata = event.artist.get_offsets()[:, 0]
+            update(xdata[event.ind[0]])
+
+    fig.canvas.mpl_connect('pick_event', on_pick)
+
+    fig.text(0.5, 0.005,
+             f'Click any point to inspect that energy.  '
+             f'Red = within {bound_threshold*100:.0f}% of bounds.  '
+             f'* in footer = near bound.',
+             ha='center', fontsize=9)
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    update(avail[0])
+    print('Click any point to update the reflectivity and SLD profile panels.')
+    return fig
 
 
 def create_vscode_before_after_explorer(results_dict, original_objectives_dict,
