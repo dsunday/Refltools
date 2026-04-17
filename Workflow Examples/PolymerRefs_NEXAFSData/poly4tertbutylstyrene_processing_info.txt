@@ -1,0 +1,11 @@
+Processing Information for poly4tertbutylstyrene
+ROI: (350, 300, 200, 200)
+Pre-edge normalization: True
+Pre-edge subtraction: True
+Post-edge normalization: True
+Pre-edge norm range: (276, 277)
+Pre-edge sub range: (276, 277)
+Post-edge range: (325, 330)
+pre_edge_slope_params: (-0.8256051079212436, 323.55575333650904)
+pre_edge_value: 0.9999999958121514
+post_edge_value: 1.9688194305892583

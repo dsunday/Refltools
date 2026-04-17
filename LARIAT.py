@@ -14,29 +14,37 @@ class LariatDataProcessor:
     A class for processing Lariat datacube files and extracting/analyzing spectra.
     """
     
+    def __init__(self, filepath=None, pixel_size_um=50.0, energy_range=None, 
+                 invert_x=False, invert_y=False, rotate=0):
+            """
+            Initialize the LariatDataProcessor.
+            
+            Parameters:
+            -----------
+            filepath : str, optional
+                Path to the HDF5 file to load immediately
+            pixel_size_um : float, optional
+                Size of each pixel in micrometers. Default is 50.0 um
+            energy_range : tuple, optional
+                (min_energy, max_energy) to load only a subset of energies.
+                If None, loads all energies from the file.
+            invert_x : bool, optional
+                If True, flip the data along the x-axis (left-right). Default is False.
+            invert_y : bool, optional
+                If True, flip the data along the y-axis (up-down). Default is False.
+            rotate : int, optional
+                Rotate the data counterclockwise by this many degrees.
+                Valid values: 0, 90, 180, 270 (or -90, -180, -270). Default is 0.
+            """
+            self.data = None
+            self.metadata = None
+            self.filepath = filepath
+            self.pixel_size_um = pixel_size_um
+            
+            if filepath is not None:
+                self.load_data(filepath, energy_range=energy_range, 
+                             invert_x=invert_x, invert_y=invert_y, rotate=rotate)
     
-    def __init__(self, filepath=None, pixel_size_um=50.0, energy_range=None):
-        """
-        Initialize the LariatDataProcessor.
-        
-        Parameters:
-        -----------
-        filepath : str, optional
-            Path to the HDF5 file to load immediately
-        pixel_size_um : float, optional
-            Size of each pixel in micrometers. Default is 50.0 um
-        energy_range : tuple, optional
-            (min_energy, max_energy) to load only a subset of energies.
-            If None, loads all energies from the file.
-        """
-        self.data = None
-        self.metadata = None
-        self.filepath = filepath
-        self.pixel_size_um = pixel_size_um
-        
-        if filepath is not None:
-            self.load_data(filepath, energy_range=energy_range)
-        
     def set_pixel_size(self, pixel_size_um):
         """
         Set or update the pixel size in micrometers.
@@ -105,7 +113,7 @@ class LariatDataProcessor:
         extent = [0, width * self.pixel_size_um, 0, height * self.pixel_size_um]
         return extent
     
-    def load_data(self, filepath, energy_range=None):
+    def load_data(self, filepath, energy_range=None, invert_x=False, invert_y=False, rotate=0):
         """
         Load lariat datacube from HDF5 file.
         
@@ -116,11 +124,19 @@ class LariatDataProcessor:
         energy_range : tuple, optional
             (min_energy, max_energy) to load only a subset of energies.
             If None, loads all energies from the file.
+        invert_x : bool, optional
+            If True, flip the data along the x-axis (left-right). Default is False.
+        invert_y : bool, optional
+            If True, flip the data along the y-axis (up-down). Default is False.
+        rotate : int, optional
+            Rotate the data counterclockwise by this many degrees.
+            Valid values: 0, 90, 180, 270 (or -90, -180, -270). Default is 0.
         """
         self.filepath = filepath
-        self.data, self.metadata = self._read_lariat_datacube(filepath, energy_range=energy_range)
+        self.data, self.metadata = self._read_lariat_datacube(filepath, energy_range=energy_range,
+                                                              invert_x=invert_x, invert_y=invert_y, rotate=rotate)
     
-    def _read_lariat_datacube(self, filepath, energy_range=None):
+    def _read_lariat_datacube(self, filepath, energy_range=None, invert_x=False, invert_y=False, rotate=0):
         """
         Read lariat datacube from HDF5 file.
         
@@ -131,6 +147,13 @@ class LariatDataProcessor:
         energy_range : tuple, optional
             (min_energy, max_energy) to load only a subset of energies.
             If None, loads all energies from the file.
+        invert_x : bool, optional
+            If True, flip the data along the x-axis (left-right). Default is False.
+        invert_y : bool, optional
+            If True, flip the data along the y-axis (up-down). Default is False.
+        rotate : int, optional
+            Rotate the data counterclockwise by this many degrees.
+            Valid values: 0, 90, 180, 270 (or -90, -180, -270). Default is 0.
             
         Returns:
         --------
@@ -139,36 +162,91 @@ class LariatDataProcessor:
         metadata : dict
             Metadata from the file
         """
-        f = h5py.File(filepath)
-        metadata = json.loads(f['File Version'].attrs['Meta Data'])
-        all_energies = np.arange(*metadata['BeamEnergy'])
+        # Validate rotation value
+        valid_rotations = [0, 90, 180, 270, -90, -180, -270]
+        if rotate not in valid_rotations:
+            raise ValueError(f"rotate must be one of {valid_rotations}, got {rotate}")
         
-        # Apply energy range filter if specified
-        if energy_range is not None:
-            min_energy, max_energy = energy_range
-            energy_mask = (all_energies >= min_energy) & (all_energies <= max_energy)
-            energy_indices = np.where(energy_mask)[0]
-            energies = all_energies[energy_mask]
-            
-            if len(energies) == 0:
-                raise ValueError(f"No energies found in range {min_energy} - {max_energy} eV. "
-                            f"Available range: {all_energies.min():.2f} - {all_energies.max():.2f} eV")
-            
-            print(f"Loading {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
-            print(f"(Requested range: {min_energy:.2f} - {max_energy:.2f} eV)")
-        else:
-            energy_indices = np.arange(len(all_energies))
-            energies = all_energies
-            print(f"Loading all {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
+        with h5py.File(filepath, 'r') as f:
+            metadata = json.loads(f['File Version'].attrs['Meta Data'])
+            all_energies = np.arange(*metadata['BeamEnergy'])
+
+            # Build an explicit mapping from energy positions to actual HDF5 image keys.
+            # Some files may not have contiguous names (e.g., missing Image120), so
+            # indexing via f'Image{idx}' is not reliable.
+            image_group = f['Images']
+            image_keys = [k for k in image_group.keys() if k.startswith('Image')]
+            parsed_keys = []
+            for key in image_keys:
+                suffix = key[5:]
+                if suffix.isdigit():
+                    parsed_keys.append((int(suffix), key))
+
+            if not parsed_keys:
+                raise ValueError(f"No valid Image* groups found in {filepath}")
+
+            parsed_keys.sort(key=lambda x: x[0])
+            ordered_image_keys = [key for _, key in parsed_keys]
+            n_images = len(ordered_image_keys)
+
+            if len(all_energies) != n_images:
+                print(f"Warning: metadata has {len(all_energies)} energies but file has {n_images} image groups.")
+                print("Using the overlapping subset in acquisition order.")
+            n_common = min(len(all_energies), n_images)
+            all_energies = all_energies[:n_common]
+            ordered_image_keys = ordered_image_keys[:n_common]
         
-        image_list = []
-        energy_list = []
-        for idx in energy_indices:
-            image = f['Images'][f'Image{idx}']['ImagePlane0'][()]
-            image_list.append(image)
-            energy_list.append(energies[idx - energy_indices[0]])
+            # Apply energy range filter if specified
+            if energy_range is not None:
+                min_energy, max_energy = energy_range
+                energy_mask = (all_energies >= min_energy) & (all_energies <= max_energy)
+                selected_positions = np.where(energy_mask)[0]
+                energies = all_energies[energy_mask]
+
+                if len(energies) == 0:
+                    raise ValueError(f"No energies found in range {min_energy} - {max_energy} eV. "
+                                f"Available range: {all_energies.min():.2f} - {all_energies.max():.2f} eV")
+
+                print(f"Loading {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
+                print(f"(Requested range: {min_energy:.2f} - {max_energy:.2f} eV)")
+            else:
+                selected_positions = np.arange(len(all_energies))
+                energies = all_energies
+                print(f"Loading all {len(energies)} energy points from {energies[0]:.2f} to {energies[-1]:.2f} eV")
+
+            image_list = []
+            energy_list = []
+            for pos in selected_positions:
+                image_key = ordered_image_keys[pos]
+                image = image_group[image_key]['ImagePlane0'][()]
+
+                # Apply axis inversions if requested
+                if invert_y:
+                    image = np.flip(image, axis=0)  # Flip along y-axis (rows)
+                if invert_x:
+                    image = np.flip(image, axis=1)  # Flip along x-axis (columns)
+
+                # Apply rotation if requested
+                # np.rot90 rotates counterclockwise, k is number of 90-degree rotations
+                if rotate != 0:
+                    k = rotate // 90  # Convert degrees to number of 90-degree rotations
+                    image = np.rot90(image, k=k)
+
+                image_list.append(image)
+                energy_list.append(all_energies[pos])
         
-        f.close()
+        # Print information about transformations applied
+        transformations = []
+        if invert_x:
+            transformations.append("X-axis inversion (left-right)")
+        if invert_y:
+            transformations.append("Y-axis inversion (up-down)")
+        if rotate != 0:
+            transformations.append(f"{rotate}° rotation (counterclockwise)")
+        
+        if transformations:
+            print(f"Data loaded with transformation(s): {', '.join(transformations)}")
+        
         return xr.DataArray(image_list, dims=['energy','pix_y','pix_x'], coords={'energy':energy_list}), metadata
     
     def crop_image(self, crop_region=None, interactive=False, preview_energy=None, 
@@ -180,7 +258,7 @@ class LariatDataProcessor:
         Parameters:
         -----------
         crop_region : tuple, optional
-            (x_min, y_min, x_max, y_max) defining the crop region in pixel coordinates.
+            (x, y, width, height) defining the crop region in pixel coordinates.
             If None and interactive=False, will prompt for coordinates.
         interactive : bool, optional
             If True, display an image and allow interactive selection of crop region.
@@ -352,20 +430,26 @@ class LariatDataProcessor:
         # If no crop region specified and not interactive, prompt user
         elif crop_region is None:
             print(f"Current image size: {n_x} x {n_y} pixels")
-            print("Please specify crop region as (x_min, y_min, x_max, y_max)")
+            print("Please specify crop region as (x, y, width, height)")
             
             try:
-                x_min = int(input(f"Enter x_min (0 to {n_x-1}): "))
-                y_min = int(input(f"Enter y_min (0 to {n_y-1}): "))
-                x_max = int(input(f"Enter x_max ({x_min+1} to {n_x}): "))
-                y_max = int(input(f"Enter y_max ({y_min+1} to {n_y}): "))
-                crop_region = (x_min, y_min, x_max, y_max)
+                x = int(input(f"Enter x (0 to {n_x-1}): "))
+                y = int(input(f"Enter y (0 to {n_y-1}): "))
+                width = int(input(f"Enter width (1 to {n_x-x}): "))
+                height = int(input(f"Enter height (1 to {n_y-y}): "))
+                crop_region = (x, y, width, height)
             except (ValueError, KeyboardInterrupt):
                 print("Invalid input or operation cancelled.")
                 return None, None
         
-        # Validate crop region
-        x_min, y_min, x_max, y_max = crop_region
+        # Convert crop region from (x, y, width, height) to internal (x_min, y_min, x_max, y_max) format
+        if len(crop_region) == 4:
+            x, y, width, height = crop_region
+            x_min, y_min = x, y
+            x_max, y_max = x + width, y + height
+        else:
+            # Handle legacy format for backward compatibility
+            x_min, y_min, x_max, y_max = crop_region
         
         if not (0 <= x_min < x_max <= n_x and 0 <= y_min < y_max <= n_y):
             raise ValueError(f"Invalid crop region {crop_region}. Must be within image bounds "
@@ -391,7 +475,8 @@ class LariatDataProcessor:
         # Store crop information
         crop_info = {
             'original_shape': original_shape,
-            'crop_region': crop_region,
+            'crop_region': crop_region,  # Original input format
+            'crop_region_standardized': (x_min, y_min, crop_width, crop_height),  # Standardized (x, y, width, height)
             'cropped_shape': cropped_data.shape,
             'crop_size': (crop_width, crop_height),
             'pixels_removed': original_shape[1] * original_shape[2] - crop_width * crop_height,
@@ -636,7 +721,8 @@ class LariatDataProcessor:
         
         return fig, ax
     
-    def extract_roi_spectrum(self, roi, plot=False, energy_slice=None, use_um=True, roi_in_um=False):
+    def extract_roi_spectrum(self, roi, plot=False, energy_slice=None, use_um=True, roi_in_um=False,
+                             save_data=False, save_path=None, save_format='csv', spectrum_label=None):
         """
         Extract the average spectrum from a region of interest and optionally plot it.
         
@@ -653,6 +739,14 @@ class LariatDataProcessor:
             If True, display image coordinates in micrometers
         roi_in_um : bool, optional
             If True, roi is specified in micrometers. If False, in pixels.
+        save_data : bool, optional
+            If True, save the spectrum to files
+        save_path : str, optional
+            Directory path to save files. If None, saves to current directory
+        save_format : str, optional
+            Format to save data ('csv', 'txt', or 'npz'). Default is 'csv'
+        spectrum_label : str, optional
+            Label for the spectrum used in filenames. If None, uses 'spectrum'
             
         Returns:
         --------
@@ -756,6 +850,61 @@ class LariatDataProcessor:
             
             plt.tight_layout()
             plt.show()
+        
+        # Save data if requested
+        if save_data:
+            import os
+            
+            if save_path is None:
+                save_path = os.getcwd()
+            
+            # Create directory if it doesn't exist
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Use default label if none provided
+            if spectrum_label is None:
+                spectrum_label = 'spectrum'
+            
+            # Clean label for filename (remove spaces and special characters)
+            clean_label = "".join(c for c in spectrum_label if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            clean_label = clean_label.replace(' ', '_')
+            
+            if save_format.lower() == 'csv':
+                # Save spectrum
+                filename = f"{clean_label}.csv"
+                filepath = os.path.join(save_path, filename)
+                np.savetxt(filepath, spectrum_np, delimiter=',', 
+                        header='Energy,Intensity', comments='')
+                
+                # Save ROI info
+                info_filename = f"{clean_label}_info.txt"
+                info_filepath = os.path.join(save_path, info_filename)
+                with open(info_filepath, 'w') as f:
+                    f.write(f"Spectrum Information for {spectrum_label}\n")
+                    f.write(f"ROI: {roi}\n")
+                    if roi_in_um:
+                        f.write(f"ROI units: micrometers\n")
+                        f.write(f"ROI (pixels): {roi_pixels}\n")
+                    else:
+                        f.write(f"ROI units: pixels\n")
+            
+            elif save_format.lower() == 'txt':
+                # Save as space-delimited text file
+                filename = f"{clean_label}.txt"
+                filepath = os.path.join(save_path, filename)
+                np.savetxt(filepath, spectrum_np, delimiter=' ', 
+                        header='Energy Intensity')
+            
+            elif save_format.lower() == 'npz':
+                # Save as compressed numpy array
+                filename = f"{clean_label}.npz"
+                filepath = os.path.join(save_path, filename)
+                np.savez_compressed(filepath,
+                                spectrum=spectrum_np,
+                                roi=roi,
+                                roi_in_um=roi_in_um)
+            
+            print(f"Data saved to {save_path} in {save_format.upper()} format")
         
         return spectrum_xr, spectrum_np
     
@@ -1104,7 +1253,8 @@ class LariatDataProcessor:
     
     def extract_and_process_spectrum(self, roi, pre_edge_norm_range=None, pre_edge_sub_range=None, 
                                     post_edge_range=None, do_pre_edge_norm=True, do_pre_edge_sub=True,
-                                    do_post_edge_norm=True, plot=False, energy_slice=None):
+                                    do_post_edge_norm=True, plot=False, energy_slice=None, 
+                                    save_data=False, save_path=None, save_format='csv', spectrum_label=None):
         """
         Extract a spectrum from an ROI and apply processing steps in this order:
         1. Normalize by pre-edge slope
@@ -1134,6 +1284,14 @@ class LariatDataProcessor:
             If True, plot the extracted and processed spectra
         energy_slice : float, optional
             If provided, also shows the 2D image at this energy with the ROI
+        save_data : bool, optional
+            If True, save the processed spectrum to files
+        save_path : str, optional
+            Directory path to save files. If None, saves to current directory
+        save_format : str, optional
+            Format to save data ('csv', 'txt', or 'npz'). Default is 'csv'
+        spectrum_label : str, optional
+            Label for the spectrum used in filenames. If None, uses 'spectrum'
             
         Returns:
         --------
@@ -1346,6 +1504,76 @@ class LariatDataProcessor:
             
             plt.tight_layout()
             plt.show()
+        
+        # Save data if requested
+        if save_data:
+            import os
+            
+            if save_path is None:
+                save_path = os.getcwd()
+            
+            # Create directory if it doesn't exist
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Use default label if none provided
+            if spectrum_label is None:
+                spectrum_label = 'spectrum'
+            
+            # Clean label for filename (remove spaces and special characters)
+            clean_label = "".join(c for c in spectrum_label if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            clean_label = clean_label.replace(' ', '_')
+            
+            if save_format.lower() == 'csv':
+                # Save original spectrum
+                orig_filename = f"{clean_label}_original.csv"
+                orig_filepath = os.path.join(save_path, orig_filename)
+                np.savetxt(orig_filepath, spectrum_np, delimiter=',', 
+                        header='Energy,Intensity', comments='')
+                
+                # Save processed spectrum
+                proc_filename = f"{clean_label}_processed.csv"
+                proc_filepath = os.path.join(save_path, proc_filename)
+                np.savetxt(proc_filepath, spectrum_final, delimiter=',', 
+                        header='Energy,Processed_Intensity', comments='')
+                
+                # Save processing info
+                info_filename = f"{clean_label}_processing_info.txt"
+                info_filepath = os.path.join(save_path, info_filename)
+                with open(info_filepath, 'w') as f:
+                    f.write(f"Processing Information for {spectrum_label}\n")
+                    f.write(f"ROI: {roi}\n")
+                    f.write(f"Pre-edge normalization: {do_pre_edge_norm}\n")
+                    f.write(f"Pre-edge subtraction: {do_pre_edge_sub}\n")
+                    f.write(f"Post-edge normalization: {do_post_edge_norm}\n")
+                    f.write(f"Pre-edge norm range: {pre_edge_norm_range}\n")
+                    f.write(f"Pre-edge sub range: {pre_edge_sub_range}\n")
+                    f.write(f"Post-edge range: {post_edge_range}\n")
+                    for key, value in processing_info.items():
+                        f.write(f"{key}: {value}\n")
+            
+            elif save_format.lower() == 'txt':
+                # Save as space-delimited text files
+                orig_filename = f"{clean_label}_original.txt"
+                orig_filepath = os.path.join(save_path, orig_filename)
+                np.savetxt(orig_filepath, spectrum_np, delimiter=' ', 
+                        header='Energy Intensity')
+                
+                proc_filename = f"{clean_label}_processed.txt"
+                proc_filepath = os.path.join(save_path, proc_filename)
+                np.savetxt(proc_filepath, spectrum_final, delimiter=' ', 
+                        header='Energy Processed_Intensity')
+            
+            elif save_format.lower() == 'npz':
+                # Save as compressed numpy arrays
+                data_filename = f"{clean_label}_data.npz"
+                data_filepath = os.path.join(save_path, data_filename)
+                np.savez_compressed(data_filepath,
+                                original_spectrum=spectrum_np,
+                                processed_spectrum=spectrum_final,
+                                processing_info=processing_info,
+                                roi=roi)
+            
+            print(f"Data saved to {save_path} in {save_format.upper()} format")
         
         return spectrum_xr, spectrum_np, spectrum_final, processing_info
 
@@ -2190,7 +2418,11 @@ class LariatDataProcessor:
         if spectrum_np is None:
             if roi is not None:
                 print("Extracting spectrum from provided ROI...")
-                spectrum_xr, spectrum_np = self.extract_roi_spectrum(roi, plot=False)
+                # Use extract_processed_roi_spectra to ensure consistency
+                spectra_dict, roi_info = self.extract_processed_roi_spectra(
+                    [roi], roi_labels=['spectrum'], plot=False, verbose=False
+                )
+                spectrum_np = spectra_dict['spectrum']
             else:
                 print("No spectrum or ROI provided. Using average spectrum from entire image...")
                 # Create a spectrum from the entire image
@@ -2251,13 +2483,25 @@ class LariatDataProcessor:
         print(f"FPS: {actual_fps:.2f}, interval: {interval_ms:.1f} ms per frame")
         print(f"Animation energy range: {animation_energies[0]:.2f} to {animation_energies[-1]:.2f} eV")
         
+        # Calculate global dynamic range across all animation frames
+        print("Calculating global dynamic range across all frames...")
+        all_frame_values = []
+        for idx in animation_indices:
+            frame_data = data_to_use.isel(energy=idx).values
+            all_frame_values.append(frame_data.ravel())
+        all_frame_values = np.concatenate(all_frame_values)
+        
+        # Calculate global vmin/vmax using percentiles
+        global_vmin, global_vmax = np.nanpercentile(all_frame_values, contrast_percentiles)
+        print(f"Global dynamic range: {global_vmin:.4f} to {global_vmax:.4f}")
+        
         # Set up the figure with two subplots
         fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=(15, 5),
                                             gridspec_kw={'width_ratios': [1, 2]})
         
-        # Initialize the image plot with first animation frame
+        # Initialize the image plot with first animation frame using global range
         img_data = data_to_use.isel(energy=animation_indices[0])
-        img = ax_img.imshow(img_data, cmap='viridis', origin='lower')
+        img = ax_img.imshow(img_data, cmap='viridis', origin='lower', vmin=global_vmin, vmax=global_vmax)
         img_title = ax_img.set_title(f'Energy: {animation_energies[0]:.2f} eV')
         plt.colorbar(img, ax=ax_img, label='Intensity')
         ax_img.set_xlabel('Pixel X')
@@ -2314,9 +2558,8 @@ class LariatDataProcessor:
             img_data = data_to_use.isel(energy=energy_idx)
             img.set_array(img_data)
             
-            # Adjust contrast dynamically using percentiles
-            vmin, vmax = np.nanpercentile(img_data, contrast_percentiles)
-            img.set_clim(vmin, vmax)
+            # Keep the global dynamic range (no per-frame adjustment)
+            # The colorbar limits are already set to global_vmin and global_vmax
             
             # Update the image title
             img_title.set_text(f'Energy: {current_energy:.2f} eV')
@@ -2452,25 +2695,32 @@ class LariatDataProcessor:
             if len(roi_labels) != len(roi_list):
                 raise ValueError("Number of ROI labels must match number of ROIs")
             
-            # Convert roi_list format (x_min, y_min, width, height) to bounds format
-            for i, roi in enumerate(roi_list):
-                if len(roi) == 4:
-                    x_min, y_min, width, height = roi
-                    # Convert to bounds and store for display
-                    display_rois.append((x_min, y_min, x_min + width, y_min + height))
-                    
-                    # Extract spectrum from this ROI
-                    spectrum_xr, spectrum_np = self.extract_roi_spectrum(roi, plot=False)
-                    spectra_list.append(spectrum_np)
-                    display_labels.append(roi_labels[i])
-                    print(f"  {roi_labels[i]}: {width}x{height} pixels")
-                else:
-                    raise ValueError(f"ROI {i+1} must be (x_min, y_min, width, height)")
+            # Extract all spectra using the same method as extract_processed_roi_spectra
+            # This ensures identical results between animation and extract_processed_roi_spectra
+            spectra_dict, roi_info = self.extract_processed_roi_spectra(
+                roi_list, roi_labels=roi_labels, plot=False, verbose=False
+            )
+            
+            # Convert to lists for animation compatibility
+            for label in roi_labels:
+                spectrum_data = spectra_dict[label]
+                spectra_list.append(spectrum_data)
+                display_labels.append(label)
+                
+                # Convert ROI to bounds format for display
+                roi_bounds = roi_info[label]['roi_bounds']
+                x, y, width, height = roi_bounds
+                display_rois.append((x, y, x + width, y + height))
+                print(f"  {label}: {width}x{height} pixels")
                     
         elif roi is not None:
             # Single ROI (backward compatibility)
             print("Extracting spectrum from provided ROI...")
-            spectrum_xr, spectrum_np = self.extract_roi_spectrum(roi, plot=False)
+            # Use extract_processed_roi_spectra to ensure consistency
+            spectra_dict, roi_info = self.extract_processed_roi_spectra(
+                [roi], roi_labels=['ROI Spectrum'], plot=False, verbose=False
+            )
+            spectrum_np = spectra_dict['ROI Spectrum']
             spectra_list = [spectrum_np]
             display_labels = ['ROI Spectrum']
             
@@ -2547,9 +2797,21 @@ class LariatDataProcessor:
         fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=(15, 5),
                                             gridspec_kw={'width_ratios': [1, 2]})
         
-        # Initialize the image plot with first animation frame
+        # Calculate global dynamic range across all animation frames
+        print("Calculating global dynamic range across all frames...")
+        all_frame_values = []
+        for idx in animation_indices:
+            frame_data = data_to_use.isel(energy=idx).values
+            all_frame_values.append(frame_data.ravel())
+        all_frame_values = np.concatenate(all_frame_values)
+        
+        # Calculate global vmin/vmax using percentiles
+        global_vmin, global_vmax = np.nanpercentile(all_frame_values, contrast_percentiles)
+        print(f"Global dynamic range: {global_vmin:.4f} to {global_vmax:.4f}")
+        
+        # Initialize the image plot with first animation frame using global range
         img_data = data_to_use.isel(energy=animation_indices[0])
-        img = ax_img.imshow(img_data, cmap='viridis', origin='lower')
+        img = ax_img.imshow(img_data, cmap='viridis', origin='lower', vmin=global_vmin, vmax=global_vmax)
         img_title = ax_img.set_title(f'Energy: {animation_energies[0]:.2f} eV')
         plt.colorbar(img, ax=ax_img, label='Intensity')
         ax_img.set_xlabel('Pixel X')
@@ -2630,9 +2892,8 @@ class LariatDataProcessor:
             img_data = data_to_use.isel(energy=energy_idx)
             img.set_array(img_data)
             
-            # Adjust contrast dynamically using percentiles
-            vmin, vmax = np.nanpercentile(img_data, contrast_percentiles)
-            img.set_clim(vmin, vmax)
+            # Keep the global dynamic range (no per-frame adjustment)
+            # The colorbar limits are already set to global_vmin and global_vmax
             
             # Update the image title
             img_title.set_text(f'Energy: {current_energy:.2f} eV')
@@ -3686,6 +3947,14 @@ class LariatDataProcessor:
         pre_values = np.full((n_y, n_x), np.nan)
         post_values = np.full((n_y, n_x), np.nan)
         
+        # Arrays for storing intermediate results when plotting is requested
+        intermediate_step1 = None  # After pre-edge slope normalization
+        intermediate_step2 = None  # After pre-edge background subtraction
+        
+        if plot_pixel_spectrum:
+            intermediate_step1 = np.full_like(working_data.values, np.nan)
+            intermediate_step2 = np.full_like(working_data.values, np.nan)
+        
         # Find valid pixels (non-zero, sufficient intensity)
         max_intensities = np.max(working_data.values, axis=0)
         valid_pixels = max_intensities > 1e-10
@@ -3739,6 +4008,10 @@ class LariatDataProcessor:
                         line_values = chunk_slopes[:, None] * energies[None, :] + chunk_intercepts[:, None]
                         line_values = np.maximum(line_values, 1e-10)  # Avoid division by zero
                         chunk_spectra = chunk_spectra / line_values
+                        
+                        # Store intermediate result after step 1 if plotting is requested
+                        if plot_pixel_spectrum:
+                            intermediate_step1[:, chunk_y, chunk_x] = chunk_spectra.T
                 
                 # Step 2: Pre-edge subtraction
                 if do_pre_edge_sub:
@@ -3746,6 +4019,10 @@ class LariatDataProcessor:
                     chunk_pre_values = np.mean(sub_spectra, axis=1)
                     pre_values[chunk_y, chunk_x] = chunk_pre_values
                     chunk_spectra = chunk_spectra - chunk_pre_values[:, None]
+                    
+                    # Store intermediate result after step 2 if plotting is requested
+                    if plot_pixel_spectrum:
+                        intermediate_step2[:, chunk_y, chunk_x] = chunk_spectra.T
                 
                 # Step 3: Post-edge normalization
                 if do_post_edge_norm:
@@ -3782,6 +4059,11 @@ class LariatDataProcessor:
             'post_edge_values': post_values,
             'valid_pixels': valid_pixels
         }
+        
+        # Add intermediate results if they were stored
+        if plot_pixel_spectrum:
+            processing_stats['intermediate_step1'] = intermediate_step1
+            processing_stats['intermediate_step2'] = intermediate_step2
         
         processing_info = {
             'pre_edge_norm_range': pre_edge_norm_range,
@@ -3889,57 +4171,95 @@ class LariatDataProcessor:
                     print(f"Warning: Pixel location ({x_pixel}, {y_pixel}) is outside processed image bounds. Using center pixel.")
                     x_pixel, y_pixel = (processed_data.shape[2] // 2, processed_data.shape[1] // 2)
                 
-                # Extract original and processed spectra for this pixel
+                # Always use pixel-level data from original unbinned data for plotting
+                # Map binned coordinates back to original coordinates
                 if bin_x > 1 or bin_y > 1:
-                    # For binned data, we need to map back to original coordinates
                     orig_x = x_pixel * bin_x + bin_x // 2
                     orig_y = y_pixel * bin_y + bin_y // 2
                     # Make sure we're within bounds of original data
                     orig_x = min(orig_x, self.data.shape[2] - 1)
                     orig_y = min(orig_y, self.data.shape[1] - 1)
                     orig_spectrum = self.data[:, orig_y, orig_x].values
+                    location_str = f"Pixel ({x_pixel}, {y_pixel}) [binned {bin_x}x{bin_y}] -> Original Pixel ({orig_x}, {orig_y})"
                 else:
-                    orig_spectrum = working_data[:, y_pixel, x_pixel].values
-                    
+                    orig_spectrum = self.data[:, y_pixel, x_pixel].values
+                    location_str = f"Pixel ({x_pixel}, {y_pixel})"
+                
+                # Get processed spectrum from the binned data
                 proc_spectrum = processed_data[:, y_pixel, x_pixel].values
-                location_str = f"Pixel ({x_pixel}, {y_pixel})"
+                
+                # Get intermediate results if they were stored
+                step1_spectrum = None
+                step2_spectrum = None
+                if 'intermediate_step1' in processing_stats:
+                    step1_spectrum = processing_stats['intermediate_step1'][:, y_pixel, x_pixel]
+                if 'intermediate_step2' in processing_stats:
+                    step2_spectrum = processing_stats['intermediate_step2'][:, y_pixel, x_pixel]
                 
             elif len(pixel_location) == 4:
-                # ROI format: (x1, y1, x2, y2)
-                x1, y1, x2, y2 = pixel_location
+                # ROI format: (x, y, width, height)
+                x, y, width, height = pixel_location
                 is_roi = True
                 
-                # Validate ROI bounds
-                x1, x2 = max(0, min(x1, x2)), min(processed_data.shape[2], max(x1, x2))
-                y1, y2 = max(0, min(y1, y2)), min(processed_data.shape[1], max(y1, y2))
+                # Calculate corner coordinates for validation
+                x2 = x + width
+                y2 = y + height
                 
-                if x2 <= x1 or y2 <= y1:
-                    print(f"Warning: Invalid ROI ({x1}, {y1}, {x2}, {y2}). Using center pixel.")
+                # Validate ROI bounds
+                x = max(0, min(x, processed_data.shape[2]))
+                y = max(0, min(y, processed_data.shape[1]))
+                x2 = min(processed_data.shape[2], x2)
+                y2 = min(processed_data.shape[1], y2)
+                
+                # Recalculate width and height after bounds checking
+                width = x2 - x
+                height = y2 - y
+                
+                if width <= 0 or height <= 0:
+                    print(f"Warning: Invalid ROI ({x}, {y}, {width}, {height}). Using center pixel.")
                     x_pixel, y_pixel = (processed_data.shape[2] // 2, processed_data.shape[1] // 2)
-                    orig_spectrum = working_data[:, y_pixel, x_pixel].values
+                    orig_spectrum = self.data[:, y_pixel, x_pixel].values
                     proc_spectrum = processed_data[:, y_pixel, x_pixel].values
                     location_str = f"Pixel ({x_pixel}, {y_pixel})"
                     is_roi = False
-                else:
-                    # Extract ROI from original data
-                    if bin_x > 1 or bin_y > 1:
-                        # Map ROI back to original coordinates
-                        orig_x1, orig_y1 = x1 * bin_x, y1 * bin_y
-                        orig_x2, orig_y2 = x2 * bin_x, y2 * bin_y
-                        orig_x2 = min(orig_x2, self.data.shape[2])
-                        orig_y2 = min(orig_y2, self.data.shape[1])
-                        orig_roi_data = self.data[:, orig_y1:orig_y2, orig_x1:orig_x2]
-                        orig_spectrum = orig_roi_data.mean(dim=['pix_x', 'pix_y']).values
-                    else:
-                        orig_roi_data = working_data[:, y1:y2, x1:x2]
-                        orig_spectrum = orig_roi_data.mean(dim=['pix_x', 'pix_y']).values
                     
-                    # Extract ROI from processed data
-                    proc_roi_data = processed_data[:, y1:y2, x1:x2]
-                    proc_spectrum = proc_roi_data.mean(dim=['pix_x', 'pix_y']).values
-                    location_str = f"ROI ({x1}, {y1}, {x2}, {y2})"
+                    # Get intermediate results for single pixel
+                    step1_spectrum = None
+                    step2_spectrum = None
+                    if 'intermediate_step1' in processing_stats:
+                        step1_spectrum = processing_stats['intermediate_step1'][:, y_pixel, x_pixel]
+                    if 'intermediate_step2' in processing_stats:
+                        step2_spectrum = processing_stats['intermediate_step2'][:, y_pixel, x_pixel]
+                else:
+                    # For ROI, we'll use the center pixel of the ROI for detailed processing visualization
+                    # but still show ROI information
+                    center_x = x + width // 2
+                    center_y = y + height // 2
+                    
+                    # Map to original coordinates
+                    if bin_x > 1 or bin_y > 1:
+                        orig_center_x = center_x * bin_x + bin_x // 2
+                        orig_center_y = center_y * bin_y + bin_y // 2
+                        orig_center_x = min(orig_center_x, self.data.shape[2] - 1)
+                        orig_center_y = min(orig_center_y, self.data.shape[1] - 1)
+                        orig_spectrum = self.data[:, orig_center_y, orig_center_x].values
+                    else:
+                        orig_spectrum = self.data[:, center_y, center_x].values
+                    
+                    # Get processed spectrum from center pixel of ROI
+                    proc_spectrum = processed_data[:, center_y, center_x].values
+                    
+                    # Get intermediate results for center pixel
+                    step1_spectrum = None
+                    step2_spectrum = None
+                    if 'intermediate_step1' in processing_stats:
+                        step1_spectrum = processing_stats['intermediate_step1'][:, center_y, center_x]
+                    if 'intermediate_step2' in processing_stats:
+                        step2_spectrum = processing_stats['intermediate_step2'][:, center_y, center_x]
+                    
+                    location_str = f"ROI ({x}, {y}, {width}, {height}) -> Center Pixel ({center_x}, {center_y})"
             else:
-                raise ValueError("pixel_location must be (x, y) for single pixel or (x1, y1, x2, y2) for ROI")
+                raise ValueError("pixel_location must be (x, y) for single pixel or (x, y, width, height) for ROI")
             
             # Create multi-step processing visualization similar to the attached format
             fig, axes = plt.subplots(1, 4, figsize=(20, 5))
@@ -3960,7 +4280,7 @@ class LariatDataProcessor:
                         label='Post-edge Norm Region')
             
             # Add slope line if pre-edge normalization was applied
-            if do_pre_edge_norm and is_roi == False and valid_pixels[y_pixel, x_pixel]:  # Only for single pixels
+            if do_pre_edge_norm and not is_roi and valid_pixels[y_pixel, x_pixel]:  # Only for single pixels
                 slope_val = slopes[y_pixel, x_pixel]
                 intercept_val = intercepts[y_pixel, x_pixel]
                 if not np.isnan(slope_val):
@@ -3969,8 +4289,6 @@ class LariatDataProcessor:
                         label=f'Pre-edge Slope: {slope_val:.2e}')
             
             title = f'Original Spectrum from {location_str}'
-            if bin_x > 1 or bin_y > 1:
-                title += f'\n[binned {bin_x}x{bin_y}]'
             ax.set_title(title)
             ax.set_xlabel('Energy (eV)')
             ax.set_ylabel('Intensity')
@@ -3981,14 +4299,13 @@ class LariatDataProcessor:
             if do_pre_edge_norm:
                 ax = axes[1]
                 
-                # Calculate what the spectrum looks like after just pre-edge normalization
-                if is_roi:
-                    # For ROI, we need to recalculate since we don't store intermediate steps
-                    temp_spectrum = orig_spectrum.copy()
-                    # This is approximate - we'd need to store intermediate results for exact reproduction
+                # Use stored intermediate result if available
+                if step1_spectrum is not None:
+                    temp_spectrum = step1_spectrum
                 else:
-                    # For single pixel, use stored slope/intercept
-                    if valid_pixels[y_pixel, x_pixel] and not np.isnan(slopes[y_pixel, x_pixel]):
+                    # Fallback: reconstruct using stored slope/intercept for the binned pixel
+                    # Note: This won't be exactly the same as the original pixel due to binning
+                    if not is_roi and valid_pixels[y_pixel, x_pixel] and not np.isnan(slopes[y_pixel, x_pixel]):
                         slope_val = slopes[y_pixel, x_pixel]
                         intercept_val = intercepts[y_pixel, x_pixel]
                         line_values = slope_val * energies + intercept_val
@@ -4022,28 +4339,33 @@ class LariatDataProcessor:
             if do_pre_edge_sub:
                 ax = axes[next_ax_idx]
                 
-                # Calculate spectrum after normalization and subtraction
-                if do_pre_edge_norm and not is_roi and valid_pixels[y_pixel, x_pixel]:
-                    slope_val = slopes[y_pixel, x_pixel]
-                    intercept_val = intercepts[y_pixel, x_pixel]
-                    if not np.isnan(slope_val):
-                        line_values = slope_val * energies + intercept_val
-                        temp_spectrum = orig_spectrum / np.maximum(line_values, 1e-10)
+                # Use stored intermediate result if available
+                if step2_spectrum is not None:
+                    temp_spectrum = step2_spectrum
+                else:
+                    # Fallback: reconstruct step by step
+                    # First apply pre-edge normalization if it was done
+                    if do_pre_edge_norm and not is_roi and valid_pixels[y_pixel, x_pixel]:
+                        slope_val = slopes[y_pixel, x_pixel]
+                        intercept_val = intercepts[y_pixel, x_pixel]
+                        if not np.isnan(slope_val):
+                            line_values = slope_val * energies + intercept_val
+                            temp_spectrum = orig_spectrum / np.maximum(line_values, 1e-10)
+                        else:
+                            temp_spectrum = orig_spectrum.copy()
                     else:
                         temp_spectrum = orig_spectrum.copy()
-                else:
-                    temp_spectrum = orig_spectrum.copy()
-                
-                # Apply pre-edge subtraction
-                if not is_roi and valid_pixels[y_pixel, x_pixel]:
-                    pre_val = pre_values[y_pixel, x_pixel]
-                    if not np.isnan(pre_val):
+                    
+                    # Then apply pre-edge subtraction
+                    if not is_roi and valid_pixels[y_pixel, x_pixel]:
+                        pre_val = pre_values[y_pixel, x_pixel]
+                        if not np.isnan(pre_val):
+                            temp_spectrum = temp_spectrum - pre_val
+                    else:
+                        # For ROI, calculate approximate pre-edge value
+                        sub_mask_local = (energies >= pre_edge_sub_range[0]) & (energies <= pre_edge_sub_range[1])
+                        pre_val = np.mean(temp_spectrum[sub_mask_local])
                         temp_spectrum = temp_spectrum - pre_val
-                else:
-                    # For ROI, calculate approximate pre-edge value
-                    sub_mask_local = (energies >= pre_edge_sub_range[0]) & (energies <= pre_edge_sub_range[1])
-                    pre_val = np.mean(temp_spectrum[sub_mask_local])
-                    temp_spectrum = temp_spectrum - pre_val
                 
                 ax.plot(energies, temp_spectrum, 'o-', color='blue', markersize=3, linewidth=2)
                 ax.axhline(y=0, color='red', linestyle='--', alpha=0.7, label='Pre-edge Level (0)')
@@ -4183,7 +4505,7 @@ class LariatDataProcessor:
                                   save_spectra=False, save_path=None, save_name='processed_roi_spectra',
                                   plot_style='individual', figsize=None, energy_range=None,
                                   normalize_for_display=False, show_image=True, image_energy=None,
-                                  image_contrast_percentiles=(2, 98)):
+                                  image_contrast_percentiles=(2, 98), verbose=False):
         """
         Extract and plot spectra from one or more ROIs using already processed data.
         This function does NOT perform any spectral processing - it works on data that
@@ -4192,7 +4514,7 @@ class LariatDataProcessor:
         Parameters:
         -----------
         roi_list : list of tuples or single tuple
-            ROI(s) to extract spectra from. Each ROI as (x_min, y_min, x_max, y_max).
+            ROI(s) to extract spectra from. Each ROI as (x, y, width, height).
             Can also be a single tuple for one ROI.
         roi_labels : list of str, optional
             Labels for each ROI. If None, will use "ROI 1", "ROI 2", etc.
@@ -4219,6 +4541,8 @@ class LariatDataProcessor:
             Energy value to use for the ROI location image. If None, uses middle energy.
         image_contrast_percentiles : tuple, optional
             (low, high) percentiles for image contrast. Default is (2, 98).
+        verbose : bool, optional
+            If True, print progress and diagnostic information. Default is False.
             
         Returns:
         --------
@@ -4242,7 +4566,7 @@ class LariatDataProcessor:
         # Validate ROI list
         for i, roi in enumerate(roi_list):
             if len(roi) != 4:
-                raise ValueError(f"ROI {i+1} must be (x_min, y_min, x_max, y_max)")
+                raise ValueError(f"ROI {i+1} must be (x, y, width, height)")
         
         # Set default labels
         if roi_labels is None:
@@ -4255,28 +4579,36 @@ class LariatDataProcessor:
         energies = self.data.energy.values
         n_energies, n_y, n_x = self.data.shape
         
-        print(f"Extracting spectra from {len(roi_list)} ROI(s) from processed data")
-        print(f"Data shape: {n_x} x {n_y} pixels, {n_energies} energies")
+        if verbose:
+            print(f"Extracting spectra from {len(roi_list)} ROI(s) from processed data")
+            print(f"Data shape: {n_x} x {n_y} pixels, {n_energies} energies")
         
         # Check if data appears to be processed
         is_processed = self.data.attrs.get('pixel_by_pixel_processing', False)
-        if is_processed:
-            print("Data appears to be pixel-by-pixel processed")
-        else:
-            print("Warning: Data may not be processed. This function is designed for processed data.")
+        if verbose:
+            if is_processed:
+                print("Data appears to be pixel-by-pixel processed")
+            else:
+                print("Warning: Data may not be processed. This function is designed for processed data.")
         
         # Extract spectra for each ROI
         spectra_dict = {}
         roi_info = {}
         
         for roi, label in zip(roi_list, roi_labels):
-            x_min, y_min, x_max, y_max = roi
+            x, y, width, height = roi
+            
+            # Calculate corner coordinates
+            x_min, y_min = x, y
+            x_max = x + width
+            y_max = y + height
             
             # Validate ROI bounds
             if (x_min < 0 or y_min < 0 or x_max > n_x or y_max > n_y or 
-                x_min >= x_max or y_min >= y_max):
-                print(f"Warning: ROI {label} ({x_min}, {y_min}, {x_max}, {y_max}) is outside bounds or invalid")
-                print(f"Image bounds: (0, 0, {n_x}, {n_y})")
+                width <= 0 or height <= 0):
+                if verbose:
+                    print(f"Warning: ROI {label} ({x}, {y}, {width}, {height}) is outside bounds or invalid")
+                    print(f"Image bounds: (0, 0, {n_x}, {n_y})")
                 continue
             
             # Extract ROI data
@@ -4305,8 +4637,8 @@ class LariatDataProcessor:
             # Calculate ROI statistics
             roi_stats = {
                 'roi_bounds': roi,
-                'roi_size': ((x_max - x_min), (y_max - y_min)),
-                'n_pixels': (x_max - x_min) * (y_max - y_min),
+                'roi_size': (width, height),
+                'n_pixels': width * height,
                 'intensity_mean': float(np.mean(spectrum_array[:, 1])),
                 'intensity_std': float(np.std(spectrum_array[:, 1])),
                 'intensity_min': float(np.min(spectrum_array[:, 1])),
@@ -4317,8 +4649,9 @@ class LariatDataProcessor:
             }
             roi_info[label] = roi_stats
             
-            print(f"  {label}: {roi_stats['roi_size'][0]}x{roi_stats['roi_size'][1]} pixels, "
-                f"intensity range: {roi_stats['intensity_min']:.3f} - {roi_stats['intensity_max']:.3f}")
+            if verbose:
+                print(f"  {label}: {roi_stats['roi_size'][0]}x{roi_stats['roi_size'][1]} pixels, "
+                    f"intensity range: {roi_stats['intensity_min']:.3f} - {roi_stats['intensity_max']:.3f}")
         
         if not spectra_dict:
             raise ValueError("No valid ROIs found")
@@ -4370,17 +4703,15 @@ class LariatDataProcessor:
                     # Add ROI rectangles with different colors
                     colors = plt.cm.tab10(np.linspace(0, 1, len(roi_list)))
                     for i, (roi, label) in enumerate(zip(roi_list, roi_labels)):
-                        x_min, y_min, x_max, y_max = roi
-                        width = x_max - x_min
-                        height = y_max - y_min
+                        x, y, width, height = roi
                         
                         from matplotlib.patches import Rectangle
-                        rect = Rectangle((x_min, y_min), width, height, 
+                        rect = Rectangle((x, y), width, height, 
                                     edgecolor=colors[i], facecolor='none', linewidth=2)
                         ax_img.add_patch(rect)
                         
                         # Add label
-                        ax_img.text(x_min + width/2, y_min + height + 2, label, 
+                        ax_img.text(x + width/2, y + height + 2, label, 
                                 color=colors[i], fontweight='bold', ha='center',
                                 bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
                     
@@ -4464,17 +4795,15 @@ class LariatDataProcessor:
                     # Add ROI rectangles
                     colors = plt.cm.tab10(np.linspace(0, 1, len(roi_list)))
                     for i, (roi, label) in enumerate(zip(roi_list, roi_labels)):
-                        x_min, y_min, x_max, y_max = roi
-                        width = x_max - x_min
-                        height = y_max - y_min
+                        x, y, width, height = roi
                         
                         from matplotlib.patches import Rectangle
-                        rect = Rectangle((x_min, y_min), width, height, 
+                        rect = Rectangle((x, y), width, height, 
                                     edgecolor=colors[i], facecolor='none', linewidth=2)
                         ax_img.add_patch(rect)
                         
                         # Add label
-                        ax_img.text(x_min + width/2, y_min + height + 2, label, 
+                        ax_img.text(x + width/2, y + height + 2, label, 
                                 color=colors[i], fontweight='bold', ha='center',
                                 bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
                     
@@ -4606,13 +4935,14 @@ class LariatDataProcessor:
                     f.write(f"  Energy points: {stats['n_energy_points']}\n")
                     f.write("\n")
             
-            print(f"Spectra saved to {save_path}")
-            print(f"ROI information saved to {info_filepath}")
+            if verbose:
+                print(f"Spectra saved to {save_path}")
+                print(f"ROI information saved to {info_filepath}")
         
         return spectra_dict, roi_info
-    
+
     def perform_pca_analysis(self, n_components=10, plot=True, save_results=False, 
-                        save_path=None, save_name='pca_analysis'):
+                    save_path=None, save_name='pca_analysis'):
         """
         Perform Principal Component Analysis (PCA) on the datacube.
         Each pixel's spectrum is treated as a sample, and energies are features.
@@ -4899,7 +5229,622 @@ class LariatDataProcessor:
             print(f"  Info: {info_filename}")
         
         return pca_dataset, pca_info
-    
+
+
+    def extract_rois_from_pca(self, pca_dataset, n_components_to_use=3, n_clusters=5,
+                             min_roi_pixels=100, enforce_spatial_locality=False,
+                             min_component_pixels=50, plot=True, random_state=42):
+        """
+        Extract ROIs from PCA results using k-means clustering on PCA component weights.
+        
+        This function performs k-means clustering on the PCA component weights (scores) to identify
+        spatially distinct regions. This approach is much faster than clustering on full spectra
+        while capturing the main variance patterns.
+        
+        Parameters:
+        -----------
+        pca_dataset : xarray.Dataset
+            Output from perform_pca_analysis() containing PCA weights and components
+        n_components_to_use : int, optional
+            Number of PCA components to use as features for clustering. Default is 3.
+        n_clusters : int, optional
+            Number of clusters for k-means. Default is 5.
+        min_roi_pixels : int, optional
+            Minimum number of pixels required for a valid ROI. Default is 100.
+        enforce_spatial_locality : bool, optional
+            If True, split non-contiguous clusters into separate ROIs. Default is False.
+        min_component_pixels : int, optional
+            Minimum pixels per connected component when enforcing spatial locality. Default is 50.
+        plot : bool, optional
+            If True, create visualization of PCA weights and segmentation. Default is True.
+        random_state : int, optional
+            Random seed for reproducible results. Default is 42.
+            
+        Returns:
+        --------
+        roi_list : list
+            List of ROI tuples (x_min, y_min, width, height)
+        roi_labels : list
+            List of ROI labels
+        cluster_info : dict
+            Dictionary containing clustering information and statistics
+        """
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+        
+        print(f"Extracting ROIs from PCA results using {n_components_to_use} components and {n_clusters} clusters...")
+        
+        # Get PCA weights (scores) for specified components
+        weights_data = pca_dataset['weights'].values  # Shape: (n_components, pix_y, pix_x)
+        n_total_components = weights_data.shape[0]
+        
+        # Validate n_components_to_use
+        if n_components_to_use > n_total_components:
+            print(f"Warning: Requested {n_components_to_use} components but only {n_total_components} available")
+            n_components_to_use = n_total_components
+        
+        print(f"Using PCA components 1-{n_components_to_use} out of {n_total_components} total components")
+        
+        # Extract weights for selected components
+        weights_subset = weights_data[:n_components_to_use]  # Shape: (n_use, pix_y, pix_x)
+        
+        # Reshape to (n_pixels, n_components)
+        n_y, n_x = weights_subset.shape[1], weights_subset.shape[2]
+        pixel_features = weights_subset.reshape(n_components_to_use, -1).T  # (n_pixels, n_components)
+        
+        # Create coordinate arrays
+        y_coords, x_coords = np.meshgrid(np.arange(n_y), np.arange(n_x), indexing='ij')
+        y_flat = y_coords.ravel()
+        x_flat = x_coords.ravel()
+        
+        # Remove NaN pixels
+        valid_pixels = ~np.isnan(pixel_features).any(axis=1)
+        pixel_features_clean = pixel_features[valid_pixels]
+        x_coords_clean = x_flat[valid_pixels]
+        y_coords_clean = y_flat[valid_pixels]
+        
+        print(f"Clustering {len(pixel_features_clean)} valid pixels using {n_components_to_use} PCA components")
+        
+        # Standardize features (important for PCA weights with different scales)
+        scaler = StandardScaler()
+        pixel_features_scaled = scaler.fit_transform(pixel_features_clean)
+        
+        # K-means clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+        cluster_labels = kmeans.fit_predict(pixel_features_scaled)
+        
+        # Create segmentation map
+        segmentation_map = np.full((n_y, n_x), -1, dtype=int)
+        for i, (x, y, label) in enumerate(zip(x_coords_clean, y_coords_clean, cluster_labels)):
+            segmentation_map[y, x] = label
+        
+        # Apply spatial locality enforcement if requested
+        n_clusters_original = n_clusters
+        if enforce_spatial_locality:
+            from scipy.ndimage import label as connected_components
+            print(f"\nEnforcing spatial locality (splitting non-contiguous clusters)...")
+            
+            # Process each cluster to find connected components
+            new_cluster_id = n_clusters  # Start new IDs after original clusters
+            updated_segmentation = segmentation_map.copy()
+            
+            for cluster_id in range(n_clusters):
+                # Create binary mask for this cluster
+                cluster_mask = (segmentation_map == cluster_id)
+                
+                # Find connected components
+                labeled_components, num_components = connected_components(cluster_mask)
+                
+                if num_components > 1:
+                    print(f"  Cluster {cluster_id}: Found {num_components} connected components")
+                    
+                    # Process each connected component
+                    for comp_id in range(1, num_components + 1):  # Skip background (0)
+                        component_mask = (labeled_components == comp_id)
+                        component_size = np.sum(component_mask)
+                        
+                        if component_size >= min_component_pixels:
+                            # Keep as separate cluster
+                            if comp_id == 1:
+                                # Keep original cluster ID for largest component
+                                updated_segmentation[component_mask] = cluster_id
+                            else:
+                                # Assign new cluster ID for additional components
+                                updated_segmentation[component_mask] = new_cluster_id
+                                new_cluster_id += 1
+                        else:
+                            # Remove small components (set to -1)
+                            updated_segmentation[component_mask] = -1
+                            print(f"    Removed small component {comp_id} ({component_size} pixels)")
+            
+            segmentation_map = updated_segmentation
+            n_clusters_actual = new_cluster_id
+            print(f"Spatial splitting complete: {n_clusters_original} → {n_clusters_actual} clusters")
+        else:
+            n_clusters_actual = n_clusters
+        
+        # Create ROI bounding boxes
+        roi_list = []
+        roi_labels = []
+        
+        # Get unique cluster IDs (excluding -1 for invalid pixels)
+        unique_clusters = np.unique(segmentation_map)
+        unique_clusters = unique_clusters[unique_clusters >= 0]
+        
+        for cluster_id in unique_clusters:
+            # Create mask for this cluster
+            cluster_mask = (segmentation_map == cluster_id)
+            
+            # Find bounding box
+            rows, cols = np.where(cluster_mask)
+            if len(rows) == 0:
+                continue
+                
+            y_min, y_max = np.min(rows), np.max(rows)
+            x_min, x_max = np.min(cols), np.max(cols)
+            
+            # Calculate dimensions
+            width = x_max - x_min + 1
+            height = y_max - y_min + 1
+            area = width * height
+            
+            # Check minimum size requirement
+            if area >= min_roi_pixels:
+                roi_list.append((x_min, y_min, width, height))
+                roi_labels.append(f'PCA_ROI_{cluster_id}')
+            else:
+                print(f"  Removed small ROI {cluster_id}: {area} pixels (< {min_roi_pixels})")
+        
+        print(f"\nROI Detection Complete:")
+        print(f"  {len(roi_list)} ROIs detected from {n_clusters_actual} clusters")
+        print(f"  Components used: {n_components_to_use}")
+        print(f"  Spatial locality: {'enforced' if enforce_spatial_locality else 'not enforced'}")
+        
+        # Create cluster info dictionary
+        cluster_info = {
+            'n_components_used': n_components_to_use,
+            'n_clusters': n_clusters_original,
+            'n_clusters_original': n_clusters_original,
+            'n_clusters_final': n_clusters_actual,
+            'n_rois_detected': len(roi_list),
+            'min_roi_pixels': min_roi_pixels,
+            'enforce_spatial_locality': enforce_spatial_locality,
+            'min_component_pixels': min_component_pixels if enforce_spatial_locality else None,
+            'clustering_method': 'pca_weights',
+            'random_state': random_state,
+            'roi_list': roi_list,
+            'roi_labels': roi_labels
+        }
+        
+        # Add explained variance information if available
+        if 'explained_variance_ratio' in pca_dataset.attrs:
+            total_variance = np.sum(pca_dataset.attrs['explained_variance_ratio'][:n_components_to_use])
+            cluster_info['explained_variance_used'] = float(total_variance)
+            print(f"  Explained variance captured: {total_variance:.1%}")
+        
+        # Visualization
+        if plot:
+            # Create figure with PCA components and segmentation
+            n_cols = n_components_to_use + 1  # +1 for segmentation map
+            fig, axes = plt.subplots(2, n_cols, figsize=(4*n_cols, 8))
+            
+            if n_cols == 1:
+                axes = axes.reshape(2, 1)
+            
+            # Plot PCA component weights
+            for i in range(n_components_to_use):
+                # Top row: PCA components
+                im = axes[0, i].imshow(weights_subset[i], cmap='RdBu_r', origin='lower')
+                axes[0, i].set_title(f'PC{i+1} Weights')
+                axes[0, i].set_xlabel('X (pixels)')
+                axes[0, i].set_ylabel('Y (pixels)')
+                plt.colorbar(im, ax=axes[0, i], shrink=0.8)
+            
+            # Plot segmentation map
+            im_seg = axes[0, n_components_to_use].imshow(segmentation_map, cmap='tab10', origin='lower')
+            axes[0, n_components_to_use].set_title(f'K-Means Segmentation\n({n_clusters_actual} clusters)')
+            axes[0, n_components_to_use].set_xlabel('X (pixels)')
+            axes[0, n_components_to_use].set_ylabel('Y (pixels)')
+            plt.colorbar(im_seg, ax=axes[0, n_components_to_use], shrink=0.8)
+            
+            # Bottom row: Show ROI overlays on segmentation
+            for i in range(n_cols):
+                axes[1, i].imshow(segmentation_map, cmap='tab10', origin='lower', alpha=0.7)
+                
+                # Overlay ROI bounding boxes
+                for j, (x_min, y_min, width, height) in enumerate(roi_list):
+                    rect = plt.Rectangle((x_min, y_min), width, height, 
+                                       linewidth=2, edgecolor='red', facecolor='none')
+                    axes[1, i].add_patch(rect)
+                    axes[1, i].text(x_min + width/2, y_min + height/2, f'{j+1}', 
+                                  ha='center', va='center', color='red', fontweight='bold')
+                
+                axes[1, i].set_xlabel('X (pixels)')
+                axes[1, i].set_ylabel('Y (pixels)')
+                
+                if i < n_components_to_use:
+                    axes[1, i].set_title(f'PC{i+1} + ROIs')
+                else:
+                    axes[1, i].set_title(f'Segmentation + ROIs\n({len(roi_list)} ROIs)')
+            
+            plt.tight_layout()
+            plt.show()
+        
+        return roi_list, roi_labels, cluster_info
+
+
+    def detect_spectral_rois_dbscan(self, eps=None, min_samples=5, min_roi_pixels=100,
+                                     use_pca=False, pca_dataset=None, n_components_to_use=3,
+                                     energy=None, plot=True):
+        """
+        Automatically detect ROIs using DBSCAN (Density-Based Spatial Clustering of Applications with Noise).
+        
+        DBSCAN is a density-based clustering algorithm that naturally enforces spatial locality
+        and can discover arbitrary-shaped clusters. Unlike k-means, it doesn't require specifying
+        the number of clusters in advance and automatically identifies outliers as noise.
+        
+        This function can work on:
+        - Full spectral data (each pixel's complete spectrum)
+        - Single energy slice (intensity at one energy)
+        - PCA component weights (dimensionality-reduced features)
+        
+        Parameters:
+        -----------
+        eps : float or None, optional
+            Maximum distance between two samples for them to be considered in the same neighborhood.
+            If None, automatically estimates a reasonable value using nearest neighbor distances.
+            Smaller values = more/smaller clusters. Default is None (auto-estimate).
+        min_samples : int, optional
+            Minimum number of samples in a neighborhood for a point to be considered a core point.
+            Larger values = fewer, denser clusters. Default is 5.
+        min_roi_pixels : int, optional
+            Minimum number of pixels required for a cluster to be returned as an ROI.
+            Small clusters are filtered out. Default is 100.
+        use_pca : bool, optional
+            If True, cluster based on PCA component weights.
+            If False, cluster based on full spectra or single energy. Default is False.
+        pca_dataset : xarray.Dataset, optional
+            PCA results from perform_pca_analysis(). Required when use_pca=True.
+        n_components_to_use : int, optional
+            Number of PCA components to use for clustering when use_pca=True. Default is 3.
+        energy : float, optional
+            If provided (and use_pca=False), cluster based on intensity at this energy value (eV).
+            If None (and use_pca=False), cluster based on full spectral similarity.
+        plot : bool, optional
+            If True, display visualizations of clustering results. Default is True.
+            
+        Returns:
+        --------
+        roi_list : list
+            List of ROI tuples (x_min, y_min, width, height)
+        roi_labels : list
+            List of ROI labels (e.g., 'DBSCAN_ROI_0', 'DBSCAN_ROI_1', ...)
+        cluster_info : dict
+            Dictionary containing clustering information and statistics including:
+            - algorithm, eps, min_samples, n_clusters_detected, n_rois_detected
+            - n_noise_pixels, clustering_mode
+            
+        Notes:
+        ------
+        DBSCAN advantages:
+        - Automatically enforces spatial locality (density-based)
+        - Discovers arbitrary-shaped clusters
+        - No need to specify number of clusters
+        - Automatically identifies and excludes noise/outliers
+        - More robust to varying cluster densities
+        
+        Examples:
+        ---------
+        # Full spectra clustering with auto eps
+        roi_list, roi_labels, info = processor.detect_spectral_rois_dbscan(
+            min_samples=10
+        )
+        
+        # Single energy clustering
+        roi_list, roi_labels, info = processor.detect_spectral_rois_dbscan(
+            energy=285.0,
+            eps=0.3,
+            min_samples=20
+        )
+        
+        # PCA-based clustering
+        pca_dataset, _ = processor.perform_pca_analysis(n_components=10)
+        roi_list, roi_labels, info = processor.detect_spectral_rois_dbscan(
+            use_pca=True,
+            pca_dataset=pca_dataset,
+            n_components_to_use=3,
+            min_samples=15
+        )
+        """
+        from sklearn.cluster import DBSCAN
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.neighbors import NearestNeighbors
+        
+        # Determine clustering mode
+        if use_pca:
+            mode = 'pca_weights'
+            if pca_dataset is None:
+                raise ValueError("pca_dataset is required when use_pca=True. Run perform_pca_analysis() first.")
+            print(f"Starting DBSCAN ROI detection on PCA weights ({n_components_to_use} components)...")
+        elif energy is not None:
+            mode = 'single_energy'
+            print(f"Starting DBSCAN ROI detection at single energy: {energy} eV...")
+        else:
+            mode = 'full_spectra'
+            print("Starting DBSCAN ROI detection on full spectra...")
+        
+        # Feature extraction based on mode
+        if use_pca:
+            # Extract PCA weights
+            weights_data = pca_dataset['weights'].values  # Shape: (n_components, pix_y, pix_x)
+            n_total_components = weights_data.shape[0]
+            
+            # Validate n_components_to_use
+            if n_components_to_use > n_total_components:
+                print(f"Warning: Requested {n_components_to_use} components but only {n_total_components} available")
+                n_components_to_use = n_total_components
+            
+            print(f"Using PCA components 1-{n_components_to_use} out of {n_total_components} total components")
+            
+            # Extract weights for selected components
+            weights_subset = weights_data[:n_components_to_use]  # Shape: (n_use, pix_y, pix_x)
+            
+            # Reshape to (n_pixels, n_components)
+            n_y, n_x = weights_subset.shape[1], weights_subset.shape[2]
+            pixel_features = weights_subset.reshape(n_components_to_use, -1).T  # (n_pixels, n_components)
+            
+        elif energy is not None:
+            # Single energy slice
+            actual_energy = float(self.data.sel(energy=energy, method='nearest').energy.values)
+            if abs(actual_energy - energy) > 1.0:
+                print(f"Warning: Requested energy {energy} eV, using closest available: {actual_energy:.2f} eV")
+            else:
+                print(f"Using energy: {actual_energy:.2f} eV")
+            
+            energy_slice = self.data.sel(energy=energy, method='nearest').values
+            n_y, n_x = energy_slice.shape
+            pixel_features = energy_slice.ravel().reshape(-1, 1)  # (n_pixels, 1)
+            
+        else:
+            # Full spectra
+            n_energies, n_y, n_x = self.data.shape
+            pixel_features = self.data.values.reshape(n_energies, -1).T  # (n_pixels, n_energies)
+            print(f"Clustering {n_y * n_x} pixels using {n_energies} energy points per spectrum")
+        
+        # Create coordinate arrays
+        y_coords, x_coords = np.meshgrid(np.arange(n_y), np.arange(n_x), indexing='ij')
+        y_flat = y_coords.ravel()
+        x_flat = x_coords.ravel()
+        
+        # Remove NaN pixels
+        valid_pixels = ~np.isnan(pixel_features).any(axis=1)
+        pixel_features_clean = pixel_features[valid_pixels]
+        x_coords_clean = x_flat[valid_pixels]
+        y_coords_clean = y_flat[valid_pixels]
+        
+        n_valid = len(pixel_features_clean)
+        n_invalid = len(pixel_features) - n_valid
+        
+        if n_invalid > 0:
+            print(f"Removed {n_invalid} pixels with NaN values, clustering {n_valid} valid pixels")
+        else:
+            print(f"Clustering {n_valid} valid pixels")
+        
+        # Standardize features
+        print("Standardizing features...")
+        scaler = StandardScaler()
+        pixel_features_scaled = scaler.fit_transform(pixel_features_clean)
+        
+        # Auto-estimate eps if not provided
+        eps_auto_estimated = False
+        if eps is None:
+            print(f"Auto-estimating eps using {min_samples}-nearest neighbor distances...")
+            # Use k-nearest neighbor distance heuristic
+            nbrs = NearestNeighbors(n_neighbors=min_samples).fit(pixel_features_scaled)
+            distances, indices = nbrs.kneighbors(pixel_features_scaled)
+            
+            # Sort k-distances (distance to the kth nearest neighbor)
+            k_distances = np.sort(distances[:, -1])
+            
+            # Use 90th percentile as a reasonable default
+            # (catches most points while allowing some outliers)
+            eps = np.percentile(k_distances, 90)
+            eps_auto_estimated = True
+            print(f"Auto-estimated eps: {eps:.4f} (90th percentile of {min_samples}-NN distances)")
+        else:
+            print(f"Using provided eps: {eps}")
+        
+        # Apply DBSCAN
+        print(f"Running DBSCAN (eps={eps:.4f}, min_samples={min_samples})...")
+        dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+        cluster_labels = dbscan.fit_predict(pixel_features_scaled)
+        
+        # Count clusters and noise
+        unique_labels = np.unique(cluster_labels)
+        n_clusters = len(unique_labels[unique_labels >= 0])  # Exclude -1 (noise)
+        n_noise = np.sum(cluster_labels == -1)
+        
+        print(f"DBSCAN detected {n_clusters} clusters")
+        print(f"Noise points excluded: {n_noise} ({100*n_noise/n_valid:.1f}% of valid pixels)")
+        
+        # Create segmentation map (excluding noise)
+        segmentation_map = np.full((n_y, n_x), -1, dtype=int)
+        for i, (x, y, label) in enumerate(zip(x_coords_clean, y_coords_clean, cluster_labels)):
+            segmentation_map[y, x] = label  # -1 for noise, >= 0 for clusters
+        
+        # Create ROI bounding boxes
+        roi_list = []
+        roi_labels = []
+        
+        # Get unique cluster IDs (excluding -1 for noise)
+        cluster_ids = unique_labels[unique_labels >= 0]
+        
+        for cluster_id in cluster_ids:
+            # Create mask for this cluster
+            cluster_mask = (segmentation_map == cluster_id)
+            
+            # Find bounding box
+            rows, cols = np.where(cluster_mask)
+            if len(rows) == 0:
+                continue
+            
+            y_min, y_max = np.min(rows), np.max(rows)
+            x_min, x_max = np.min(cols), np.max(cols)
+            
+            # Calculate dimensions
+            width = x_max - x_min + 1
+            height = y_max - y_min + 1
+            area = width * height
+            
+            # Check minimum size requirement
+            if area >= min_roi_pixels:
+                roi_list.append((x_min, y_min, width, height))
+                roi_labels.append(f'DBSCAN_ROI_{cluster_id}')
+            else:
+                print(f"  Removed small ROI {cluster_id}: {area} pixels (< {min_roi_pixels})")
+        
+        print(f"\nROI Detection Complete:")
+        print(f"  {len(roi_list)} ROIs detected from {n_clusters} clusters")
+        print(f"  Mode: {mode}")
+        
+        # Create cluster info dictionary
+        cluster_info = {
+            'algorithm': 'dbscan',
+            'eps': float(eps),
+            'eps_auto_estimated': eps_auto_estimated,
+            'min_samples': min_samples,
+            'n_clusters_detected': n_clusters,
+            'n_rois_detected': len(roi_list),
+            'n_noise_pixels': int(n_noise),
+            'min_roi_pixels': min_roi_pixels,
+            'clustering_mode': mode,
+            'roi_list': roi_list,
+            'roi_labels': roi_labels
+        }
+        
+        # Add mode-specific information
+        if use_pca:
+            cluster_info['n_components_used'] = n_components_to_use
+            if 'explained_variance_ratio' in pca_dataset.attrs:
+                total_variance = np.sum(pca_dataset.attrs['explained_variance_ratio'][:n_components_to_use])
+                cluster_info['explained_variance_used'] = float(total_variance)
+                print(f"  Explained variance captured: {total_variance:.1%}")
+        elif energy is not None:
+            cluster_info['energy_used'] = float(actual_energy)
+        
+        # Visualization
+        if plot:
+            if use_pca:
+                # Show PCA components + segmentation
+                weights_subset = pca_dataset['weights'].values[:n_components_to_use]
+                n_cols = n_components_to_use + 1  # +1 for segmentation
+                fig, axes = plt.subplots(2, n_cols, figsize=(4*n_cols, 8))
+                
+                if n_cols == 1:
+                    axes = axes.reshape(2, 1)
+                
+                # Top row: PCA components
+                for i in range(n_components_to_use):
+                    im = axes[0, i].imshow(weights_subset[i], cmap='RdBu_r', origin='lower')
+                    axes[0, i].set_title(f'PC{i+1} Weights')
+                    axes[0, i].set_xlabel('X (pixels)')
+                    axes[0, i].set_ylabel('Y (pixels)')
+                    plt.colorbar(im, ax=axes[0, i], shrink=0.8)
+                
+                # Segmentation map
+                im_seg = axes[0, n_components_to_use].imshow(segmentation_map, cmap='tab10', origin='lower')
+                axes[0, n_components_to_use].set_title(f'DBSCAN Segmentation\n({n_clusters} clusters, {n_noise} noise pts)')
+                axes[0, n_components_to_use].set_xlabel('X (pixels)')
+                axes[0, n_components_to_use].set_ylabel('Y (pixels)')
+                plt.colorbar(im_seg, ax=axes[0, n_components_to_use], shrink=0.8)
+                
+                # Bottom row: ROI overlays
+                for i in range(n_cols):
+                    axes[1, i].imshow(segmentation_map, cmap='tab10', origin='lower', alpha=0.7)
+                    
+                    # Overlay ROI bounding boxes
+                    for j, (x_min, y_min, width, height) in enumerate(roi_list):
+                        rect = plt.Rectangle((x_min, y_min), width, height,
+                                           linewidth=2, edgecolor='red', facecolor='none')
+                        axes[1, i].add_patch(rect)
+                        axes[1, i].text(x_min + width/2, y_min + height/2, f'{j+1}',
+                                      ha='center', va='center', color='red', fontweight='bold')
+                    
+                    axes[1, i].set_xlabel('X (pixels)')
+                    axes[1, i].set_ylabel('Y (pixels)')
+                    
+                    if i < n_components_to_use:
+                        axes[1, i].set_title(f'PC{i+1} + ROIs')
+                    else:
+                        axes[1, i].set_title(f'Segmentation + ROIs\n({len(roi_list)} ROIs)')
+                
+            elif energy is not None:
+                # Show energy slice + segmentation
+                fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+                
+                # Energy slice
+                im1 = axes[0].imshow(energy_slice, cmap='viridis', origin='lower')
+                axes[0].set_title(f'Intensity at {actual_energy:.2f} eV')
+                axes[0].set_xlabel('X (pixels)')
+                axes[0].set_ylabel('Y (pixels)')
+                plt.colorbar(im1, ax=axes[0])
+                
+                # Segmentation with ROIs
+                im2 = axes[1].imshow(segmentation_map, cmap='tab10', origin='lower', alpha=0.7)
+                axes[1].set_title(f'DBSCAN Segmentation\n{len(roi_list)} ROIs from {n_clusters} clusters ({n_noise} noise pts)')
+                axes[1].set_xlabel('X (pixels)')
+                axes[1].set_ylabel('Y (pixels)')
+                plt.colorbar(im2, ax=axes[1])
+                
+                # Overlay ROI bounding boxes
+                for j, (x_min, y_min, width, height) in enumerate(roi_list):
+                    rect = plt.Rectangle((x_min, y_min), width, height,
+                                       linewidth=2, edgecolor='red', facecolor='none')
+                    axes[1].add_patch(rect)
+                    axes[1].text(x_min + width/2, y_min + height/2, f'{j+1}',
+                              ha='center', va='center', color='red', fontweight='bold')
+                
+            else:
+                # Show first/last energy images + segmentation
+                fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+                
+                # First energy image
+                im1 = axes[0].imshow(self.data.isel(energy=0).values, cmap='viridis', origin='lower')
+                first_energy = float(self.data.energy.values[0])
+                axes[0].set_title(f'First Energy: {first_energy:.2f} eV')
+                axes[0].set_xlabel('X (pixels)')
+                axes[0].set_ylabel('Y (pixels)')
+                plt.colorbar(im1, ax=axes[0])
+                
+                # Last energy image
+                im2 = axes[1].imshow(self.data.isel(energy=-1).values, cmap='viridis', origin='lower')
+                last_energy = float(self.data.energy.values[-1])
+                axes[1].set_title(f'Last Energy: {last_energy:.2f} eV')
+                axes[1].set_xlabel('X (pixels)')
+                axes[1].set_ylabel('Y (pixels)')
+                plt.colorbar(im2, ax=axes[1])
+                
+                # Segmentation with ROIs
+                im3 = axes[2].imshow(segmentation_map, cmap='tab10', origin='lower', alpha=0.7)
+                axes[2].set_title(f'DBSCAN Spectral Segmentation\n{len(roi_list)} ROIs from {n_clusters} clusters ({n_noise} noise pts)')
+                axes[2].set_xlabel('X (pixels)')
+                axes[2].set_ylabel('Y (pixels)')
+                plt.colorbar(im3, ax=axes[2])
+                
+                # Overlay ROI bounding boxes
+                for j, (x_min, y_min, width, height) in enumerate(roi_list):
+                    rect = plt.Rectangle((x_min, y_min), width, height,
+                                       linewidth=2, edgecolor='red', facecolor='none')
+                    axes[2].add_patch(rect)
+                    axes[2].text(x_min + width/2, y_min + height/2, f'{j+1}',
+                              ha='center', va='center', color='red', fontweight='bold')
+            
+            plt.tight_layout()
+            plt.show()
+        
+        return roi_list, roi_labels, cluster_info
+
+
     def perform_nmf_analysis(self, n_components=8, normalize_illumination=True,
                         low_energy_range=(525, 530), high_energy_range=(575, 580),
                         random_state=42, max_iter=1000, plot=True, 
@@ -5350,3 +6295,367 @@ class LariatDataProcessor:
             print(f"  Info: {info_filename}")
         
         return nmf_dataset, nmf_info
+
+
+    def detect_spectral_rois_kmeans(self, n_clusters=5, min_roi_pixels=100, 
+                                    plot=True, random_state=42, energy=None,
+                                    enforce_spatial_locality=False, min_component_pixels=50):
+        """
+        Automatically detect regions with distinct spectral signatures using k-means clustering.
+        Returns a list of ROI bounding boxes that can be used with existing extraction functions.
+        
+        This function works on processed data and clusters pixels based on their spectral similarity
+        (full spectra) or intensity at a single energy.
+        
+        Parameters:
+        -----------
+        n_clusters : int, optional
+            Number of spectral clusters to detect. Default is 5.
+        min_roi_pixels : int, optional
+            Minimum number of pixels required for a cluster to be returned as an ROI.
+            Small clusters are filtered out to avoid noise. Default is 100.
+        plot : bool, optional
+            If True, display the segmentation map with ROI overlays. Default is True.
+        random_state : int, optional
+            Random seed for reproducibility. Default is 42.
+        energy : float, optional
+            If provided, cluster based on intensity at this single energy value (eV).
+            If None (default), cluster based on full spectral similarity.
+        enforce_spatial_locality : bool, optional
+            If True, split each k-means cluster into spatially contiguous regions using
+            connected component analysis. This prevents grouping disconnected areas with
+            similar spectra into the same cluster. May result in more ROIs than n_clusters.
+            Default is False.
+        min_component_pixels : int, optional
+            When enforce_spatial_locality=True, minimum number of pixels for a connected
+            component to be kept as an ROI. Smaller components are discarded.
+            Default is 50.
+            
+        Returns:
+        --------
+        roi_list : list of tuples
+            List of ROIs as (x_min, y_min, width, height) that can be used with
+            extract_processed_roi_spectra or create_spectral_animation
+        roi_labels : list of str
+            Labels for each ROI (e.g., "Cluster 1 (500 pixels)")
+        cluster_info : dict
+            Dictionary containing clustering statistics and information
+        """
+        from sklearn.cluster import KMeans
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+        
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+        
+        # Check if data appears to be processed
+        is_processed = self.data.attrs.get('pixel_by_pixel_processing', False)
+        if not is_processed:
+            print("Warning: Data may not be processed. This function works best with processed data.")
+        
+        # Get data shape
+        image_data = self.data.values  # Shape: (energy, pix_y, pix_x)
+        n_energy, n_y, n_x = image_data.shape
+        
+        # Handle single energy clustering vs full spectral clustering
+        if energy is not None:
+            print(f"Starting k-means ROI detection based on single energy: {energy} eV")
+            
+            # Select the closest energy slice
+            energies = self.data.energy.values
+            energy_idx = np.argmin(np.abs(energies - energy))
+            actual_energy = energies[energy_idx]
+            
+            print(f"Using energy slice at {actual_energy:.2f} eV (requested: {energy} eV)")
+            print(f"Data shape: ({n_y}, {n_x}) pixels")
+            
+            # Get single energy slice and reshape to (n_pixels, 1) for clustering
+            energy_slice = image_data[energy_idx, :, :]
+            pixel_spectra = energy_slice.reshape(-1, 1)
+            
+        else:
+            print("Starting k-means spectral ROI detection based on full spectra...")
+            print(f"Data shape: {image_data.shape} (energy, pix_y, pix_x)")
+            print(f"Total pixels: {n_y * n_x:,}")
+            print(f"Energy points: {n_energy}")
+            
+            # Reshape to (n_pixels, n_energies) for clustering
+            pixel_spectra = image_data.transpose(1, 2, 0).reshape(-1, n_energy)
+        
+        # Create pixel position map for later ROI creation
+        y_coords, x_coords = np.meshgrid(np.arange(n_y), np.arange(n_x), indexing='ij')
+        y_flat = y_coords.ravel()
+        x_flat = x_coords.ravel()
+        
+        # Remove any pixels with NaN values or very low intensity
+        valid_pixels = ~np.isnan(pixel_spectra).any(axis=1)
+        max_intensity = np.max(np.abs(pixel_spectra), axis=1)
+        valid_pixels = valid_pixels & (max_intensity > 1e-10)
+        
+        pixel_spectra_clean = pixel_spectra[valid_pixels]
+        x_coords_clean = x_flat[valid_pixels]
+        y_coords_clean = y_flat[valid_pixels]
+        
+        print(f"Valid pixels for clustering: {len(pixel_spectra_clean):,} ({len(pixel_spectra_clean)/(n_y*n_x)*100:.1f}%)")
+        
+        if len(pixel_spectra_clean) == 0:
+            raise ValueError("No valid pixels found for clustering")
+        
+        if len(pixel_spectra_clean) < n_clusters:
+            raise ValueError(f"Not enough valid pixels ({len(pixel_spectra_clean)}) for {n_clusters} clusters")
+        
+        # Perform k-means clustering
+        print(f"Performing k-means clustering with {n_clusters} clusters...")
+        kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+        cluster_labels = kmeans.fit_predict(pixel_spectra_clean)
+        
+        print(f"Clustering complete. Inertia: {kmeans.inertia_:.2f}")
+        
+        # Create segmentation image
+        segmentation_map = np.full((n_y, n_x), -1, dtype=int)
+        for i, (x, y, label) in enumerate(zip(x_coords_clean, y_coords_clean, cluster_labels)):
+            segmentation_map[y, x] = label
+        
+        # Store original number of clusters
+        n_clusters_original = n_clusters
+        
+        # Post-process clusters for spatial locality if requested
+        if enforce_spatial_locality:
+            from scipy.ndimage import label as connected_components
+            
+            print(f"\nEnforcing spatial locality (splitting non-contiguous clusters)...")
+            print(f"Minimum component size: {min_component_pixels} pixels")
+            
+            # Process each cluster to find connected components
+            new_cluster_labels = np.copy(cluster_labels)
+            next_cluster_id = n_clusters
+            split_info = {}  # Track which clusters were split
+            
+            for cluster_id in range(n_clusters):
+                # Create binary mask for this cluster
+                cluster_mask_2d = (segmentation_map == cluster_id)
+                
+                # Find connected components
+                labeled_array, num_features = connected_components(cluster_mask_2d)
+                
+                if num_features > 1:
+                    # Calculate sizes of each component
+                    component_sizes = []
+                    for comp_id in range(1, num_features + 1):
+                        comp_size = np.sum(labeled_array == comp_id)
+                        component_sizes.append((comp_id, comp_size))
+                    
+                    # Sort by size descending
+                    component_sizes.sort(key=lambda x: x[1], reverse=True)
+                    
+                    # Count valid components (large enough)
+                    valid_components = [c for c in component_sizes if c[1] >= min_component_pixels]
+                    
+                    if len(valid_components) > 1:
+                        print(f"  Cluster {cluster_id + 1}: Splitting into {len(valid_components)} regions " +
+                              f"(discarding {len(component_sizes) - len(valid_components)} small components)")
+                        
+                        # Keep largest as original cluster_id (it's component_sizes[0])
+                        split_info[cluster_id] = []
+                        
+                        # Reassign other components to new cluster IDs
+                        for i, (comp_id, comp_size) in enumerate(component_sizes[1:]):
+                            if comp_size >= min_component_pixels:
+                                # Find pixels in this component and reassign
+                                comp_pixels = labeled_array == comp_id
+                                y_comp, x_comp = np.where(comp_pixels)
+                                
+                                # Update cluster labels for these pixels
+                                for y, x in zip(y_comp, x_comp):
+                                    # Find this pixel in the clean coordinates
+                                    pixel_idx = np.where((y_coords_clean == y) & 
+                                                       (x_coords_clean == x))[0]
+                                    if len(pixel_idx) > 0:
+                                        new_cluster_labels[pixel_idx[0]] = next_cluster_id
+                                
+                                # Update segmentation map
+                                segmentation_map[comp_pixels] = next_cluster_id
+                                split_info[cluster_id].append((next_cluster_id, comp_size))
+                                next_cluster_id += 1
+                            else:
+                                # Remove small components
+                                comp_pixels = labeled_array == comp_id
+                                segmentation_map[comp_pixels] = -1
+                                # Remove from cluster_labels
+                                y_comp, x_comp = np.where(comp_pixels)
+                                for y, x in zip(y_comp, x_comp):
+                                    pixel_idx = np.where((y_coords_clean == y) & 
+                                                       (x_coords_clean == x))[0]
+                                    if len(pixel_idx) > 0:
+                                        new_cluster_labels[pixel_idx[0]] = -1
+                    elif len(valid_components) == 1 and valid_components[0][0] != component_sizes[0][0]:
+                        # Only one valid component but it's not the largest - keep it but discard small ones
+                        print(f"  Cluster {cluster_id + 1}: Keeping main component, " +
+                              f"discarding {len(component_sizes) - 1} small components")
+                        for comp_id, comp_size in component_sizes[1:]:
+                            comp_pixels = labeled_array == comp_id
+                            segmentation_map[comp_pixels] = -1
+                            y_comp, x_comp = np.where(comp_pixels)
+                            for y, x in zip(y_comp, x_comp):
+                                pixel_idx = np.where((y_coords_clean == y) & 
+                                                   (x_coords_clean == x))[0]
+                                if len(pixel_idx) > 0:
+                                    new_cluster_labels[pixel_idx[0]] = -1
+            
+            # Update cluster labels
+            cluster_labels = new_cluster_labels
+            
+            # Get unique cluster IDs (excluding -1 for invalid)
+            valid_mask = cluster_labels >= 0
+            cluster_labels_valid = cluster_labels[valid_mask]
+            unique_clusters = np.unique(cluster_labels_valid)
+            n_clusters_actual = len(unique_clusters)
+            
+            print(f"  Total ROIs after spatial splitting: {n_clusters_actual} (from {n_clusters_original} original clusters)")
+        else:
+            unique_clusters = range(n_clusters)
+            n_clusters_actual = n_clusters
+        
+        # Create ROI bounding boxes for each cluster
+        roi_list = []
+        roi_labels = []
+        cluster_stats = []
+        
+        print(f"\nCreating ROI bounding boxes:")
+        for cluster_id in unique_clusters:
+            # Find all pixels in this cluster
+            cluster_mask = cluster_labels == cluster_id
+            cluster_x = x_coords_clean[cluster_mask]
+            cluster_y = y_coords_clean[cluster_mask]
+            n_pixels = len(cluster_x)
+            
+            # Skip small clusters
+            if n_pixels < min_roi_pixels:
+                print(f"  Cluster {cluster_id + 1}: {n_pixels} pixels (< {min_roi_pixels}, skipped)")
+                continue
+            
+            # Calculate bounding box
+            x_min = int(np.min(cluster_x))
+            x_max = int(np.max(cluster_x))
+            y_min = int(np.min(cluster_y))
+            y_max = int(np.max(cluster_y))
+            
+            # Convert to ROI format (x_min, y_min, width, height)
+            width = x_max - x_min + 1
+            height = y_max - y_min + 1
+            roi = (x_min, y_min, width, height)
+            
+            # Calculate fill ratio (actual pixels / bounding box area)
+            fill_ratio = n_pixels / (width * height)
+            
+            roi_list.append(roi)
+            label = f"Cluster {cluster_id + 1} ({n_pixels} pixels)"
+            roi_labels.append(label)
+            
+            cluster_stats.append({
+                'cluster_id': cluster_id + 1,
+                'n_pixels': n_pixels,
+                'roi': roi,
+                'fill_ratio': fill_ratio
+            })
+            
+            print(f"  Cluster {cluster_id + 1}: {n_pixels} pixels, "
+                  f"ROI=({x_min}, {y_min}, {width}, {height}), fill={fill_ratio:.2%}")
+        
+        if len(roi_list) == 0:
+            raise ValueError(f"No clusters with >= {min_roi_pixels} pixels found")
+        
+        if enforce_spatial_locality:
+            print(f"\nDetected {len(roi_list)} ROIs from {n_clusters_original} original clusters (after spatial splitting)")
+        else:
+            print(f"\nDetected {len(roi_list)} ROIs from {n_clusters} clusters")
+        
+        # Store clustering information
+        cluster_info = {
+            'n_clusters': n_clusters_original if enforce_spatial_locality else n_clusters,
+            'n_clusters_original': n_clusters_original,
+            'n_clusters_final': n_clusters_actual,
+            'n_rois_detected': len(roi_list),
+            'n_valid_pixels': len(pixel_spectra_clean),
+            'n_total_pixels': n_y * n_x,
+            'valid_pixel_fraction': len(pixel_spectra_clean) / (n_y * n_x),
+            'min_roi_pixels': min_roi_pixels,
+            'enforce_spatial_locality': enforce_spatial_locality,
+            'min_component_pixels': min_component_pixels if enforce_spatial_locality else None,
+            'cluster_stats': cluster_stats,
+            'inertia': float(kmeans.inertia_),
+            'segmentation_map': segmentation_map,
+            'clustering_method': 'single_energy' if energy is not None else 'full_spectra'
+        }
+        
+        # Add energy info if single energy clustering was used
+        if energy is not None:
+            cluster_info['energy_used'] = float(actual_energy)
+        
+        # Plot segmentation if requested
+        if plot:
+            # Create figure with 1 or 2 subplots depending on whether we used single energy
+            if energy is not None:
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+                
+                # Show the actual intensity image at the selected energy
+                im1 = ax1.imshow(energy_slice, cmap='viridis', origin='lower')
+                ax1.set_xlabel('Pixel X')
+                ax1.set_ylabel('Pixel Y')
+                ax1.set_title(f'Intensity at {actual_energy:.2f} eV')
+                plt.colorbar(im1, ax=ax1, label='Intensity')
+                
+                ax = ax2  # Use second subplot for segmentation
+            else:
+                fig, ax = plt.subplots(figsize=(12, 10))
+            
+            # Display segmentation map
+            # Use a custom colormap that shows -1 (invalid) as white
+            segmentation_display = segmentation_map.copy().astype(float)
+            segmentation_display[segmentation_display == -1] = np.nan
+            
+            im = ax.imshow(segmentation_display, cmap='tab10', origin='lower', 
+                          vmin=0, vmax=n_clusters-1, interpolation='nearest')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax, label='Cluster ID')
+            
+            # Overlay ROI bounding boxes
+            colors = plt.cm.tab10(np.linspace(0, 1, n_clusters))
+            for i, (roi, label, stats) in enumerate(zip(roi_list, roi_labels, cluster_stats)):
+                x_min, y_min, width, height = roi
+                cluster_id = stats['cluster_id'] - 1
+                
+                # Draw rectangle
+                rect = Rectangle((x_min, y_min), width, height,
+                               edgecolor=colors[cluster_id], facecolor='none', 
+                               linewidth=2, linestyle='--')
+                ax.add_patch(rect)
+                
+                # Add label
+                ax.text(x_min + width/2, y_min + height + 5, label,
+                       color=colors[cluster_id], fontweight='bold', ha='center',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
+                       fontsize=9)
+            
+            ax.set_xlabel('Pixel X')
+            ax.set_ylabel('Pixel Y')
+            
+            # Set title based on clustering method and spatial locality enforcement
+            if energy is not None:
+                base_title = f'K-Means Segmentation at {actual_energy:.2f} eV'
+            else:
+                base_title = f'K-Means Spectral Segmentation'
+            
+            if enforce_spatial_locality:
+                title = f'{base_title}\n{len(roi_list)} ROIs from {n_clusters_original} clusters (spatially split)'
+            else:
+                title = f'{base_title}\n{len(roi_list)} ROIs detected from {n_clusters} clusters'
+            
+            ax.set_title(title)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        return roi_list, roi_labels, cluster_info

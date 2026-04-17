@@ -1,0 +1,30 @@
+Group,Sample,Energy (eV),Filename,Detector,Angle Range,Count Time,Trim Start,Trim End,Position X,Position Y,Min Angle,Max Angle
+1,UVStack,519.9989,UVStack_O000000.dat,photodiode,0.00 - 6.00,,0,-1,23.001,5.0084,0.0005,6.0
+1,UVStack,519.9989,UVStack_O000001.dat,cem digital,3.00 - 9.93,0.5,0,-19,23.001,5.0084,3.0,9.93
+1,UVStack,519.9989,UVStack_O000002.dat,cem digital,9.00 - 15.93,1.0,0,-23,23.001,5.0084,9.0,15.93
+2,UVStack,529.9996,UVStack_O_PD000000.dat,photodiode,0.00 - 6.00,,0,-1,21.502,5.0094,0.0005,6.0005
+2,UVStack,529.9996,UVSTack_O_CT1000000.dat,cem digital,3.00 - 9.00,1.0,0,-24,21.502,5.0094,3.0,9.0
+2,UVStack,529.9996,UVStack_O_CT2000000.dat,cem digital,8.50 - 25.00,2.0,0,-40,21.502,5.0094,8.5,25.0
+3,UVStack,531.0012,UVStack_O_PD000001.dat,photodiode,0.00 - 6.00,,0,-1,21.502,5.0097,0.0005,6.0
+3,UVStack,531.0012,UVSTack_O_CT1000001.dat,cem digital,3.00 - 9.00,1.0,0,-16,21.502,5.0097,3.0,9.0
+3,UVStack,531.0012,UVStack_O_CT2000001.dat,cem digital,8.50 - 25.00,5.0,0,-62,21.502,5.0097,8.5,25.0
+4,UVStack,531.9994,UVStack_O_PD000002.dat,photodiode,0.00 - 6.00,,0,-1,22.002,5.0094,0.0005,6.0
+4,UVStack,531.9994,UVSTack_O_CT1000002.dat,cem digital,3.00 - 9.00,1.0,0,-16,22.002,5.0094,3.0,9.0
+4,UVStack,531.9994,UVStack_O_CT2000002.dat,cem digital,8.50 - 25.00,5.0,0,-71,22.002,5.0094,8.5,25.0
+5,UVStack,533.0014,UVStack_O_PD000003.dat,photodiode,0.00 - 6.00,,0,-1,22.001,5.0094,0.0005,6.0005
+5,UVStack,533.0014,UVSTack_O_CT1000003.dat,cem digital,3.00 - 9.00,1.0,0,-17,22.001,5.0094,3.0,9.0
+5,UVStack,533.0014,UVStack_O_CT2000003.dat,cem digital,8.50 - 25.00,2.0,0,-30,22.001,5.0094,8.5,25.0
+6,UVStack,534.0,UVStack_O_PD000004.dat,photodiode,0.00 - 6.00,,0,-1,22.001,5.0097,0.0005,6.0
+6,UVStack,534.0,UVSTack_O_CT1000004.dat,cem digital,3.00 - 9.00,1.0,0,-17,22.001,5.0097,3.0,9.0
+6,UVStack,534.0,UVStack_O_CT2000004.dat,cem digital,8.50 - 25.00,2.0,0,-57,22.001,5.0097,8.5,25.0
+7,UVStack,534.9987,UVStack_O_PD000007.dat,photodiode,0.00 - 6.00,,0,-1,22.502,5.0094,0.0005,6.0
+7,UVStack,534.9987,UVSTack_O_CT1000005.dat,cem digital,3.00 - 9.00,1.0,0,-18,22.502,5.0094,3.0,9.0
+7,UVStack,534.9987,UVStack_O_CT2000005.dat,cem digital,8.50 - 25.00,3.0,0,-38,22.502,5.0094,8.5,25.0
+8,UVStack,540.0006,UVStack_O_PD000008.dat,photodiode,0.00 - 6.00,,0,-1,22.502,5.0091,0.0005,6.0005
+8,UVStack,540.0006,UVStack_O_PD000009.dat,photodiode,-0.00 - 0.87,,0,-1,22.502,5.0091,-0.0005,0.87
+8,UVStack,540.0006,UVStack_O_CT2000007.dat,photodiode,0.00 - 1.00,,0,-1,22.502,5.0091,0.0,1.0
+8,UVStack,540.0006,UVSTack_O_CT1000006.dat,cem digital,3.00 - 9.00,1.0,0,-19,22.502,5.0091,3.0,9.0
+8,UVStack,540.0006,UVSTack_O_CT1000007.dat,cem digital,0.00 - 1.00,1.0,0,-1,22.502,5.0091,0.0,1.0
+8,UVStack,540.0006,UVStack_O_CT2000006.dat,cem digital,8.50 - 25.00,5.0,0,-8,22.502,5.0091,8.5,25.0
+9,UVStack,570.0281,UVStack_O_PD000005.dat,photodiode,500.00 - 570.03,,0,-1,22.502,5.0069,500.000276,570.028144
+9,UVStack,570.0281,UVStack_O_PD000006.dat,photodiode,499.95 - 570.02,,0,-1,22.502,5.0069,499.949619,570.024029

@@ -1765,7 +1765,6 @@ class RSoXRProcessor:
         import glob
         import re
         import pandas as pd
-        from collections import defaultdict
         from copy import deepcopy
         
         if self.log_data is None:
@@ -1837,22 +1836,38 @@ class RSoXRProcessor:
             print("Warning: Could not extract metadata for any files.")
             return []
             
-        # Group by position and energy
-        position_groups = defaultdict(list)
+        # Group by position and energy using exact tolerance checks
+        # This replaces the rounding-based approach to avoid missing scan combinations
+        # Files are grouped if they are within tolerance of the first file in the group
+        position_groups = []
         
         for meta in file_metadata:
-            # Create a position key with rounded values
-            x_rounded = round(meta['x'] / position_tolerance) * position_tolerance
-            y_rounded = round(meta['y'] / position_tolerance) * position_tolerance
-            e_rounded = round(meta['energy'] / energy_tolerance) * energy_tolerance
+            added_to_group = False
+            # Check if this file is within tolerance of any existing group
+            # Use the first file in each group as the reference point
+            for group in position_groups:
+                if len(group) > 0:
+                    reference_meta = group[0]  # Use first file as reference
+                    x_diff = abs(meta['x'] - reference_meta['x'])
+                    y_diff = abs(meta['y'] - reference_meta['y'])
+                    e_diff = abs(meta['energy'] - reference_meta['energy'])
+                    
+                    # If within tolerance for both position and energy, add to this group
+                    if (x_diff <= position_tolerance and 
+                        y_diff <= position_tolerance and 
+                        e_diff <= energy_tolerance):
+                        group.append(meta)
+                        added_to_group = True
+                        break
             
-            position_key = f"{x_rounded:.2f}_{y_rounded:.2f}_{e_rounded:.1f}"
-            position_groups[position_key].append(meta)
+            # If no matching group found, create a new group
+            if not added_to_group:
+                position_groups.append([meta])
         
         # Prepare groups of files with detector information
         scan_groups = []
         
-        for pos_key, files in position_groups.items():
+        for files in position_groups:
             # Sort files by detector type and angle
             photodiode_files = []
             cem_files = []

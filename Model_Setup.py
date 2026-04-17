@@ -237,8 +237,9 @@ def create_reflectometry_model(materials_list, layer_params, layer_order=None, i
 
 
 def create_model_and_objective(structure, data, model_name=None, scale=1.0, bkg=None, dq=1.6, 
-                             vary_scale=True, vary_bkg=True, vary_dq=False,
+                             q_offset=0.0, vary_scale=True, vary_bkg=True, vary_dq=False, vary_qoffset=False,
                              scale_bounds=(0.1, 10), bkg_bounds=(0.01, 10), dq_bounds=(0.5, 2.0),
+                             qoffset_bounds=(-0.01, 0.01),
                              transform='logY'):
     """
     Create a reflectometry model and objective with specified parameters and bounds.
@@ -250,12 +251,15 @@ def create_model_and_objective(structure, data, model_name=None, scale=1.0, bkg=
         scale: Initial scale factor
         bkg: Initial background value (if None, will use minimum value in data)
         dq: Initial resolution parameter
+        q_offset: Initial q offset value
         vary_scale: Whether to vary the scale parameter
         vary_bkg: Whether to vary the background parameter
         vary_dq: Whether to vary the resolution parameter
+        vary_qoffset: Whether to vary the q offset parameter
         scale_bounds: Tuple of (lower_factor, upper_factor) to multiply scale by for bounds
         bkg_bounds: Tuple of (lower_factor, upper_factor) to multiply bkg by for bounds
         dq_bounds: Tuple of (lower, upper) absolute values for dq bounds
+        qoffset_bounds: Tuple of (lower, upper) absolute values for q_offset bounds
         transform: Transform to apply to the data ('logY', 'YX4', etc.)
         
     Returns:
@@ -281,7 +285,7 @@ def create_model_and_objective(structure, data, model_name=None, scale=1.0, bkg=
         print(f"Auto-setting background to {bkg:.3e} (minimum value in data)")
     
     # Create the reflectometry model
-    model = ReflectModel(structure, scale=scale, bkg=bkg, dq=dq, name=model_name)
+    model = ReflectModel(structure, scale=scale, bkg=bkg, dq=dq, q_offset=q_offset, name=model_name)
     
     # Set parameter bounds and vary flags
     if vary_scale:
@@ -296,6 +300,9 @@ def create_model_and_objective(structure, data, model_name=None, scale=1.0, bkg=
     
     if vary_dq:
         model.dq.setp(bounds=dq_bounds, vary=True)
+    
+    if vary_qoffset:
+        model.q_offset.setp(bounds=qoffset_bounds, vary=True)
     
     # Create the objective function
     objective = Objective(model, data, transform=Transform(transform))
@@ -4442,6 +4449,158 @@ def load_material_sld_array(file_path, has_header=True, verbose=True):
     except Exception as e:
         print(f"Error loading SLD data from {file_path}: {str(e)}")
         raise
+
+
+def save_reflectivity_data(obj, save_path, model_name=None):
+    """
+    Save experimental data and simulated reflectivity from an Objective object.
+    
+    Parameters:
+    -----------
+    obj : refnx.analysis.Objective
+        The Objective object containing data and model
+    save_path : str
+        Path to save the data (without extension). Files will be saved as:
+        - {save_path}_data.txt (experimental data: Q, R, R_err)
+        - {save_path}_simulated.txt (simulated reflectivity: Q, R_sim)
+        - {save_path}_metadata.pkl (metadata including model name, etc.)
+    model_name : str, optional
+        Name of the model to save in metadata
+    
+    Returns:
+    --------
+    dict : Dictionary containing the saved data paths and metadata
+    """
+    # Extract experimental data
+    x_data = obj.data.x
+    y_data = obj.data.y
+    y_err = obj.data.y_err if hasattr(obj.data, 'y_err') and obj.data.y_err is not None else np.zeros_like(y_data)
+    
+    # Calculate simulated reflectivity
+    y_sim = obj.model(x_data)
+    
+    # Save experimental data (Q, R, R_err)
+    data_file = f"{save_path}_data.txt"
+    np.savetxt(data_file, np.column_stack([x_data, y_data, y_err]), 
+               header='Q (1/Angstrom)    R (reflectivity)    R_err (error)', 
+               fmt='%.8e')
+    
+    # Save simulated reflectivity (Q, R_sim)
+    sim_file = f"{save_path}_simulated.txt"
+    np.savetxt(sim_file, np.column_stack([x_data, y_sim]), 
+               header='Q (1/Angstrom)    R_sim (simulated reflectivity)', 
+               fmt='%.8e')
+    
+    # Save metadata
+    metadata = {
+        'model_name': model_name,
+        'data_file': data_file,
+        'sim_file': sim_file,
+        'n_points': len(x_data),
+        'q_min': float(x_data.min()),
+        'q_max': float(x_data.max()),
+    }
+    
+    metadata_file = f"{save_path}_metadata.pkl"
+    with open(metadata_file, 'wb') as f:
+        pickle.dump(metadata, f)
+    
+    print(f"Saved reflectivity data to:")
+    print(f"  Experimental: {data_file}")
+    print(f"  Simulated: {sim_file}")
+    print(f"  Metadata: {metadata_file}")
+    
+    return metadata
+
+
+def load_reflectivity_data(save_path):
+    """
+    Load saved reflectivity data and metadata.
+    
+    Parameters:
+    -----------
+    save_path : str
+        Base path used when saving (without extension)
+    
+    Returns:
+    --------
+    dict : Dictionary containing:
+        - 'data': array with columns [Q, R, R_err]
+        - 'simulated': array with columns [Q, R_sim]
+        - 'metadata': dictionary with metadata
+    """
+    data_file = f"{save_path}_data.txt"
+    sim_file = f"{save_path}_simulated.txt"
+    metadata_file = f"{save_path}_metadata.pkl"
+    
+    # Load data
+    data = np.loadtxt(data_file)
+    simulated = np.loadtxt(sim_file)
+    
+    # Load metadata
+    with open(metadata_file, 'rb') as f:
+        metadata = pickle.load(f)
+    
+    return {
+        'data': data,
+        'simulated': simulated,
+        'metadata': metadata
+    }
+
+
+def plot_reflectivity_data(loaded_data, figsize=(10, 6), log_y=True, save_path=None):
+    """
+    Plot loaded reflectivity data.
+    
+    Parameters:
+    -----------
+    loaded_data : dict
+        Dictionary returned by load_reflectivity_data()
+    figsize : tuple, optional
+        Figure size (default: (10, 6))
+    log_y : bool, optional
+        Whether to use log scale for y-axis (default: True)
+    save_path : str, optional
+        Path to save the figure (if None, just displays)
+    
+    Returns:
+    --------
+    fig, ax : matplotlib figure and axes objects
+    """
+    data = loaded_data['data']
+    simulated = loaded_data['simulated']
+    metadata = loaded_data['metadata']
+    
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Plot experimental data with error bars
+    ax.errorbar(data[:, 0], data[:, 1], yerr=data[:, 2], 
+                fmt='o', markersize=4, capsize=2, alpha=0.7, 
+                label='Experimental data', zorder=1)
+    
+    # Plot simulated reflectivity
+    ax.plot(simulated[:, 0], simulated[:, 1], 
+            '-', linewidth=2, label='Simulated', zorder=2)
+    
+    ax.set_xlabel('Q (1/Å)', fontsize=12)
+    ax.set_ylabel('Reflectivity', fontsize=12)
+    if log_y:
+        ax.set_yscale('log')
+    
+    if metadata.get('model_name'):
+        ax.set_title(f"Reflectivity: {metadata['model_name']}", fontsize=14, fontweight='bold')
+    else:
+        ax.set_title("Reflectivity", fontsize=14, fontweight='bold')
+    
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Figure saved to {save_path}")
+    
+    return fig, ax
 
 
 
