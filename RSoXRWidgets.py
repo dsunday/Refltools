@@ -76,7 +76,7 @@ class ReflectivityViewer:
     def setup_widgets(self):
         """Create and setup the interactive widgets"""
         # Create dropdown for energy selection
-        energy_options = [(f"{energy:.1f} eV", energy) for energy in self.energies]
+        energy_options = [(f"{energy:.2f} eV", energy) for energy in self.energies]
         self.energy_dropdown = widgets.Dropdown(
             options=energy_options,
             description='Energy:',
@@ -90,13 +90,13 @@ class ReflectivityViewer:
                 value=self.energies[0],
                 min=min(self.energies),
                 max=max(self.energies),
-                step=0.1,
+                step=0.01,
                 description='Energy:',
                 disabled=False,
                 continuous_update=False,
                 orientation='horizontal',
                 readout=True,
-                readout_format='.1f',
+                readout_format='.2f',
                 layout=widgets.Layout(width='500px')
             )
         else:
@@ -268,7 +268,7 @@ class ReflectivityViewer:
                     # Set labels and title
                     plt.xlabel('Q (Å⁻¹)')
                     plt.ylabel('Reflectivity' + (' (Normalized)' if do_normalize else ''))
-                    plt.title(f'Reflectivity Curve - {energy:.1f} eV')
+                    plt.title(f'Reflectivity Curve - {energy:.2f} eV')
                     
                     # Add grid
                     plt.grid(True, which='both', linestyle='--', alpha=0.7)
@@ -282,7 +282,7 @@ class ReflectivityViewer:
                 else:
                     print(f"No valid data found in file: {filename}")
             else:
-                print(f"No file found for energy {energy:.1f} eV")
+                print(f"No file found for energy {energy:.2f} eV")
     
     def display(self):
         """Display the widget"""
@@ -407,7 +407,7 @@ class MultiCurveViewer:
             for energy in self.energies[i:i+items_per_column]:
                 checkbox = widgets.Checkbox(
                     value=False,
-                    description=f"{energy:.1f} eV",
+                    description=f"{energy:.2f} eV",
                     disabled=False,
                     indent=False,
                     layout=widgets.Layout(width='120px')
@@ -604,7 +604,7 @@ class MultiCurveViewer:
                             color = None
                         
                         # Plot the data
-                        label = f"{energy:.1f} eV"
+                        label = f"{energy:.2f} eV"
                         plt.plot(q_values, r_values, 'o-', markersize=3, label=label, color=color)
                         
                         # Add error bars if available
@@ -651,7 +651,7 @@ class MultiCurveViewer:
             
             if len(sorted_energies) == 1:
                 energy = next(iter(sorted_energies))
-                plt.title(f'Reflectivity Curve - {energy:.1f} eV')
+                plt.title(f'Reflectivity Curve - {energy:.2f} eV')
             else:
                 plt.title(f'Reflectivity Curves - Multiple Energies')
             
@@ -1907,12 +1907,12 @@ class RSoXRTrimWidget:
                     print("Error: No valid scan data available for stitching preview.")
                     return
                 
-                print(f"Generating stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.1f} eV")
+                print(f"Generating stitching preview for group {group_idx+1}: {group['sample_name']} at {energy:.2f} eV")
                 
                 # Print open beam information (enhanced with range warning)
                 if use_open_beam and open_beam_intensity is not None:
                     status = "APPLIED" if is_within_range else "APPLIED (EXTRAPOLATED)"
-                    print(f"Open beam I₀({energy:.1f} eV) = {open_beam_intensity:.3e} ({status})")
+                    print(f"Open beam I₀({energy:.2f} eV) = {open_beam_intensity:.3e} ({status})")
                     if not is_within_range:
                         print(f"⚠️  WARNING: Using extrapolation - energy is {distance:.1f} eV outside open beam range!")
                 else:
@@ -2006,7 +2006,7 @@ class RSoXRTrimWidget:
                 # Set labels and titles
                 ax1.set_xlabel('Angle (degrees)')
                 ax1.set_ylabel('Intensity')  # Raw scans always show raw intensity
-                ax1.set_title(f'Raw Scans (Trimmed & BG Corrected) - {energy:.1f} eV')
+                ax1.set_title(f'Raw Scans (Trimmed & BG Corrected) - {energy:.2f} eV')
                 ax1.legend()
                 ax1.grid(True, which="both", ls="--", alpha=0.3)
                 
@@ -2015,7 +2015,7 @@ class RSoXRTrimWidget:
                 title_suffix = ' (Open Beam Corrected)' if use_open_beam else ''
                 if not is_within_range and use_open_beam:
                     title_suffix += ' ⚠️ EXTRAPOLATED'
-                ax2.set_title(f'Stitching Preview{title_suffix} - {energy:.1f} eV')
+                ax2.set_title(f'Stitching Preview{title_suffix} - {energy:.2f} eV')
                 ax2.legend()
                 ax2.grid(True, which="both", ls="--", alpha=0.3)
                 
@@ -2242,7 +2242,7 @@ class RSoXRTrimWidget:
         # Process the group with current settings
         with self.output_area:
             clear_output(wait=True)
-            print(f"Processing group {group_idx+1}: {group['sample_name']} at {group['energy']:.1f} eV")
+            print(f"Processing group {group_idx+1}: {group['sample_name']} at {group['energy']:.2f} eV")
             print(f"Scan numbers: {', '.join(f'#{num}' for num in group['scan_numbers'])}")
             print(f"Using trims: {group['trims']}")
             print(f"Using backgrounds: {group['backgrounds']}")
@@ -2268,7 +2268,7 @@ class RSoXRTrimWidget:
             
             try:
                 # Generate output filename
-                output_filename = f"{group['sample_name']}_{group['energy']:.1f}eV.dat"
+                output_filename = f"{group['sample_name']}_{group['energy']:.2f}eV.dat"
                 
                 # Check if the processor has the enhanced open beam method
                 if hasattr(self.processor, 'process_scan_set_with_open_beam_option'):
@@ -2415,7 +2415,7 @@ class RSoXRTrimWidget:
                             'savgol_order': polynomial_order,
                             'remove_zeros': False,  # Already removed
                             'output_dir': output_dir,
-                            'plot_prefix': f"{group['sample_name']}_{group['energy']:.1f}eV",
+                            'plot_prefix': f"{group['sample_name']}_{group['energy']:.2f}eV",
                             'use_open_beam': False  # Already normalized
                         }
                         result = self.processor.reduce_data_with_open_beam_option(**reduce_kwargs)
@@ -2431,7 +2431,7 @@ class RSoXRTrimWidget:
                                 data_to_save = result
                             
                             # Create header with processing info
-                            header = f"# Processed RSoXR data\n# Sample: {group['sample_name']}\n# Energy: {group['energy']:.1f} eV"
+                            header = f"# Processed RSoXR data\n# Sample: {group['sample_name']}\n# Energy: {group['energy']:.2f} eV"
                             header += f"\n# Normalization: {'Open Beam' if use_open_beam_for_processing else 'Standard'}"
                             if use_open_beam_for_processing:
                                 header += f"\n# Open beam I0: {open_beam_intensity:.3e}"
@@ -2516,7 +2516,7 @@ class RSoXRTrimWidget:
                         'savgol_order': polynomial_order,
                         'remove_zeros': self.remove_zeros_checkbox.value,
                         'output_dir': output_dir,
-                        'plot_prefix': f"{group['sample_name']}_{group['energy']:.1f}eV",
+                        'plot_prefix': f"{group['sample_name']}_{group['energy']:.2f}eV",
                         'use_open_beam': use_open_beam  # Explicitly control open beam
                     }
                     # Check if processor supports scaling_overrides
@@ -2638,7 +2638,7 @@ class RSoXRTrimWidget:
                             data_to_save = result
                         
                         # Create header with processing info
-                        header = f"# Processed RSoXR data\n# Sample: {group['sample_name']}\n# Energy: {group['energy']:.1f} eV"
+                        header = f"# Processed RSoXR data\n# Sample: {group['sample_name']}\n# Energy: {group['energy']:.2f} eV"
                         header += f"\n# Normalization: {'Open Beam' if use_open_beam else 'Standard'}"
                         if use_open_beam:
                             open_beam_intensity = self.processor.get_open_beam_intensity(group['energy'])
@@ -2981,10 +2981,10 @@ class RSoXRTrimWidget:
         # Create HTML formatted warning message
         if energy < min_energy:
             position = "BELOW"
-            closest = f"(minimum open beam energy: {min_energy:.1f} eV)"
+            closest = f"(minimum open beam energy: {min_energy:.2f} eV)"
         else:
             position = "ABOVE" 
-            closest = f"(maximum open beam energy: {max_energy:.1f} eV)"
+            closest = f"(maximum open beam energy: {max_energy:.2f} eV)"
         
         warning_html = f"""
         <div style="border: 3px solid red; background-color: #ffebee; padding: 15px; margin: 10px 0;">
@@ -2992,11 +2992,11 @@ class RSoXRTrimWidget:
                 ⚠️ ENERGY OUT OF OPEN BEAM RANGE WARNING ⚠️
             </h3>
             <p style="color: red; font-weight: bold; font-size: 14px; margin: 5px 0; text-align: center;">
-                Current energy: <span style="font-size: 16px;">{energy:.1f} eV</span> is 
+                Current energy: <span style="font-size: 16px;">{energy:.2f} eV</span> is 
                 <span style="font-size: 16px;">{position}</span> the open beam data range!
             </p>
             <p style="color: red; font-weight: bold; font-size: 14px; margin: 5px 0; text-align: center;">
-                Open beam range: {min_energy:.1f} - {max_energy:.1f} eV
+                Open beam range: {min_energy:.2f} - {max_energy:.2f} eV
             </p>
             <p style="color: red; font-weight: bold; font-size: 14px; margin: 5px 0; text-align: center;">
                 Distance from range: <span style="font-size: 16px;">{distance:.1f} eV</span> {closest}
@@ -3013,8 +3013,8 @@ class RSoXRTrimWidget:
         
         # Also print to console
         print(f"\n{'='*80}")
-        print(f"🚨 WARNING: ENERGY {energy:.1f} eV IS {position} OPEN BEAM RANGE! 🚨")
-        print(f"Open beam range: {min_energy:.1f} - {max_energy:.1f} eV")
+        print(f"🚨 WARNING: ENERGY {energy:.2f} eV IS {position} OPEN BEAM RANGE! 🚨")
+        print(f"Open beam range: {min_energy:.2f} - {max_energy:.2f} eV")
         print(f"Distance from range: {distance:.1f} eV")
         print(f"Using extrapolation - results may be unreliable!")
         print(f"{'='*80}\n")
