@@ -672,7 +672,7 @@ class RSoXRProcessor:
             else:
                 ax1.set_ylabel('Intensity')
                 
-            ax1.set_title(f'Raw RSoXR Data - {energy:.1f} eV')
+            ax1.set_title(f'Raw RSoXR Data - {energy:.2f} eV')
             ax1.legend()
             ax1.grid(True, which="both", ls="--", alpha=0.3)
             
@@ -697,7 +697,7 @@ class RSoXRProcessor:
             else:
                 ax2.set_ylabel('Reflectivity')
                 
-            ax2.set_title(f'Reduced RSoXR Data - {energy:.1f} eV')
+            ax2.set_title(f'Reduced RSoXR Data - {energy:.2f} eV')
             ax2.legend()
             ax2.grid(True, which="both", ls="--", alpha=0.3)
             
@@ -707,7 +707,7 @@ class RSoXRProcessor:
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
                 if plot_prefix is None:
-                    plot_prefix = f"reflectivity_{energy:.1f}eV"
+                    plot_prefix = f"reflectivity_{energy:.2f}eV"
                 plot_filename = f"{plot_prefix}_combined.png"
                 plot_path = os.path.join(output_dir, plot_filename)
                 plt.savefig(plot_path, dpi=150)
@@ -718,7 +718,7 @@ class RSoXRProcessor:
             # Save both raw and smoothed data if smoothing was applied
         if output_dir:
             if plot_prefix is None:
-                plot_prefix = f"reflectivity_{energy:.1f}eV"
+                plot_prefix = f"reflectivity_{energy:.2f}eV"
             
             # Always save raw data
             raw_data_filename = f"{plot_prefix}_raw.dat"
@@ -849,7 +849,7 @@ class RSoXRProcessor:
             plot_prefix = os.path.splitext(os.path.basename(output_filename))[0]
         elif plot_prefix is None:
             # Default prefix based on energy
-            plot_prefix = f"{scan_group['sample_name']}_{energy:.1f}eV"
+            plot_prefix = f"{scan_group['sample_name']}_{energy:.2f}eV"
         
         # Validate smoothing parameters if smoothing is enabled
         if smooth_data:
@@ -907,7 +907,7 @@ class RSoXRProcessor:
                 output_path = output_filename
             
             # Save the processed data
-            header = f"# Processed RSoXR data\n# Sample: {scan_group['sample_name']}\n# Energy: {energy:.1f} eV\n# Columns: Angle(deg), Reflectivity"
+            header = f"# Processed RSoXR data\n# Sample: {scan_group['sample_name']}\n# Energy: {energy:.2f} eV\n# Columns: Angle(deg), Reflectivity"
             
             # Add background information to header (NEW)
             bg_info = [f"File {i+1}: -{bg:.3f}" for i, bg in enumerate(actual_backgrounds) if bg != 0.0]
@@ -927,7 +927,7 @@ class RSoXRProcessor:
                     
                 sample_name = scan_group['sample_name']
                 energy = scan_group['energy']
-                meta_filename = f"{log_file_base}_{sample_name}_{energy:.1f}eV_metadata.csv"
+                meta_filename = f"{log_file_base}_{sample_name}_{energy:.2f}eV_metadata.csv"
                 
                 if output_dir:
                     meta_path = os.path.join(output_dir, meta_filename)
@@ -985,7 +985,7 @@ class RSoXRProcessor:
                             
                         sample_name = scan_group['sample_name']
                         energy = scan_group['energy']
-                        meta_filename = f"{log_file_base}_{sample_name}_{energy:.1f}eV_metadata.csv"
+                        meta_filename = f"{log_file_base}_{sample_name}_{energy:.2f}eV_metadata.csv"
                         
                         if output_dir:
                             meta_path = os.path.join(output_dir, meta_filename)
@@ -1231,7 +1231,7 @@ class RSoXRProcessor:
             
             ax1.set_xlabel('Angle (degrees)')
             ax1.set_ylabel('Intensity')
-            ax1.set_title(f'Individual Scans (Background Corrected) - {energy:.1f} eV')
+            ax1.set_title(f'Individual Scans (Background Corrected) - {energy:.2f} eV')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             ax1.set_yscale('log')
@@ -1240,7 +1240,7 @@ class RSoXRProcessor:
             ax2.plot(final_data[:, 0], final_data[:, 1], 'b-', linewidth=2, label='Combined Data')
             ax2.set_xlabel('Q (Å⁻¹)')
             ax2.set_ylabel('Intensity')
-            ax2.set_title(f'Final Combined Data - {energy:.1f} eV')
+            ax2.set_title(f'Final Combined Data - {energy:.2f} eV')
             ax2.legend()
             ax2.grid(True, alpha=0.3)
             ax2.set_yscale('log')
@@ -1274,7 +1274,7 @@ class RSoXRProcessor:
         trims_sets : list of lists of tuples
             List of lists of trim settings for each scan set
         output_template : str
-            Template for output filenames, e.g. "output_{energy:.1f}eV.dat"
+            Template for output filenames, e.g. "output_{energy:.2f}eV.dat"
         normalize : bool
             Whether to normalize the reflectivity
         plot : bool
@@ -1701,7 +1701,7 @@ class RSoXRProcessor:
         print("=" * 100)
         
         for i, group in enumerate(scan_groups):
-            print(f"\nGroup {i+1}: {group['sample_name']} ({group['energy']:.1f} eV)")
+            print(f"\nGroup {i+1}: {group['sample_name']} ({group['energy']:.2f} eV)")
             print(f"Position: ({group['x']:.2f}, {group['y']:.2f})")
             print(f"Files: {len(group['files'])}")
             
@@ -1984,7 +1984,7 @@ class RSoXRProcessor:
             if group['min_angle'] is not None and group['max_angle'] is not None:
                 angle_range_str = f"{group['min_angle']:.2f} - {group['max_angle']:.2f}°"
             
-            print(f"{i+1:3} | {group['sample_name']:12} | {group['energy']:10.1f} | {position_str:20} | {angle_range_str:15} | {len(group['files']):8} | {detector_str}")
+            print(f"{i+1:3} | {group['sample_name']:12} | {group['energy']:10.2f} | {position_str:20} | {angle_range_str:15} | {len(group['files']):8} | {detector_str}")
         
         print("=" * 115)
         
@@ -2165,7 +2165,7 @@ class RSoXRProcessor:
                 
         return trims
     
-    def process_auto_groups(self, scan_groups, output_template="{sample_name}_{energy:.1f}eV.dat", 
+    def process_auto_groups(self, scan_groups, output_template="{sample_name}_{energy:.2f}eV.dat", 
                       normalize=True, plot=True, convert_to_photons=False, trims=None, 
                       output_dir=None, plot_prefix_template=None, save_metadata=True,
                       estimate_thickness=True, min_prominence=0.1, 
@@ -2232,7 +2232,7 @@ class RSoXRProcessor:
             print(f"Output will be saved to directory: {output_dir}")
         
         for i, group in enumerate(scan_groups):
-            print(f"\nProcessing group {i+1}/{len(scan_groups)}: {group['sample_name']} at {group['energy']:.1f} eV")
+            print(f"\nProcessing group {i+1}/{len(scan_groups)}: {group['sample_name']} at {group['energy']:.2f} eV")
             
             # Generate output filename from template
             output_filename = output_template.format(
@@ -2528,7 +2528,7 @@ class RSoXRProcessor:
             log_file_base = os.path.splitext(os.path.basename(self.log_file))[0]
         
         # Create metadata output name
-        output_filename = f"{log_file_base}_{sample_name}_{energy:.1f}eV_metadata"
+        output_filename = f"{log_file_base}_{sample_name}_{energy:.2f}eV_metadata"
         
         # Create output directory if needed
         if output_dir:
@@ -2725,8 +2725,8 @@ class RSoXRProcessor:
             group = scan_groups[idx]
             if abs(group['energy'] - base_energy) > energy_tolerance:
                 print(f"Warning: Energy mismatch between groups. "
-                        f"Base: {base_energy:.1f} eV, "
-                        f"Group {idx+1}: {group['energy']:.1f} eV")
+                        f"Base: {base_energy:.2f} eV, "
+                        f"Group {idx+1}: {group['energy']:.2f} eV")
         
         # Combine all files, metadata, trims, and scan numbers
         combined_files = list(base_group['files'])
@@ -3063,7 +3063,7 @@ class RSoXRProcessor:
             if group.get('min_angle') is not None and group.get('max_angle') is not None:
                 angle_range_str = f"{group['min_angle']:.2f} - {group['max_angle']:.2f}°"
             
-            print(f"{i+1:3} | {group['sample_name']:12} | {group['energy']:10.1f} | {position_str:20} | {angle_range_str:15} | {len(group['files']):8} | {detector_str}")
+            print(f"{i+1:3} | {group['sample_name']:12} | {group['energy']:10.2f} | {position_str:20} | {angle_range_str:15} | {len(group['files']):8} | {detector_str}")
             
             # Show detailed file information if requested
             if show_details:
@@ -3414,13 +3414,13 @@ class RSoXRProcessor:
             
             # Check if extrapolation was used (warn user)
             if energy < energy_values.min() or energy > energy_values.max():
-                print(f"Warning: Energy {energy:.1f} eV is outside open beam data range "
-                    f"({energy_values.min():.1f} - {energy_values.max():.1f} eV). Using extrapolation.")
+                print(f"Warning: Energy {energy:.2f} eV is outside open beam data range "
+                    f"({energy_values.min():.2f} - {energy_values.max():.2f} eV). Using extrapolation.")
             
             return intensity
             
         except Exception as e:
-            print(f"Error interpolating open beam intensity at {energy:.1f} eV: {str(e)}")
+            print(f"Error interpolating open beam intensity at {energy:.2f} eV: {str(e)}")
             return None
 
 
@@ -3512,12 +3512,12 @@ class RSoXRProcessor:
             open_beam_intensity = self.get_open_beam_intensity(energy)
             
             if open_beam_intensity is None or open_beam_intensity <= 0:
-                print(f"Warning: Invalid open beam intensity at {energy:.1f} eV. Using standard normalization.")
+                print(f"Warning: Invalid open beam intensity at {energy:.2f} eV. Using standard normalization.")
                 normalized_data = intensity_data / np.max(intensity_data)
                 print("Applied standard normalization (fallback)")
             else:
                 normalized_data = intensity_data / open_beam_intensity
-                print(f"Applied open beam normalization at {energy:.1f} eV (I0 = {open_beam_intensity:.3e})")
+                print(f"Applied open beam normalization at {energy:.2f} eV (I0 = {open_beam_intensity:.3e})")
         else:
             # Use standard normalization
             normalized_data = intensity_data / np.max(intensity_data)
@@ -3563,7 +3563,7 @@ class RSoXRProcessor:
             if apply_open_beam:
                 open_beam_intensity = self.get_open_beam_intensity(energy)
                 if open_beam_intensity is None or open_beam_intensity <= 0:
-                    print(f"Warning: Invalid open beam intensity at {energy:.1f} eV. Disabling open beam correction.")
+                    print(f"Warning: Invalid open beam intensity at {energy:.2f} eV. Disabling open beam correction.")
                     apply_open_beam = False
             
             # Process the first scan - CORRECT ORDER matching preview
@@ -3804,7 +3804,7 @@ class RSoXRProcessor:
             
             ax1.set_xlabel('Angle (degrees)')
             ax1.set_ylabel('Intensity')
-            ax1.set_title(f'Individual Scans (Background Corrected) - {energy:.1f} eV')
+            ax1.set_title(f'Individual Scans (Background Corrected) - {energy:.2f} eV')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             ax1.set_yscale('log')
@@ -3816,7 +3816,7 @@ class RSoXRProcessor:
             ax2.plot(final_data[:, 0], final_data[:, 1], 'b-', linewidth=2, label=f'Combined Data')
             ax2.set_xlabel('Q (Å⁻¹)')
             ax2.set_ylabel('Normalized Intensity')
-            ax2.set_title(f'Final Combined Data ({norm_type}) - {energy:.1f} eV')
+            ax2.set_title(f'Final Combined Data ({norm_type}) - {energy:.2f} eV')
             ax2.legend()
             ax2.grid(True, alpha=0.3)
             ax2.set_yscale('log')
@@ -3825,7 +3825,7 @@ class RSoXRProcessor:
             if use_open_beam and hasattr(self, 'open_beam_data') and self.open_beam_data is not None:
                 open_beam_intensity = self.get_open_beam_intensity(energy)
                 if open_beam_intensity:
-                    ax2.text(0.05, 0.95, f'I₀({energy:.1f} eV) = {open_beam_intensity:.3e}', 
+                    ax2.text(0.05, 0.95, f'I₀({energy:.2f} eV) = {open_beam_intensity:.3e}', 
                             transform=ax2.transAxes, verticalalignment='top',
                             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
             
@@ -3906,7 +3906,7 @@ class RSoXRProcessor:
             plot_prefix = os.path.splitext(os.path.basename(output_filename))[0]
         elif plot_prefix is None:
             # Default prefix based on energy
-            plot_prefix = f"{scan_group['sample_name']}_{energy:.1f}eV"
+            plot_prefix = f"{scan_group['sample_name']}_{energy:.2f}eV"
         
         # Use the enhanced reduce_data method with open beam option AND PLOTTING
         result = self.reduce_data_with_open_beam_option(
@@ -4146,13 +4146,13 @@ class RSoXRProcessor:
             
             # Set plot prefix if not provided
             if plot_prefix is None:
-                plot_prefix = f"{group['sample_name']}_{energy:.1f}eV"
+                plot_prefix = f"{group['sample_name']}_{energy:.2f}eV"
             
             # Set output filename if not provided and saving is enabled
             if save_data and output_filename is None:
-                output_filename = f"{group['sample_name']}_{energy:.1f}eV.dat"
+                output_filename = f"{group['sample_name']}_{energy:.2f}eV.dat"
             
-            print(f"Using group {group_number}: {group['sample_name']} at {energy:.1f} eV")
+            print(f"Using group {group_number}: {group['sample_name']} at {energy:.2f} eV")
             print(f"Scan numbers: {group.get('scan_numbers', 'N/A')}")
             
             # Show if parameters were overridden
@@ -4226,13 +4226,13 @@ class RSoXRProcessor:
             try:
                 open_beam_intensity = self.get_open_beam_intensity(energy)
                 if open_beam_intensity is None:
-                    print(f"Warning: Could not get open beam intensity at {energy:.1f} eV")
+                    print(f"Warning: Could not get open beam intensity at {energy:.2f} eV")
                     use_open_beam = False
             except Exception as e:
                 print(f"Warning: Error getting open beam intensity: {str(e)}")
                 use_open_beam = False
         
-        print(f"Processing {len(scans)} scans at {energy:.1f} eV")
+        print(f"Processing {len(scans)} scans at {energy:.2f} eV")
         print(f"Trims: {trims}")
         print(f"Backgrounds: {backgrounds}")
         print(f"Scaling factors: {scaling_factors}")
@@ -4402,7 +4402,7 @@ class RSoXRProcessor:
                 ax1.set_ylabel('Intensity / I₀')
             else:
                 ax1.set_ylabel('Intensity')
-            ax1.set_title(f'Individual Scans (Processed) - {energy:.1f} eV')
+            ax1.set_title(f'Individual Scans (Processed) - {energy:.2f} eV')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             if log_scale:
@@ -4419,7 +4419,7 @@ class RSoXRProcessor:
             title_suffix = ''
             if use_open_beam:
                 title_suffix = ' (Open Beam Corrected)'
-            ax2.set_title(f'Final Combined Data{title_suffix} - {energy:.1f} eV')
+            ax2.set_title(f'Final Combined Data{title_suffix} - {energy:.2f} eV')
             ax2.legend()
             ax2.grid(True, alpha=0.3)
             if log_scale:
@@ -4427,7 +4427,7 @@ class RSoXRProcessor:
             
             # Add open beam info if available
             if use_open_beam and open_beam_intensity:
-                ax2.text(0.05, 0.95, f'I₀({energy:.1f} eV) = {open_beam_intensity:.3e}', 
+                ax2.text(0.05, 0.95, f'I₀({energy:.2f} eV) = {open_beam_intensity:.3e}', 
                         transform=ax2.transAxes, verticalalignment='top',
                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
             
@@ -4445,7 +4445,7 @@ class RSoXRProcessor:
             
             # Print summary information
             print("\nProcessing Summary:")
-            print(f"• Energy: {energy:.1f} eV")
+            print(f"• Energy: {energy:.2f} eV")
             print(f"• Number of scans combined: {len(all_scans)}")
             print(f"• Background subtractions applied: {sum(1 for bg in backgrounds if bg != 0.0)}")
             print(f"• Manual scaling factors: {scaling_factors}")
@@ -4599,13 +4599,13 @@ class RSoXRProcessor:
             
             # Set plot prefix if not provided
             if plot_prefix is None:
-                plot_prefix = f"{group['sample_name']}_{energy:.1f}eV"
+                plot_prefix = f"{group['sample_name']}_{energy:.2f}eV"
             
             # Set output filename if not provided and saving is enabled
             if save_data and output_filename is None:
-                output_filename = f"{group['sample_name']}_{energy:.1f}eV.dat"
+                output_filename = f"{group['sample_name']}_{energy:.2f}eV.dat"
             
-            print(f"Using group {group_number}: {group['sample_name']} at {energy:.1f} eV")
+            print(f"Using group {group_number}: {group['sample_name']} at {energy:.2f} eV")
             print(f"Scan numbers: {group.get('scan_numbers', 'N/A')}")
             
             # Show if parameters were overridden
@@ -4679,13 +4679,13 @@ class RSoXRProcessor:
             try:
                 open_beam_intensity = self.get_open_beam_intensity(energy)
                 if open_beam_intensity is None:
-                    print(f"Warning: Could not get open beam intensity at {energy:.1f} eV")
+                    print(f"Warning: Could not get open beam intensity at {energy:.2f} eV")
                     use_open_beam = False
             except Exception as e:
                 print(f"Warning: Error getting open beam intensity: {str(e)}")
                 use_open_beam = False
         
-        print(f"Processing {len(scans)} scans at {energy:.1f} eV")
+        print(f"Processing {len(scans)} scans at {energy:.2f} eV")
         print(f"Trims: {trims}")
         print(f"Backgrounds: {backgrounds}")
         print(f"Scaling factors: {scaling_factors}")
@@ -4865,7 +4865,7 @@ class RSoXRProcessor:
                 ax1.set_ylabel('Intensity / I₀')
             else:
                 ax1.set_ylabel('Intensity')
-            ax1.set_title(f'Individual Scans (Processed) - {energy:.1f} eV')
+            ax1.set_title(f'Individual Scans (Processed) - {energy:.2f} eV')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             if log_scale:
@@ -4882,7 +4882,7 @@ class RSoXRProcessor:
             title_suffix = ''
             if use_open_beam:
                 title_suffix = ' (Open Beam Corrected)'
-            ax2.set_title(f'Final Combined Data{title_suffix} - {energy:.1f} eV')
+            ax2.set_title(f'Final Combined Data{title_suffix} - {energy:.2f} eV')
             ax2.legend()
             ax2.grid(True, alpha=0.3)
             if log_scale:
@@ -4890,7 +4890,7 @@ class RSoXRProcessor:
             
             # Add open beam info if available
             if use_open_beam and open_beam_intensity:
-                ax2.text(0.05, 0.95, f'I₀({energy:.1f} eV) = {open_beam_intensity:.3e}', 
+                ax2.text(0.05, 0.95, f'I₀({energy:.2f} eV) = {open_beam_intensity:.3e}', 
                         transform=ax2.transAxes, verticalalignment='top',
                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
             
@@ -4908,7 +4908,7 @@ class RSoXRProcessor:
             
             # Print summary information
             print("\nProcessing Summary:")
-            print(f"• Energy: {energy:.1f} eV")
+            print(f"• Energy: {energy:.2f} eV")
             print(f"• Number of scans combined: {len(all_scans)}")
             print(f"• Background subtractions applied: {sum(1 for bg in backgrounds if bg != 0.0)}")
             print(f"• Manual scaling factors: {scaling_factors}")
@@ -4953,7 +4953,7 @@ class RSoXRProcessor:
             
             # Set default filename if not provided
             if output_filename is None:
-                output_filename = f"processed_data_{energy:.1f}eV.dat"
+                output_filename = f"processed_data_{energy:.2f}eV.dat"
             
             # Construct full path
             output_path = os.path.join(output_dir, output_filename)
@@ -5006,7 +5006,7 @@ class RSoXRProcessor:
         
         print(f"\nGroup {group_number} Information:")
         print(f"Sample Name: {group['sample_name']}")
-        print(f"Energy: {group['energy']:.1f} eV")
+        print(f"Energy: {group['energy']:.2f} eV")
         print(f"Position: ({group['x']:.2f}, {group['y']:.2f})")
         print(f"Number of scans: {len(group['files'])}")
         

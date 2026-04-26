@@ -1523,8 +1523,11 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
         fig, ax = plt.subplots(1, 1, figsize=figsize)
         ax_peaks = None
     
-    # Get peak names and set up colors
-    peak_names = get_peak_names(peak_params)
+    # Get peak names sorted by energy so legend and stacked curves follow energy order
+    peak_names = sorted(
+        get_peak_names(peak_params),
+        key=lambda n: float(peak_params[f"{n}_energy"]),
+    )
     n_peaks = len(peak_names)
     
     if peak_colors is None:
@@ -1564,7 +1567,6 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
         total_spectrum += edge_contribution
     
     # Add Gaussian peaks to total
-    peak_names = get_peak_names(peak_params)
     for peak_name in peak_names:
         width = peak_params[f"{peak_name}_width"]
         height = peak_params[f"{peak_name}_height"]
@@ -1638,7 +1640,7 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
     ax.set_ylabel('Intensity (arb. units)', fontsize=12)
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper left', fontsize=10) #bbox_to_anchor=(1.05, 1),
+    ax.legend(loc='upper right', fontsize=10)
 
     if ax_peaks is not None:
         ax_peaks.set_xlabel('Energy (eV)', fontsize=12)
