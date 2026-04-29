@@ -31,7 +31,9 @@ from Model_Setup import (
     batch_fit_selected_models_v2,
 )
 from h5io import (save_batch_to_h5, load_h5_objectives, get_h5_info,
-                  plot_parameter_vs_energy, plot_reflectivity)
+                  plot_parameter_vs_energy, plot_reflectivity,
+                  save_nexafs_to_h5, update_nexafs_sld,
+                  load_nexafs_from_h5, list_nexafs_spectra)
  
 
 # ---------------------------------------------------------------------------

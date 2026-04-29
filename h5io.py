@@ -119,6 +119,15 @@ def _decode_strings(arr):
     return [s if isinstance(s, str) else s.decode('utf-8') for s in arr]
 
 
+def _is_energy_key(key):
+    """Return True if *key* is a valid float string (energy group), not 'nexafs' etc."""
+    try:
+        float(key)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def _reconstruct_objective(layer_names, final_slabs,
                             param_names, final_values, final_lb, final_ub, final_vary,
                             q, R, dR, transform='logY'):
@@ -370,7 +379,7 @@ def load_h5_objectives(filepath, sample_name, model_name,
             raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
         sample_grp = f[sample_name]
 
-        available = list(sample_grp.keys())
+        available = [k for k in sample_grp.keys() if _is_energy_key(k)]
         if energy_list is not None:
             wanted = {str(float(e)) for e in energy_list}
             available = [k for k in available if k in wanted]
@@ -470,6 +479,12 @@ def plot_parameter_vs_energy(
     energy_list=None,
     show_bounds=False,
     bound_tol_pct=10.0,
+    show_gof=False,
+    reference_data=None,
+    reference_label='Reference',
+    nexafs_spectrum=None,
+    nexafs_component='real',
+    nexafs_label=None,
     figsize=None,
     xlim=None,
     ylim=None,
@@ -500,20 +515,65 @@ def plot_parameter_vs_energy(
         For a finite [lb, ub] interval the percentage is relative to
         (ub − lb); for a one-sided bound it is relative to that bound's
         absolute value.  Set to 0 to disable.  Default 10.
+    show_gof : bool
+        If True, add a linked subplot below the main axes showing chi_sq_final
+        vs. energy for each model (x-axes are shared so ticks align).
+        A new figure is always created when show_gof is True; the *ax* argument
+        is ignored in that case.  Default False.
+    reference_data : array-like (N, 2), str, Path, or DataFrame, optional
+        Reference values overlaid on the main plot as a dashed black line.
+        Accepted formats:
+        * str or Path — CSV file; first column energy, second column value.
+        * ndarray / list — shape (N, 2), column 0 energy, column 1 value.
+        * pandas DataFrame — first two columns used.
+        Default None (no reference line).
+    reference_label : str
+        Legend label for the reference line.  Default ``'Reference'``.
+    nexafs_spectrum : str, optional
+        Name of a NEXAFS spectrum stored in the same HDF5 file under
+        ``/{sample_name}/nexafs/``.  If given, the selected SLD component is
+        overlaid on the main plot.  Default None (no overlay).
+    nexafs_component : 'real' | 'imag'
+        Which SLD component to plot.  Default ``'real'``.
+    nexafs_label : str, optional
+        Legend label for the NEXAFS line.  Defaults to
+        ``'{nexafs_spectrum} (real SLD)'`` or ``'{nexafs_spectrum} (imag SLD)'``.
     figsize : (width, height), optional
+        Total figure size.  When show_gof is True defaults to ``(10, 6)``.
     xlim : (xmin, xmax), optional
     ylim : (ymin, ymax), optional
+        Applied to the main (parameter) axes only.
     ax : matplotlib.axes.Axes, optional
-        Axes to draw into; if None a new figure is created.
+        Axes to draw into; ignored when show_gof is True.
 
     Returns
     -------
     ax : matplotlib.axes.Axes
+        The main parameter axes.  Returned when show_gof is False.
+    (ax_main, ax_gof) : tuple of matplotlib.axes.Axes
+        Main axes and goodness-of-fit axes.  Returned when show_gof is True.
     """
     import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    from pathlib import Path as _Path
 
     if isinstance(model_names, str):
         model_names = [model_names]
+
+    # ---- parse reference data -----------------------------------------------
+    ref_E = ref_V = None
+    if reference_data is not None:
+        if isinstance(reference_data, (str, _Path)):
+            import pandas as _pd
+            _df = _pd.read_csv(reference_data)
+            ref_E = _df.iloc[:, 0].to_numpy(dtype=float)
+            ref_V = _df.iloc[:, 1].to_numpy(dtype=float)
+        elif hasattr(reference_data, 'iloc'):
+            ref_E = reference_data.iloc[:, 0].to_numpy(dtype=float)
+            ref_V = reference_data.iloc[:, 1].to_numpy(dtype=float)
+        else:
+            _arr  = np.asarray(reference_data, dtype=float)
+            ref_E, ref_V = _arr[:, 0], _arr[:, 1]
 
     # ---- collect data from HDF5 (file closed before any plotting) ----------
     model_data = {}
@@ -522,14 +582,14 @@ def plot_parameter_vs_energy(
             raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
         sample_grp = f[sample_name]
 
-        energy_keys = sorted(sample_grp.keys(), key=float)
+        energy_keys = sorted([k for k in sample_grp.keys() if _is_energy_key(k)], key=float)
         if energy_list is not None:
             wanted = {str(float(e)) for e in energy_list}
             energy_keys = [k for k in energy_keys if k in wanted]
 
         for mname in model_names:
             mdata = {'energies': [], 'values': [], 'lbs': [], 'ubs': [],
-                     'near_bound': []}
+                     'near_bound': [], 'chi_sq': []}
 
             for ekey in energy_keys:
                 energy_grp = sample_grp[ekey]
@@ -557,7 +617,8 @@ def plot_parameter_vs_energy(
                     raise ValueError(
                         f"criteria must be 'best', 'last', or int — got {criteria!r}")
 
-                pg = model_grp[rkey]['parameters']
+                rg = model_grp[rkey]
+                pg = rg['parameters']
                 pnames = _decode_strings(pg['names'][:])
                 if param_name not in pnames:
                     continue
@@ -572,13 +633,43 @@ def plot_parameter_vs_energy(
                 mdata['lbs'].append(lb)
                 mdata['ubs'].append(ub)
                 mdata['near_bound'].append(_near_bound(val, lb, ub, bound_tol_pct))
+                mdata['chi_sq'].append(float(rg.attrs.get('chi_sq_final', np.nan)))
 
             model_data[mname] = mdata
 
-    # ---- plot ---------------------------------------------------------------
-    if ax is None:
-        _, ax = plt.subplots(figsize=figsize)
+        # NEXAFS SLD overlay — read while the file is still open
+        nexafs_E = nexafs_V = None
+        if nexafs_spectrum is not None:
+            if nexafs_component not in ('real', 'imag'):
+                raise ValueError(
+                    f"nexafs_component must be 'real' or 'imag' — got {nexafs_component!r}")
+            npath = f'{sample_name}/nexafs/{nexafs_spectrum}/sld'
+            if npath in f:
+                sg       = f[npath]
+                comp_key = 'sld_real' if nexafs_component == 'real' else 'sld_imag'
+                nexafs_E = sg['energy'][:]
+                nexafs_V = sg[comp_key][:]
+            else:
+                print(f"  Warning: NEXAFS '{nexafs_spectrum}' not found or SLD not "
+                      f"computed in {filepath} — overlay skipped.")
 
+    # ---- figure / axes setup ------------------------------------------------
+    if show_gof:
+        if figsize is None:
+            figsize = (10, 6)
+        fig = plt.figure(figsize=figsize)
+        gs = gridspec.GridSpec(2, 1, height_ratios=[3, 1], hspace=0.05)
+        ax_main = fig.add_subplot(gs[0])
+        ax_gof  = fig.add_subplot(gs[1], sharex=ax_main)
+        plt.setp(ax_main.get_xticklabels(), visible=False)
+    else:
+        if ax is None:
+            _, ax_main = plt.subplots(figsize=figsize)
+        else:
+            ax_main = ax
+        ax_gof = None
+
+    # ---- main panel ---------------------------------------------------------
     markers = ['o', 's', '^', 'D', 'v', 'P', '*', 'X']
     colors   = plt.rcParams['axes.prop_cycle'].by_key()['color']
     nb_label_used = False
@@ -598,46 +689,71 @@ def plot_parameter_vs_energy(
         UB   = np.array(mdata['ubs'])
         flag = np.array(mdata['near_bound'], dtype=bool)
 
-        # Main line connecting all points in model colour
-        ax.plot(E, V, marker=marker, linestyle='-', color=color,
-                label=mname, zorder=2)
+        ax_main.plot(E, V, marker=marker, linestyle='-', color=color,
+                     label=mname, zorder=2)
 
-        # Near-bound points overlaid in red (single legend entry)
         if bound_tol_pct > 0 and np.any(flag):
             nb_label = '_nolegend_' if nb_label_used else 'near bound'
-            ax.scatter(E[flag], V[flag], c='red', marker=marker,
-                       zorder=3, s=80, label=nb_label)
+            ax_main.scatter(E[flag], V[flag], c='red', marker=marker,
+                            zorder=3, s=80, label=nb_label)
             nb_label_used = True
 
-        # Parameter bounds
         if show_bounds:
-            fin_lb   = np.isfinite(LB)
-            fin_ub   = np.isfinite(UB)
-            both     = fin_lb & fin_ub
-            b_label  = f'{mname} bounds'
+            fin_lb  = np.isfinite(LB)
+            fin_ub  = np.isfinite(UB)
+            both    = fin_lb & fin_ub
+            b_label = f'{mname} bounds'
 
             if np.any(fin_lb):
-                ax.plot(E[fin_lb], LB[fin_lb], linestyle='--',
-                        color=color, alpha=0.6, zorder=1, label=b_label)
+                ax_main.plot(E[fin_lb], LB[fin_lb], linestyle='--',
+                             color=color, alpha=0.6, zorder=1, label=b_label)
                 b_label = '_nolegend_'
             if np.any(fin_ub):
-                ax.plot(E[fin_ub], UB[fin_ub], linestyle='--',
-                        color=color, alpha=0.6, zorder=1, label=b_label)
+                ax_main.plot(E[fin_ub], UB[fin_ub], linestyle='--',
+                             color=color, alpha=0.6, zorder=1, label=b_label)
             if np.any(both):
-                ax.fill_between(E[both], LB[both], UB[both],
-                                color=color, alpha=0.1, zorder=0)
+                ax_main.fill_between(E[both], LB[both], UB[both],
+                                     color=color, alpha=0.1, zorder=0)
 
-    ax.set_xlabel('Energy (eV)')
-    ax.set_ylabel(param_name)
-    ax.set_title(f'{sample_name}  —  {param_name}')
-    ax.legend()
+        # GoF subplot — same colour/marker as main, no duplicate legend needed
+        if ax_gof is not None:
+            chi = np.array(mdata['chi_sq'])
+            ax_gof.plot(E, chi, marker=marker, linestyle='-', color=color,
+                        label=mname if len(model_names) > 1 else '_nolegend_',
+                        zorder=2)
+
+    # Reference line
+    if ref_E is not None:
+        ax_main.plot(ref_E, ref_V, 'k--', lw=1.5, label=reference_label, zorder=1)
+
+    # NEXAFS SLD overlay
+    if nexafs_E is not None:
+        _comp_str = 'real SLD' if nexafs_component == 'real' else 'imag SLD'
+        _nx_label = nexafs_label or f'{nexafs_spectrum} ({_comp_str})'
+        ax_main.plot(nexafs_E, nexafs_V, linestyle='-.', color='dimgray',
+                     lw=1.5, label=_nx_label, zorder=1)
+
+    ax_main.set_ylabel(param_name)
+    ax_main.set_title(f'{sample_name}  —  {param_name}')
+    ax_main.legend()
 
     if xlim is not None:
-        ax.set_xlim(xlim)
+        ax_main.set_xlim(xlim)
     if ylim is not None:
-        ax.set_ylim(ylim)
+        ax_main.set_ylim(ylim)
 
-    return ax
+    if ax_gof is not None:
+        ax_gof.set_xlabel('Energy (eV)')
+        ax_gof.set_ylabel('χ²', fontsize=9)
+        ax_gof.tick_params(labelsize=8)
+        if len(model_names) > 1:
+            ax_gof.legend(fontsize=7)
+        if xlim is not None:
+            ax_gof.set_xlim(xlim)
+        return ax_main, ax_gof
+
+    ax_main.set_xlabel('Energy (eV)')
+    return ax_main
 
 
 def plot_reflectivity(
@@ -705,7 +821,7 @@ def plot_reflectivity(
             raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
         sample_grp = f[sample_name]
 
-        all_keys = sorted(sample_grp.keys(), key=float)
+        all_keys = sorted([k for k in sample_grp.keys() if _is_energy_key(k)], key=float)
 
         if energy_list is not None:
             wanted = {str(float(e)) for e in energy_list}
@@ -852,6 +968,319 @@ def plot_reflectivity(
     return fig, axes_flat[:n_panels]
 
 
+# ---------------------------------------------------------------------------
+# NEXAFS private helpers
+# ---------------------------------------------------------------------------
+
+def _parse_nexafs_input(nexafs_data):
+    """
+    Normalise *nexafs_data* to (energy_arr, intensity_arr, source_str).
+
+    Accepted input types mirror those used by *reference_data* elsewhere:
+    * str / Path → CSV file, first two columns used
+    * DataFrame  → first two columns used
+    * array-like → shape (N, 2), column 0 = energy, column 1 = intensity
+    """
+    from pathlib import Path as _Path
+    if isinstance(nexafs_data, (str, _Path)):
+        import pandas as _pd
+        _df = _pd.read_csv(nexafs_data)
+        return (_df.iloc[:, 0].to_numpy(dtype=float),
+                _df.iloc[:, 1].to_numpy(dtype=float),
+                str(nexafs_data))
+    elif hasattr(nexafs_data, 'iloc'):
+        return (nexafs_data.iloc[:, 0].to_numpy(dtype=float),
+                nexafs_data.iloc[:, 1].to_numpy(dtype=float),
+                '')
+    else:
+        arr = np.asarray(nexafs_data, dtype=float)
+        return arr[:, 0], arr[:, 1], ''
+
+
+def _write_sld_deltabeta(spec_grp, DeltaBeta, SLD,
+                          chemical_formula, density, x_min, x_max):
+    """Write fresh /sld/ and /deltabeta/ sub-groups into an open HDF5 group."""
+    sld_g = spec_grp.create_group('sld')
+    sld_g.attrs['chemical_formula'] = str(chemical_formula)
+    sld_g.attrs['density']          = float(density)
+    sld_g.attrs['x_min']            = float(x_min) if x_min is not None else np.nan
+    sld_g.attrs['x_max']            = float(x_max) if x_max is not None else np.nan
+    sld_g.create_dataset('energy',     data=SLD[:, 0].astype(np.float64))
+    sld_g.create_dataset('sld_real',   data=SLD[:, 1].astype(np.float64))
+    sld_g.create_dataset('sld_imag',   data=SLD[:, 2].astype(np.float64))
+    sld_g.create_dataset('wavelength', data=SLD[:, 3].astype(np.float64))
+
+    db_g = spec_grp.create_group('deltabeta')
+    db_g.attrs['chemical_formula'] = str(chemical_formula)
+    db_g.attrs['density']          = float(density)
+    db_g.attrs['x_min']            = float(x_min) if x_min is not None else np.nan
+    db_g.attrs['x_max']            = float(x_max) if x_max is not None else np.nan
+    db_g.create_dataset('energy', data=DeltaBeta[:, 0].astype(np.float64))
+    db_g.create_dataset('delta',  data=DeltaBeta[:, 1].astype(np.float64))
+    db_g.create_dataset('beta',   data=DeltaBeta[:, 2].astype(np.float64))
+
+
+# ---------------------------------------------------------------------------
+# NEXAFS public API
+# ---------------------------------------------------------------------------
+
+def save_nexafs_to_h5(filepath, sample_name, nexafs_data, spectrum_name,
+                      chemical_formula, density,
+                      x_min=None, x_max=None,
+                      beamline=None, date=None, method=None,
+                      overwrite=False):
+    """
+    Save a NEXAFS spectrum to HDF5 and auto-compute its SLD and DeltaBeta.
+
+    The spectrum is stored under::
+
+        /{sample_name}/nexafs/{spectrum_name}/
+
+    which sits alongside the fitting-results energy groups and never conflicts
+    with them (``"nexafs"`` is not a valid float string).
+
+    Parameters
+    ----------
+    filepath : str or Path
+    sample_name : str
+    nexafs_data : str, Path, array-like (N, 2), or DataFrame
+        Raw NEXAFS data.  If a file path is given it is passed directly to
+        ``process_nexafs_to_SLD``; otherwise the data is stacked into an
+        (N, 2) array that ``calculate_refractive_index`` accepts.
+    spectrum_name : str
+        Unique label for this spectrum under the sample, e.g. ``'SOC_UV'``.
+    chemical_formula : str
+        Chemical formula used for the KK transform, e.g. ``'C8H8'``.
+    density : float
+        Density in g/cc used for the KK transform.
+    x_min, x_max : float, optional
+        Energy window passed to ``process_nexafs_to_SLD``.
+    beamline, date, method : str, optional
+        Freeform metadata stored as HDF5 attributes.
+    overwrite : bool
+        If True, replace an existing spectrum with the same name.
+        Default False (raises ValueError on conflict).
+    """
+    energy_arr, intensity_arr, source_str = _parse_nexafs_input(nexafs_data)
+    spec_path = f'{sample_name}/nexafs/{spectrum_name}'
+
+    with h5py.File(filepath, 'a') as f:
+        if spec_path in f:
+            if not overwrite:
+                raise ValueError(
+                    f"Spectrum '{spectrum_name}' already exists under "
+                    f"'{sample_name}/nexafs/'.  Use overwrite=True to replace.")
+            del f[spec_path]
+
+        spec_grp = f.require_group(spec_path)
+        spec_grp.attrs['timestamp']   = datetime.datetime.now().isoformat()
+        spec_grp.attrs['source_file'] = source_str
+        spec_grp.attrs['beamline']    = beamline or ''
+        spec_grp.attrs['date']        = date     or ''
+        spec_grp.attrs['method']      = method   or ''
+
+        raw_g = spec_grp.create_group('raw')
+        raw_g.create_dataset('energy',    data=energy_arr.astype(np.float64))
+        raw_g.create_dataset('intensity', data=intensity_arr.astype(np.float64))
+
+        # Lazy import — avoids hard dependency on kkcalc at module load time
+        from NEXAFS import process_nexafs_to_SLD
+        input_data = (source_str
+                      if source_str
+                      else np.column_stack([energy_arr, intensity_arr]))
+        DeltaBeta, SLD = process_nexafs_to_SLD(
+            input_data, chemical_formula, density, x_min, x_max)
+
+        _write_sld_deltabeta(spec_grp, DeltaBeta, SLD,
+                             chemical_formula, density, x_min, x_max)
+
+    print(f"Saved NEXAFS '{spectrum_name}' → {filepath}")
+    print(f"  raw: {len(energy_arr)} pts | sld: {len(DeltaBeta)} pts | "
+          f"formula={chemical_formula}, density={density} g/cc")
+
+
+def update_nexafs_sld(filepath, sample_name, spectrum_name,
+                      chemical_formula, density,
+                      x_min=None, x_max=None):
+    """
+    Recompute and overwrite the SLD / DeltaBeta for an existing NEXAFS spectrum.
+
+    The raw data stored in the file is reused; only the /sld/ and /deltabeta/
+    sub-groups are replaced.  The spectrum's other metadata (beamline, date,
+    etc.) is unchanged.
+
+    Parameters
+    ----------
+    filepath : str or Path
+    sample_name : str
+    spectrum_name : str
+    chemical_formula : str
+        New chemical formula for the KK transform.
+    density : float
+        New density in g/cc.
+    x_min, x_max : float, optional
+        Energy window for the KK transform.  Pass None to use the full range.
+    """
+    spec_path = f'{sample_name}/nexafs/{spectrum_name}'
+
+    with h5py.File(filepath, 'a') as f:
+        if spec_path not in f:
+            raise KeyError(
+                f"Spectrum '{spectrum_name}' not found under "
+                f"'{sample_name}/nexafs/'.  Save it first with save_nexafs_to_h5.")
+
+        spec_grp      = f[spec_path]
+        energy_arr    = spec_grp['raw/energy'][:]
+        intensity_arr = spec_grp['raw/intensity'][:]
+
+        for sub in ('sld', 'deltabeta'):
+            if sub in spec_grp:
+                del spec_grp[sub]
+
+        from NEXAFS import process_nexafs_to_SLD
+        arr = np.column_stack([energy_arr, intensity_arr])
+        DeltaBeta, SLD = process_nexafs_to_SLD(
+            arr, chemical_formula, density, x_min, x_max)
+
+        _write_sld_deltabeta(spec_grp, DeltaBeta, SLD,
+                             chemical_formula, density, x_min, x_max)
+
+    print(f"Updated SLD for '{spectrum_name}' in {filepath}")
+    print(f"  formula={chemical_formula}, density={density} g/cc | "
+          f"{len(DeltaBeta)} pts")
+
+
+def load_nexafs_from_h5(filepath, sample_name, spectrum_name=None):
+    """
+    Load NEXAFS data from an HDF5 file.
+
+    Parameters
+    ----------
+    filepath : str or Path
+    sample_name : str
+    spectrum_name : str, optional
+        Name of a specific spectrum.  If None, all spectra are returned.
+
+    Returns
+    -------
+    dict
+        When *spectrum_name* is given: a single result dict.
+        When *spectrum_name* is None: ``{name: result_dict}`` for all spectra.
+
+    Each result dict has the keys::
+
+        {
+          'spectrum_name': str,
+          'raw':           {'energy': ndarray, 'intensity': ndarray},
+          'sld':           {'energy', 'sld_real', 'sld_imag', 'wavelength'},
+          'deltabeta':     {'energy', 'delta', 'beta'},
+          'metadata':      {'chemical_formula', 'density', 'x_min', 'x_max',
+                            'beamline', 'date', 'method',
+                            'timestamp', 'source_file'},
+        }
+
+    ``sld`` and ``deltabeta`` are None if not yet computed.
+    """
+    def _read_spectrum(spec_grp, name):
+        result = {'spectrum_name': name,
+                  'raw': None, 'sld': None, 'deltabeta': None, 'metadata': {}}
+
+        if 'raw' in spec_grp:
+            result['raw'] = {
+                'energy':    spec_grp['raw/energy'][:],
+                'intensity': spec_grp['raw/intensity'][:],
+            }
+
+        if 'sld' in spec_grp:
+            sg = spec_grp['sld']
+            result['sld'] = {
+                'energy':     sg['energy'][:],
+                'sld_real':   sg['sld_real'][:],
+                'sld_imag':   sg['sld_imag'][:],
+                'wavelength': sg['wavelength'][:],
+            }
+
+        if 'deltabeta' in spec_grp:
+            dg = spec_grp['deltabeta']
+            result['deltabeta'] = {
+                'energy': dg['energy'][:],
+                'delta':  dg['delta'][:],
+                'beta':   dg['beta'][:],
+            }
+
+        meta = {k: spec_grp.attrs.get(k, '')
+                for k in ('beamline', 'date', 'method', 'timestamp', 'source_file')}
+        sld_src = spec_grp.get('sld') or spec_grp.get('deltabeta')
+        if sld_src is not None:
+            meta['chemical_formula'] = sld_src.attrs.get('chemical_formula', '')
+            meta['density']          = float(sld_src.attrs.get('density', np.nan))
+            meta['x_min']            = float(sld_src.attrs.get('x_min',    np.nan))
+            meta['x_max']            = float(sld_src.attrs.get('x_max',    np.nan))
+        else:
+            meta.update({'chemical_formula': '', 'density': np.nan,
+                         'x_min': np.nan, 'x_max': np.nan})
+        result['metadata'] = meta
+        return result
+
+    with h5py.File(filepath, 'r') as f:
+        if sample_name not in f:
+            raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
+        nexafs_path = f'{sample_name}/nexafs'
+        if nexafs_path not in f:
+            raise KeyError(f"No NEXAFS data found under '{sample_name}' in {filepath}.")
+        nexafs_grp = f[nexafs_path]
+
+        if spectrum_name is not None:
+            if spectrum_name not in nexafs_grp:
+                raise KeyError(
+                    f"Spectrum '{spectrum_name}' not found under "
+                    f"'{sample_name}/nexafs/'.")
+            return _read_spectrum(nexafs_grp[spectrum_name], spectrum_name)
+
+        return {name: _read_spectrum(nexafs_grp[name], name)
+                for name in nexafs_grp.keys()}
+
+
+def list_nexafs_spectra(filepath, sample_name):
+    """
+    List stored NEXAFS spectra for a sample without loading array data.
+
+    Returns
+    -------
+    list of dict
+        One dict per spectrum with keys:
+        ``spectrum_name, chemical_formula, density, x_min, x_max,
+        beamline, date, method, timestamp, source_file,
+        n_points_raw, n_points_sld``
+    """
+    results = []
+    with h5py.File(filepath, 'r') as f:
+        nexafs_path = f'{sample_name}/nexafs'
+        if nexafs_path not in f:
+            return results
+        for name, spec_grp in f[nexafs_path].items():
+            entry = {'spectrum_name': name}
+            for k in ('beamline', 'date', 'method', 'timestamp', 'source_file'):
+                entry[k] = spec_grp.attrs.get(k, '')
+
+            sld_src = spec_grp.get('sld') or spec_grp.get('deltabeta')
+            if sld_src is not None:
+                entry['chemical_formula'] = sld_src.attrs.get('chemical_formula', '')
+                entry['density']          = float(sld_src.attrs.get('density', np.nan))
+                entry['x_min']            = float(sld_src.attrs.get('x_min',    np.nan))
+                entry['x_max']            = float(sld_src.attrs.get('x_max',    np.nan))
+                entry['n_points_sld'] = (len(sld_src['energy'])
+                                         if 'energy' in sld_src else 0)
+            else:
+                entry.update({'chemical_formula': '', 'density': np.nan,
+                              'x_min': np.nan, 'x_max': np.nan, 'n_points_sld': 0})
+
+            entry['n_points_raw'] = (len(spec_grp['raw/energy'])
+                                     if 'raw/energy' in spec_grp else 0)
+            results.append(entry)
+    return results
+
+
 def get_h5_info(filepath, sample_name=None):
     """
     Inspect an HDF5 results file without loading array data.
@@ -871,6 +1300,8 @@ def get_h5_info(filepath, sample_name=None):
                 continue
             info[skey] = {}
             for ekey, energy_grp in f[skey].items():
+                if not _is_energy_key(ekey):
+                    continue
                 energy_val = float(ekey)
                 info[skey][energy_val] = {}
                 for mkey, model_grp in energy_grp.items():
