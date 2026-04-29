@@ -30,7 +30,9 @@ from Model_Setup import (
     create_model_and_objective,
     batch_fit_selected_models_v2,
 )
-
+from h5io import (save_batch_to_h5, load_h5_objectives, get_h5_info,
+                  plot_parameter_vs_energy, plot_reflectivity)
+ 
 
 # ---------------------------------------------------------------------------
 # Data loading
