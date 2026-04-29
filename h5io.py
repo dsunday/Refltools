@@ -485,6 +485,8 @@ def plot_parameter_vs_energy(
     nexafs_spectrum=None,
     nexafs_component='real',
     nexafs_label=None,
+    refl_energy_shift=0.0,
+    nexafs_energy_shift=0.0,
     figsize=None,
     xlim=None,
     ylim=None,
@@ -538,6 +540,12 @@ def plot_parameter_vs_energy(
     nexafs_label : str, optional
         Legend label for the NEXAFS line.  Defaults to
         ``'{nexafs_spectrum} (real SLD)'`` or ``'{nexafs_spectrum} (imag SLD)'``.
+    refl_energy_shift : float
+        Energy offset in eV added to the fitted reflectivity data points before
+        plotting.  Positive values shift points to higher energies.  Default 0.
+    nexafs_energy_shift : float
+        Energy offset in eV added to the NEXAFS SLD overlay curve before
+        plotting.  Default 0.
     figsize : (width, height), optional
         Total figure size.  When show_gof is True defaults to ``(10, 6)``.
     xlim : (xmin, xmax), optional
@@ -683,7 +691,7 @@ def plot_parameter_vs_energy(
         color  = colors[m_idx % len(colors)]
         marker = markers[m_idx % len(markers)]
 
-        E    = np.array(mdata['energies'])
+        E    = np.array(mdata['energies']) + refl_energy_shift
         V    = np.array(mdata['values'])
         LB   = np.array(mdata['lbs'])
         UB   = np.array(mdata['ubs'])
@@ -730,8 +738,9 @@ def plot_parameter_vs_energy(
     if nexafs_E is not None:
         _comp_str = 'real SLD' if nexafs_component == 'real' else 'imag SLD'
         _nx_label = nexafs_label or f'{nexafs_spectrum} ({_comp_str})'
-        ax_main.plot(nexafs_E, nexafs_V, linestyle='-.', color='dimgray',
-                     lw=1.5, label=_nx_label, zorder=1)
+        ax_main.plot(nexafs_E + nexafs_energy_shift, nexafs_V,
+                     linestyle='-.', color='dimgray', lw=1.5,
+                     label=_nx_label, zorder=1)
 
     ax_main.set_ylabel(param_name)
     ax_main.set_title(f'{sample_name}  —  {param_name}')
@@ -742,8 +751,17 @@ def plot_parameter_vs_energy(
     if ylim is not None:
         ax_main.set_ylim(ylim)
 
+    # Build xlabel — append shift notes on a second line when active
+    _shift_notes = []
+    if refl_energy_shift != 0:
+        _shift_notes.append(f'reflectivity data shifted {refl_energy_shift:+.3g} eV')
+    if nexafs_energy_shift != 0:
+        _shift_notes.append(f'NEXAFS shifted {nexafs_energy_shift:+.3g} eV')
+    _xlabel = ('Energy (eV)\n' + ',  '.join(_shift_notes)
+               if _shift_notes else 'Energy (eV)')
+
     if ax_gof is not None:
-        ax_gof.set_xlabel('Energy (eV)')
+        ax_gof.set_xlabel(_xlabel)
         ax_gof.set_ylabel('χ²', fontsize=9)
         ax_gof.tick_params(labelsize=8)
         if len(model_names) > 1:
@@ -752,7 +770,7 @@ def plot_parameter_vs_energy(
             ax_gof.set_xlim(xlim)
         return ax_main, ax_gof
 
-    ax_main.set_xlabel('Energy (eV)')
+    ax_main.set_xlabel(_xlabel)
     return ax_main
 
 
