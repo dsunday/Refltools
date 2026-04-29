@@ -10,7 +10,8 @@ HDF5 layout
     attrs: energy_eV
     /{model_name}/                   e.g. "Model1"
       /run_0/
-        attrs: chi_sq_initial, chi_sq_final, timestamp, run_index, transform
+        attrs: chi_sq_initial, chi_sq_final, timestamp, run_index, transform,
+               has_mcmc (bool)
         /parameters/
           names           vlen-str  [n_params]
           initial_values  float64   [n_params]
@@ -22,6 +23,9 @@ HDF5 layout
           final_ub        float64   [n_params]
           final_vary      int8      [n_params]
           stderr          float64   [n_params]   (NaN where unavailable)
+          ci_lower        float64   [n_params]   (NaN where unavail; 2.5th pct, MCMC only)
+          ci_upper        float64   [n_params]   (NaN where unavail; 97.5th pct, MCMC only)
+          rhat            float64   [n_params]   (NaN where unavail; Gelman-Rubin, MCMC only)
         /data/
           q    float64 [n_points]
           R    float64 [n_points]
@@ -43,6 +47,12 @@ import h5py
 from refnx.reflect import SLD, Structure, ReflectModel
 from refnx.analysis import Objective, Transform
 from refnx.dataset import ReflectDataset
+
+try:
+    import arviz as az
+    _ARVIZ_AVAILABLE = True
+except ImportError:
+    _ARVIZ_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +96,62 @@ def _extract_param_arrays(objective):
         np.array(varys,  dtype=np.int8),
         np.array(stderrs, dtype=np.float64),
     )
+
+
+def _compute_mcmc_diagnostics(objective, param_names):
+    """
+    Compute 95% CI and Gelman-Rubin R-hat for each parameter from MCMC chains.
+
+    Uses ``param.chain`` set on each Parameter by refnx's ``process_chain``
+    after ``CurveFitter.sample()``.  Chain shape is ``(steps, nwalkers)`` for
+    standard emcee.
+
+    Parameters
+    ----------
+    objective : refnx.analysis.Objective
+    param_names : list of str
+        Names in the same order as ``_extract_param_arrays`` returns.
+
+    Returns
+    -------
+    ci_lower, ci_upper, rhat : float64 arrays of length len(param_names)
+        NaN for fixed or un-sampled parameters.
+    """
+    n = len(param_names)
+    ci_lower = np.full(n, np.nan)
+    ci_upper = np.full(n, np.nan)
+    rhat     = np.full(n, np.nan)
+
+    params = list(objective.parameters.flattened(unique=True))
+    if len(params) != n:
+        return ci_lower, ci_upper, rhat
+
+    for i, p in enumerate(params):
+        chain = getattr(p, 'chain', None)
+        if not p.vary or chain is None or chain.size == 0:
+            continue
+
+        # Flatten all walkers/steps into a 1-D sample for percentiles
+        flat = chain.ravel()
+        lo, hi = np.percentile(flat, [2.5, 97.5])
+        ci_lower[i] = lo
+        ci_upper[i] = hi
+
+        # R-hat requires the un-flattened (chains, draws) shape
+        if _ARVIZ_AVAILABLE and chain.ndim == 2:
+            # chain shape: (steps, nwalkers) → transpose to (nwalkers, steps)
+            n_chains = chain.shape[1]
+            if n_chains >= 2:
+                try:
+                    result = az.rhat({"x": chain.T})
+                    rhat[i] = float(result["x"].values)
+                except Exception:
+                    pass
+        elif chain.ndim > 2:
+            # Parallel tempering — R-hat not straightforwardly defined here
+            pass
+
+    return ci_lower, ci_upper, rhat
 
 
 def _get_layer_names(structure):
@@ -303,6 +369,20 @@ def save_batch_to_h5(batch_results, sample_name, model_name, filepath,
             pg.create_dataset('final_ub',     data=f_ub)
             pg.create_dataset('final_vary',   data=f_vary)
             pg.create_dataset('stderr',       data=f_stderr)
+
+            # MCMC diagnostics — only written when sampling was performed
+            _has_mcmc = any(
+                p.vary
+                and getattr(p, 'chain', None) is not None
+                and p.chain.size > 0
+                for p in fitted_obj.parameters.flattened(unique=True)
+            )
+            if _has_mcmc:
+                ci_lo, ci_hi, rhat_vals = _compute_mcmc_diagnostics(fitted_obj, f_names)
+                pg.create_dataset('ci_lower', data=ci_lo)
+                pg.create_dataset('ci_upper', data=ci_hi)
+                pg.create_dataset('rhat',     data=rhat_vals)
+            run_grp.attrs['has_mcmc'] = _has_mcmc
 
             orig_obj = original_objectives.get(energy)
             if orig_obj is not None:
@@ -1340,6 +1420,7 @@ def get_h5_info(filepath, sample_name=None):
                             'timestamp':      rg.attrs.get('timestamp', ''),
                             'n_params':       n_params,
                             'n_layers':       n_layers,
+                            'has_mcmc':       bool(rg.attrs.get('has_mcmc', False)),
                         })
                     info[skey][energy_val][mkey] = runs
     return info
