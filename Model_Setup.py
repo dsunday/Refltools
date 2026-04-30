@@ -275,6 +275,7 @@ def create_model_and_objective(structure, data, model_name=None, scale=1.0,
 def run_fitting(objective, method='differential_evolution',
                 workers=-1, popsize=15, steps=1000, burn=500,
                 nthin=1, nwalkers=100,
+                sampler='emcee', sampler_kws=None,
                 save_dir=None, save_objective=False, save_results=False,
                 structure=None, model_name=None, verbose=False):
     """
@@ -285,10 +286,21 @@ def run_fitting(objective, method='differential_evolution',
         method       : scipy optimisation method (default 'differential_evolution')
         workers      : parallel workers for differential evolution (-1 = all cores)
         popsize      : population size for differential evolution
-        steps        : MCMC steps (0 to skip MCMC)
-        burn         : burn-in steps to discard from the chain
-        nthin        : chain thinning factor
-        nwalkers     : number of MCMC walkers
+        steps        : MCMC steps (0 to skip MCMC).
+                       For pymc: draws per chain.  For dynesty: not used.
+        burn         : burn-in steps to discard.
+                       For pymc: passed as nburn to process_chain.
+                       For dynesty: not used.
+        nthin        : thinning factor.
+                       For pymc: passed as nthin to process_chain.
+                       For dynesty: not used.
+        nwalkers     : number of MCMC walkers (emcee) or chains (pymc).
+                       Not used by dynesty.
+        sampler      : 'emcee' (default), 'pymc', or 'dynesty'
+        sampler_kws  : extra keyword arguments forwarded to the sampler call.
+                       For emcee → fitter.sample(); for pymc → pm.sample();
+                       for dynesty → DynamicNestedSampler().
+                       For pymc, 'step' key overrides the default DEMetropolis step.
         save_dir     : directory to write pickle files (None = no saving)
         save_objective: save objective to <model_name>_objective.pkl
         save_results : save combined results+structure to
@@ -303,7 +315,8 @@ def run_fitting(objective, method='differential_evolution',
             initial_chi_squared, optimized_chi_squared,
             optimized_parameters,
             mcmc_samples (array or None),
-            mcmc_stats   (dict or None)
+            mcmc_stats   (dict or None),
+            log_evidence (float or None — dynesty only)
     """
     if model_name is None:
         model_name = getattr(objective.model, 'name', 'unnamed_model')
@@ -320,6 +333,7 @@ def run_fitting(objective, method='differential_evolution',
         'optimized_chi_squared': None,
         'mcmc_samples':         None,
         'mcmc_stats':           None,
+        'log_evidence':         None,
     }
 
     # --- optimisation ---------------------------------------------------------
@@ -340,29 +354,69 @@ def run_fitting(objective, method='differential_evolution',
 
     # --- MCMC -----------------------------------------------------------------
     if steps > 0:
+        _skws = dict(sampler_kws or {})
         if verbose:
-            print(f"MCMC: {steps} steps, {burn} burn-in, {nwalkers} walkers …")
+            print(f"MCMC ({sampler}): {steps} steps, {burn} burn-in, "
+                  f"{nwalkers} walkers/chains …")
         try:
-            fitter.sample(steps, nthin=nthin)
-            chain = fitter.chain
+            if sampler == 'emcee':
+                fitter.sample(steps, nthin=nthin, **_skws)
+                chain = fitter.chain
 
-            if chain is not None and burn > 0:
-                if chain.ndim == 3:
-                    b = min(burn, chain.shape[1])
-                    chain = chain[:, b:, :]
-                elif chain.ndim == 2:
-                    b = min(burn, chain.shape[0])
-                    chain = chain[b:, :]
-                if verbose:
-                    print(f"Removed {b} burn-in steps. Chain shape: {chain.shape}")
+                if chain is not None and burn > 0:
+                    if chain.ndim == 3:
+                        b = min(burn, chain.shape[1])
+                        chain = chain[:, b:, :]
+                    elif chain.ndim == 2:
+                        b = min(burn, chain.shape[0])
+                        chain = chain[b:, :]
+                    if verbose:
+                        print(f"Removed {b} burn-in steps. Chain shape: {chain.shape}")
 
-            results['mcmc_samples'] = chain
-            if chain is not None:
-                results['mcmc_stats'] = calculate_mcmc_statistics(
-                    chain, objective.parameters)
+                results['mcmc_samples'] = chain
+                if chain is not None:
+                    results['mcmc_stats'] = calculate_mcmc_statistics(
+                        chain, objective.parameters)
+
+            elif sampler == 'pymc':
+                from refnx.analysis import pymc_model
+                from refnx.analysis import process_chain as _process_chain
+                import pymc as pm
+                step_fn = _skws.pop('step', pm.DEMetropolis())
+                with pymc_model(objective) as _model:
+                    starter = {f"p{n}": p.value
+                               for n, p in enumerate(objective.varying_parameters())}
+                    trace = pm.sample(draws=steps, chains=nwalkers,
+                                      initvals=starter, step=step_fn,
+                                      **_skws)
+                nvary = len(objective.varying_parameters())
+                raw = np.stack([trace.posterior[f"p{i}"].data
+                                for i in range(nvary)], axis=-1)  # (chains, draws, nvary)
+                chain = raw.transpose(1, 0, 2)                    # (draws, chains, nvary)
+                _process_chain(objective, chain, nburn=burn, nthin=nthin)
+                results['mcmc_samples'] = chain[burn::nthin] if burn < chain.shape[0] else chain
+                results['mcmc_stats'] = _stats_from_param_chains(objective)
+
+            elif sampler == 'dynesty':
+                import dynesty
+                from refnx.analysis import process_chain as _process_chain
+                ndim = len(objective.varying_parameters())
+                ns = dynesty.DynamicNestedSampler(
+                    objective.logl, objective.prior_transform,
+                    ndim=ndim, **_skws)
+                ns.run_nested()
+                chain = ns.results.samples_equal()  # (nsamples, ndims)
+                _process_chain(objective, chain[:, None, :])
+                results['mcmc_samples'] = chain
+                results['log_evidence'] = float(ns.results.logz[-1])
+                results['mcmc_stats'] = _stats_from_param_chains(objective)
+
+            else:
+                raise ValueError(
+                    f"sampler must be 'emcee', 'pymc', or 'dynesty' — got {sampler!r}")
 
         except Exception as exc:
-            print(f"MCMC failed: {exc}")
+            print(f"MCMC ({sampler}) failed: {exc}")
 
     # --- optional file saving -------------------------------------------------
     if save_dir is not None:
@@ -405,6 +459,22 @@ def calculate_mcmc_statistics(chain, parameters):
                 }
     except Exception as exc:
         print(f"Error calculating MCMC statistics: {exc}")
+    return stats
+
+
+def _stats_from_param_chains(objective):
+    """Build mcmc_stats from param.chain set by refnx process_chain()."""
+    stats = {}
+    for p in objective.varying_parameters():
+        chain = getattr(p, 'chain', None)
+        if chain is None or chain.size == 0:
+            continue
+        stats[p.name] = {
+            'mean':        float(np.mean(chain)),
+            'median':      float(np.median(chain)),
+            'std':         float(np.std(chain)),
+            'percentiles': np.percentile(chain, [16, 50, 84]),
+        }
     return stats
 
 
@@ -988,6 +1058,7 @@ def batch_fit_selected_models_v2(objectives_dict, structures_dict,
                                   workers=-1, popsize=15,
                                   steps=1000, burn=500,
                                   nthin=1, nwalkers=100,
+                                  sampler='emcee', sampler_kws=None,
                                   save_dir=None,
                                   save_objectives=False,
                                   save_results=False,
@@ -1007,6 +1078,8 @@ def batch_fit_selected_models_v2(objectives_dict, structures_dict,
         energy_list       : energies to fit (None = all available)
         method / workers / popsize / steps / burn / nthin / nwalkers :
                             passed directly to run_fitting
+        sampler           : 'emcee' (default), 'pymc', or 'dynesty'
+        sampler_kws       : extra kwargs forwarded to the sampler (see run_fitting)
         save_dir          : directory for per-energy pickle files
         save_objectives   : save each objective
         save_results      : save each results dict
@@ -1083,6 +1156,8 @@ def batch_fit_selected_models_v2(objectives_dict, structures_dict,
                 burn=burn,
                 nthin=nthin,
                 nwalkers=nwalkers,
+                sampler=sampler,
+                sampler_kws=dict(sampler_kws or {}),
                 save_dir=save_dir,
                 save_objective=save_objectives,
                 save_results=save_results,

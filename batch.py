@@ -373,6 +373,7 @@ def batch_fit_selected_models(objectives_dict, structures_dict,
                                workers=8, popsize=20,
                                steps=500, burn=200,
                                nthin=1, nwalkers=100,
+                               sampler='emcee', sampler_kws=None,
                                save_dir=None, save_objectives=False,
                                save_results=False,
                                preserve_originals=True,
@@ -392,6 +393,8 @@ def batch_fit_selected_models(objectives_dict, structures_dict,
         workers / popsize: differential_evolution settings
         steps / burn     : MCMC total steps and burn-in steps
         nthin / nwalkers : MCMC thinning and walker count
+        sampler          : 'emcee' (default), 'pymc', or 'dynesty'
+        sampler_kws      : extra kwargs forwarded to the sampler (see run_fitting)
         save_dir         : directory for per-energy pickle outputs
         save_objectives  : write <model>_objective.pkl per energy
         save_results     : write <model>_results_structure.pkl per energy
@@ -417,6 +420,8 @@ def batch_fit_selected_models(objectives_dict, structures_dict,
         burn=burn,
         nthin=nthin,
         nwalkers=nwalkers,
+        sampler=sampler,
+        sampler_kws=sampler_kws,
         save_dir=save_dir,
         save_objectives=save_objectives,
         save_results=save_results,
