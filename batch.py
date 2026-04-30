@@ -29,11 +29,15 @@ from Model_Setup import (
     create_reflectometry_model,
     create_model_and_objective,
     batch_fit_selected_models_v2,
+    run_fitting,
 )
-from h5io import (save_batch_to_h5, load_h5_objectives, get_h5_info,
+from h5io import (save_batch_to_h5, save_sweep_results_to_h5,
+                  load_h5_objectives, get_h5_info,
                   plot_parameter_vs_energy, plot_reflectivity,
                   save_nexafs_to_h5, update_nexafs_sld,
                   load_nexafs_from_h5, list_nexafs_spectra)
+from parameter_sweep import (setup_parameter_sweep, run_parameter_sweep,
+                              get_best_fit_with_uncertainty)
  
 
 # ---------------------------------------------------------------------------
@@ -378,12 +382,12 @@ def batch_fit_selected_models(objectives_dict, structures_dict,
                                save_results=False,
                                preserve_originals=True,
                                verbose=True,
-                               model_name=None):
+                               model_name=None,
+                               sample_name=None,
+                               h5_filepath=None,
+                               run_index=None):
     """
     Fit a batch of RSoXR objectives, one per energy.
-
-    This is a clean wrapper around Model_Setup.batch_fit_selected_models_v2
-    using its modern API (no results_log / database).
 
     Args:
         objectives_dict  : {energy: Objective}
@@ -401,6 +405,11 @@ def batch_fit_selected_models(objectives_dict, structures_dict,
         preserve_originals: keep deep copies of inputs in output dict
         verbose          : progress printing
         model_name       : label applied to all fits (default 'Model1')
+        sample_name      : HDF5 sample label (e.g. 'Brewer1'); required with h5_filepath
+        h5_filepath      : path to .h5 file; if given, each energy is saved
+                           immediately after it finishes so a crash loses at
+                           most one energy's work
+        run_index        : explicit HDF5 run index (default: auto-increment)
 
     Returns:
         dict with keys:
@@ -409,26 +418,151 @@ def batch_fit_selected_models(objectives_dict, structures_dict,
             original_objectives (if preserve_originals),
             original_structures (if preserve_originals)
     """
-    return batch_fit_selected_models_v2(
-        objectives_dict=objectives_dict,
-        structures_dict=structures_dict,
-        energy_list=energy_list,
-        method=method,
-        workers=workers,
-        popsize=popsize,
-        steps=steps,
-        burn=burn,
-        nthin=nthin,
-        nwalkers=nwalkers,
-        sampler=sampler,
-        sampler_kws=sampler_kws,
-        save_dir=save_dir,
-        save_objectives=save_objectives,
-        save_results=save_results,
-        preserve_originals=preserve_originals,
-        verbose=verbose,
-        model_name=model_name,
-    )
+    save_to_h5 = h5_filepath is not None and sample_name is not None
+    if h5_filepath is not None and sample_name is None:
+        print("  Warning: h5_filepath provided without sample_name — "
+              "per-energy HDF5 saving disabled.")
+
+    print("=" * 60)
+    print("BATCH FITTING")
+    print("=" * 60)
+
+    fitted_objectives = copy.deepcopy(objectives_dict)
+
+    if energy_list is None:
+        to_fit = sorted(set(objectives_dict) & set(structures_dict))
+    else:
+        to_fit = []
+        for e in energy_list:
+            if e in objectives_dict and e in structures_dict:
+                to_fit.append(e)
+            else:
+                print(f"Warning: {e} eV not in both dicts – skipping.")
+
+    if not to_fit:
+        print("No valid energies found.")
+        return None
+
+    all_energies   = set(objectives_dict)
+    fitted_set     = set(to_fit)
+    non_fitted_set = all_energies - fitted_set
+
+    print(f"Total: {len(all_energies)}  |  To fit: {len(fitted_set)}  |  "
+          f"Pass-through: {len(non_fitted_set)}")
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    ename = model_name if model_name else "Model1"
+    original_objectives = {}
+    original_structures = {}
+    individual_results  = {}
+    successful = failed = 0
+    chi_init_total = chi_final_total = 0.0
+
+    for i, energy in enumerate(to_fit):
+        print(f"\n--- {i+1}/{len(to_fit)}: {energy} eV ---")
+        try:
+            orig_obj  = objectives_dict[energy]
+            structure = structures_dict[energy]
+
+            if preserve_originals:
+                original_objectives[energy] = copy.deepcopy(orig_obj)
+                original_structures[energy] = copy.deepcopy(structure)
+
+            working  = copy.deepcopy(orig_obj)
+            chi_init = working.chisqr()
+            chi_init_total += chi_init
+            if verbose:
+                print(f"  Initial χ²: {chi_init:.6g}")
+
+            results = run_fitting(
+                objective=working,
+                method=method,
+                workers=workers,
+                popsize=popsize,
+                steps=steps,
+                burn=burn,
+                nthin=nthin,
+                nwalkers=nwalkers,
+                sampler=sampler,
+                sampler_kws=dict(sampler_kws or {}),
+                save_dir=save_dir,
+                save_objective=save_objectives,
+                save_results=save_results,
+                structure=structure,
+                model_name=ename,
+                verbose=verbose,
+            )
+
+            fitted_objectives[energy] = working
+            individual_results[energy] = results
+
+            chi_final = working.chisqr()
+            chi_final_total += chi_final
+            if chi_init > 0:
+                pct = (chi_init - chi_final) / chi_init * 100
+                print(f"  Final χ²: {chi_final:.6g}  (improvement: {pct:.1f}%)")
+            else:
+                print(f"  Final χ²: {chi_final:.6g}")
+            successful += 1
+
+            if save_to_h5:
+                energy_batch = {
+                    'fitted_objectives':  {energy: working},
+                    'individual_results': {energy: results},
+                    'fitted_energies':    [energy],
+                }
+                if preserve_originals:
+                    energy_batch['original_objectives'] = {
+                        energy: original_objectives[energy]}
+                    energy_batch['original_structures'] = {
+                        energy: original_structures[energy]}
+                save_batch_to_h5(
+                    energy_batch,
+                    sample_name=sample_name,
+                    model_name=ename,
+                    filepath=h5_filepath,
+                    energy_list=[energy],
+                    run_index=run_index,
+                )
+
+        except Exception as exc:
+            print(f"  ERROR at {energy} eV: {exc}")
+            failed += 1
+
+    print(f"\n{'='*60}")
+    print(f"Successful: {successful}  |  Failed: {failed}  |  "
+          f"Pass-through: {len(non_fitted_set)}")
+    if successful > 0 and chi_init_total > 0:
+        overall = (chi_init_total - chi_final_total) / chi_init_total * 100
+        print(f"Overall χ² improvement: {overall:.1f}%")
+
+    summary = {
+        'total_models':               len(to_fit),
+        'total_objectives_in_output': len(fitted_objectives),
+        'successful_fits':            successful,
+        'failed_fits':                failed,
+        'non_fitted_count':           len(non_fitted_set),
+        'initial_chi_squared_total':  chi_init_total,
+        'final_chi_squared_total':    chi_final_total,
+        'overall_improvement_percent': (
+            (chi_init_total - chi_final_total) / chi_init_total * 100
+            if chi_init_total > 0 else 0),
+        'save_directory': save_dir,
+    }
+
+    ret = {
+        'fitted_objectives':   fitted_objectives,
+        'individual_results':  individual_results,
+        'summary_stats':       summary,
+        'fitted_energies':     sorted(fitted_set),
+        'non_fitted_energies': sorted(non_fitted_set),
+    }
+    if preserve_originals:
+        ret['original_objectives'] = original_objectives
+        ret['original_structures'] = original_structures
+
+    return ret
 
 
 # ---------------------------------------------------------------------------
@@ -699,3 +833,226 @@ def export_best_parameters(results_dict, original_objectives_dict,
         df.to_csv(output_file, index=False)
         print(f"Saved best parameters → {output_file}")
     return df
+
+
+# ---------------------------------------------------------------------------
+# Parameter sweep uncertainty estimation
+# ---------------------------------------------------------------------------
+
+def batch_fit_sweep(batch_results, sweep_params, sample_name, model_name,
+                    h5_filepath, run_criteria='best', uncertainty_percent=10,
+                    optimization_method='differential_evolution',
+                    opt_workers=8, opt_popsize=20,
+                    energy_list=None, verbose=True):
+    """
+    Estimate parameter uncertainties via sweep fitting across a batch of energies.
+
+    For each energy and each specified parameter, fixes that parameter at a
+    series of values, optimises all others, and defines the confidence interval
+    as all points within *uncertainty_percent*% of the best-fit chi-squared.
+    Results are saved to the HDF5 file after each energy completes, so a crash
+    loses at most one energy's sweep time.
+
+    Parameters
+    ----------
+    batch_results : dict
+        Output of batch_fit_selected_models. Must contain 'fitted_objectives'.
+    sweep_params : list of dict
+        Each dict describes one parameter to sweep:
+            {'param': 'SOC - sld', 'delta': 1.0, 'step': 0.2}
+            {'param': 'SOC - sld', 'values': [4.0, 4.5, 5.0, 5.5]}
+        'delta'/'step' auto-generates sweep_values as best_fit ± delta in
+        steps of step, clamped to the parameter's bounds.
+    sample_name : str
+        HDF5 sample label, e.g. 'Brewer1'.
+    model_name : str
+        HDF5 model label, e.g. 'Model1'.
+    h5_filepath : str or Path
+        Existing .h5 file (must have been written by save_batch_to_h5 first).
+    run_criteria : 'best' | 'last' | int
+        Which run_N group to attach sweep results to per energy.
+    uncertainty_percent : float
+        GOF threshold: models within this % of the best chi-squared define the CI.
+    optimization_method : str
+        Optimisation method passed to run_parameter_sweep.
+    opt_workers / opt_popsize : int
+        Differential evolution settings.
+    energy_list : list of float, optional
+        Subset of energies to process; defaults to batch_results['fitted_energies'].
+    verbose : bool
+
+    Returns
+    -------
+    dict with keys:
+        sweep_results     – {energy: {param_name: {'sweep_info': …, 'ci_result': …}}}
+        ci_summary        – DataFrame (energy, param_name, best_value, best_gof,
+                            ci_lower, ci_upper, uncertainty_width, uncertainty_percent)
+        swept_energies    – list of energies successfully saved
+        skipped_energies  – list of (energy, reason) tuples
+        h5_filepath       – str path
+        sample_name       – str
+        model_name        – str
+    """
+    if 'fitted_objectives' not in batch_results:
+        raise ValueError("batch_results must contain 'fitted_objectives'.")
+
+    for i, spec in enumerate(sweep_params):
+        if 'param' not in spec:
+            raise ValueError(f"sweep_params[{i}] missing 'param' key.")
+        if 'values' not in spec and not ('delta' in spec and 'step' in spec):
+            raise ValueError(
+                f"sweep_params[{i}]: must have either 'values' or both "
+                f"'delta' and 'step'.")
+
+    if energy_list is not None:
+        missing = [e for e in energy_list
+                   if e not in batch_results['fitted_objectives']]
+        if missing:
+            print(f"  Warning: energies not in fitted_objectives: {missing}")
+        working_energies = [e for e in energy_list
+                            if e in batch_results['fitted_objectives']]
+    else:
+        working_energies = batch_results.get(
+            'fitted_energies',
+            sorted(batch_results['fitted_objectives'].keys()))
+
+    all_sweep_results = {}
+    swept_energies    = []
+    skipped_energies  = []
+    ci_rows           = []
+
+    for energy in sorted(working_energies):
+        objective = batch_results['fitted_objectives'].get(energy)
+        if objective is None:
+            skipped_energies.append((energy, 'not in fitted_objectives'))
+            continue
+
+        if verbose:
+            print(f"\n{'─' * 60}")
+            print(f"  Energy: {energy} eV")
+
+        energy_sweep_data = {}
+
+        for spec in sweep_params:
+            param_name = spec['param']
+
+            if 'values' in spec:
+                sweep_values = np.asarray(spec['values'], dtype=float)
+                lb = ub = None
+            else:
+                delta = float(spec['delta'])
+                step  = float(spec['step'])
+
+                best_val = lb = ub = None
+                for p in objective.parameters.flattened(unique=True):
+                    if p.name == param_name:
+                        best_val = float(p.value)
+                        b = getattr(p, 'bounds', None)
+                        if b is not None:
+                            lb = float(b.lb) if hasattr(b, 'lb') else float(b[0])
+                            ub = float(b.ub) if hasattr(b, 'ub') else float(b[1])
+                        break
+
+                if best_val is None:
+                    print(f"  Warning: parameter '{param_name}' not found in "
+                          f"objective for {energy} eV — skipping sweep.")
+                    continue
+
+                raw_lo = best_val - delta
+                raw_hi = best_val + delta
+                clamped_lo = (max(raw_lo, lb) if lb is not None and np.isfinite(lb)
+                              else raw_lo)
+                clamped_hi = (min(raw_hi, ub) if ub is not None and np.isfinite(ub)
+                              else raw_hi)
+
+                if clamped_lo != raw_lo or clamped_hi != raw_hi:
+                    print(f"  Warning: sweep range for '{param_name}' at {energy} eV "
+                          f"clamped from [{raw_lo:.4g}, {raw_hi:.4g}] to "
+                          f"[{clamped_lo:.4g}, {clamped_hi:.4g}].")
+
+                sweep_values = np.arange(clamped_lo, clamped_hi + step / 2, step)
+                if len(sweep_values) == 0:
+                    print(f"  Warning: no sweep values generated for '{param_name}' "
+                          f"at {energy} eV after clamping — skipping.")
+                    continue
+
+            if verbose:
+                print(f"    Sweeping '{param_name}': {len(sweep_values)} points "
+                      f"[{sweep_values[0]:.4g} → {sweep_values[-1]:.4g}]")
+
+            # Deep-copy so each sweep starts from the clean best-fit state
+            obj_copy = copy.deepcopy(objective)
+
+            try:
+                sweep_info = setup_parameter_sweep(obj_copy, param_name, sweep_values)
+                sweep_info, _ = run_parameter_sweep(
+                    sweep_info,
+                    optimization_method=optimization_method,
+                    opt_workers=opt_workers,
+                    opt_popsize=opt_popsize,
+                    save_dir=None,
+                    save_intermediate=False,
+                    save_combined=False,
+                )
+                ci_result = get_best_fit_with_uncertainty(
+                    sweep_info, uncertainty_percent)
+            except ValueError as exc:
+                print(f"  Warning: sweep failed for '{param_name}' at "
+                      f"{energy} eV: {exc}")
+                continue
+            except Exception as exc:
+                print(f"  Warning: unexpected error sweeping '{param_name}' at "
+                      f"{energy} eV: {exc}")
+                continue
+
+            energy_sweep_data[param_name] = {
+                'sweep_info': sweep_info,
+                'ci_result':  ci_result,
+            }
+
+            lo, hi = ci_result['uncertainty_range']
+            ci_rows.append(dict(
+                energy=energy,
+                param_name=param_name,
+                best_value=ci_result['best_value'],
+                best_gof=ci_result['best_gof'],
+                ci_lower=lo,
+                ci_upper=hi,
+                uncertainty_width=ci_result['uncertainty_width'],
+                uncertainty_percent=ci_result['uncertainty_percent'],
+            ))
+
+            if verbose:
+                print(f"      CI ({uncertainty_percent}%): [{lo:.4g}, {hi:.4g}]  "
+                      f"width={ci_result['uncertainty_width']:.4g}")
+
+        if energy_sweep_data:
+            save_sweep_results_to_h5(
+                energy_sweep_data, sample_name, model_name, h5_filepath,
+                energy, run_criteria=run_criteria,
+                uncertainty_percent=uncertainty_percent,
+            )
+            all_sweep_results[energy] = energy_sweep_data
+            swept_energies.append(energy)
+        else:
+            skipped_energies.append(
+                (energy, 'no sweep parameters produced results'))
+
+    ci_summary = (pd.DataFrame(ci_rows) if ci_rows
+                  else pd.DataFrame(columns=[
+                      'energy', 'param_name', 'best_value', 'best_gof',
+                      'ci_lower', 'ci_upper', 'uncertainty_width',
+                      'uncertainty_percent']))
+
+    print(f"\nBatch sweep complete: {len(swept_energies)} energies saved "
+          f"→ {h5_filepath}")
+
+    return {
+        'sweep_results':   all_sweep_results,
+        'ci_summary':      ci_summary,
+        'swept_energies':  swept_energies,
+        'skipped_energies': skipped_energies,
+        'h5_filepath':     str(h5_filepath),
+        'sample_name':     sample_name,
+        'model_name':      model_name,
+    }

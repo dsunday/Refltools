@@ -429,6 +429,132 @@ def save_batch_to_h5(batch_results, sample_name, model_name, filepath,
     print(f"Saved {saved}/{len(energies)} energies → {filepath}")
 
 
+def save_sweep_results_to_h5(energy_sweep_data, sample_name, model_name,
+                              filepath, energy, run_criteria='best',
+                              uncertainty_percent=10):
+    """
+    Attach parameter-sweep uncertainty results to an existing run in the HDF5 file.
+
+    Results are written under the selected run_N group:
+        /{sample_name}/{energy}/{model_name}/run_N/
+            attrs: has_sweep, sweep_timestamp, sweep_uncertainty_percent
+            /parameters/
+                sweep_ci_lower  [n_params]  NaN for non-swept params
+                sweep_ci_upper  [n_params]  NaN for non-swept params
+            /sweep_results/
+                /{param_key}/
+                    attrs: param_name, best_value, best_gof, ci_lower, ci_upper,
+                           gof_threshold, uncertainty_percent, n_sweep_points
+                    sweep_values  [n_sweep_points]
+                    gof_values    [n_sweep_points]
+
+    Re-running overwrites any existing sweep_results subgroup for that run.
+
+    Parameters
+    ----------
+    energy_sweep_data : dict
+        {param_name: {'sweep_info': ..., 'ci_result': ...}}
+        As produced by batch_fit_sweep for a single energy.
+    sample_name : str
+    model_name : str
+    filepath : str or Path
+        Existing .h5 file; opened in append mode.
+    energy : float
+    run_criteria : 'best' | 'last' | int
+        Which run_N group to update.
+    uncertainty_percent : float
+        Threshold used for CI calculation (stored as metadata).
+    """
+    energy_key = str(float(energy))
+    model_path = f"{sample_name}/{energy_key}/{model_name}"
+
+    with h5py.File(filepath, 'a') as f:
+        if model_path not in f:
+            raise KeyError(
+                f"No existing run found at '{model_path}' in {filepath}. "
+                f"Call save_batch_to_h5 before saving sweep results."
+            )
+
+        model_grp = f[model_path]
+        run_keys = sorted(
+            [k for k in model_grp.keys() if k.startswith('run_')],
+            key=lambda k: int(k.split('_')[1])
+        )
+        if not run_keys:
+            raise KeyError(f"No run groups found at '{model_path}'.")
+
+        if run_criteria == 'best':
+            run_key = min(
+                run_keys,
+                key=lambda k: model_grp[k].attrs.get('chi_sq_final', np.inf))
+        elif run_criteria == 'last':
+            run_key = run_keys[-1]
+        elif isinstance(run_criteria, int):
+            run_key = f'run_{run_criteria}'
+            if run_key not in model_grp:
+                raise KeyError(
+                    f"run_{run_criteria} not found at '{model_path}'.")
+        else:
+            raise ValueError(
+                f"run_criteria must be 'best', 'last', or int — got {run_criteria!r}")
+
+        run_grp = model_grp[run_key]
+
+        # Update run-level attrs
+        run_grp.attrs['has_sweep'] = True
+        run_grp.attrs['sweep_timestamp'] = datetime.datetime.now().isoformat()
+        run_grp.attrs['sweep_uncertainty_percent'] = float(uncertainty_percent)
+
+        # Aligned CI arrays (NaN for non-swept params)
+        pg = run_grp['parameters']
+        param_names = _decode_strings(pg['names'][:])
+        n = len(param_names)
+        sweep_ci_lower = np.full(n, np.nan)
+        sweep_ci_upper = np.full(n, np.nan)
+
+        # Overwrite sweep_results subgroup so re-runs are clean
+        if 'sweep_results' in run_grp:
+            del run_grp['sweep_results']
+        sweep_grp = run_grp.create_group('sweep_results')
+
+        for pname, data in energy_sweep_data.items():
+            sweep_info = data['sweep_info']
+            ci_result  = data['ci_result']
+
+            key = pname.replace(' ', '_').replace('-', '_')
+            param_grp = sweep_grp.create_group(key)
+            param_grp.attrs['param_name'] = pname
+
+            param_grp.create_dataset(
+                'sweep_values',
+                data=np.array(sweep_info['parameter_values'], dtype=np.float64))
+            param_grp.create_dataset(
+                'gof_values',
+                data=np.array(sweep_info['goodness_of_fit'], dtype=np.float64))
+
+            ci_lo = float(ci_result['uncertainty_range'][0])
+            ci_hi = float(ci_result['uncertainty_range'][1])
+            param_grp.attrs['best_value']         = float(ci_result['best_value'])
+            param_grp.attrs['best_gof']           = float(ci_result['best_gof'])
+            param_grp.attrs['ci_lower']           = ci_lo
+            param_grp.attrs['ci_upper']           = ci_hi
+            param_grp.attrs['gof_threshold']      = float(ci_result['gof_threshold'])
+            param_grp.attrs['uncertainty_percent'] = float(ci_result['uncertainty_percent'])
+            param_grp.attrs['n_sweep_points']     = len(sweep_info['parameter_values'])
+
+            if pname in param_names:
+                idx = param_names.index(pname)
+                sweep_ci_lower[idx] = ci_lo
+                sweep_ci_upper[idx] = ci_hi
+
+        # Write aligned CI datasets (overwrite if already present)
+        for dset_name, arr in [('sweep_ci_lower', sweep_ci_lower),
+                                ('sweep_ci_upper', sweep_ci_upper)]:
+            if dset_name in pg:
+                del pg[dset_name]
+            pg.create_dataset(dset_name, data=arr)
+
+
 def load_h5_objectives(filepath, sample_name, model_name,
                        criteria='best', energy_list=None):
     """
@@ -716,8 +842,13 @@ def plot_parameter_vs_energy(
                 val   = float(pg['final_values'][idx])
                 lb    = float(pg['final_lb'][idx])
                 ub    = float(pg['final_ub'][idx])
-                ci_lo = float(pg['ci_lower'][idx]) if 'ci_lower' in pg else np.nan
-                ci_hi = float(pg['ci_upper'][idx]) if 'ci_upper' in pg else np.nan
+                ci_lo = ci_hi = np.nan
+                if 'ci_lower' in pg:
+                    ci_lo = float(pg['ci_lower'][idx])
+                    ci_hi = float(pg['ci_upper'][idx]) if 'ci_upper' in pg else np.nan
+                if np.isnan(ci_lo) and 'sweep_ci_lower' in pg:
+                    ci_lo = float(pg['sweep_ci_lower'][idx])
+                    ci_hi = float(pg['sweep_ci_upper'][idx]) if 'sweep_ci_upper' in pg else np.nan
 
                 mdata['energies'].append(float(ekey))
                 mdata['values'].append(val)

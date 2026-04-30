@@ -383,13 +383,22 @@ def run_fitting(objective, method='differential_evolution',
                 from refnx.analysis import process_chain as _process_chain
                 import pymc as pm
                 step_fn = _skws.pop('step', pm.DEMetropolis())
+                nvary = len(objective.varying_parameters())
+                # DEMetropolis requires ≥ ndim+1 chains; silently bump if needed
+                n_chains = nwalkers
+                if isinstance(step_fn, pm.DEMetropolis):
+                    min_chains = nvary + 1
+                    if n_chains < min_chains:
+                        print(f"  PyMC DEMetropolis requires ≥{min_chains} chains "
+                              f"for {nvary} parameters; bumping nwalkers "
+                              f"{n_chains} → {min_chains}")
+                        n_chains = min_chains
                 with pymc_model(objective) as _model:
                     starter = {f"p{n}": p.value
                                for n, p in enumerate(objective.varying_parameters())}
-                    trace = pm.sample(draws=steps, chains=nwalkers,
+                    trace = pm.sample(draws=steps, chains=n_chains,
                                       initvals=starter, step=step_fn,
                                       **_skws)
-                nvary = len(objective.varying_parameters())
                 raw = np.stack([trace.posterior[f"p{i}"].data
                                 for i in range(nvary)], axis=-1)  # (chains, draws, nvary)
                 chain = raw.transpose(1, 0, 2)                    # (draws, chains, nvary)
