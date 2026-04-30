@@ -677,7 +677,8 @@ def plot_parameter_vs_energy(
 
         for mname in model_names:
             mdata = {'energies': [], 'values': [], 'lbs': [], 'ubs': [],
-                     'near_bound': [], 'chi_sq': []}
+                     'near_bound': [], 'chi_sq': [],
+                     'ci_lower': [], 'ci_upper': []}
 
             for ekey in energy_keys:
                 energy_grp = sample_grp[ekey]
@@ -712,9 +713,11 @@ def plot_parameter_vs_energy(
                     continue
                 idx = pnames.index(param_name)
 
-                val = float(pg['final_values'][idx])
-                lb  = float(pg['final_lb'][idx])
-                ub  = float(pg['final_ub'][idx])
+                val   = float(pg['final_values'][idx])
+                lb    = float(pg['final_lb'][idx])
+                ub    = float(pg['final_ub'][idx])
+                ci_lo = float(pg['ci_lower'][idx]) if 'ci_lower' in pg else np.nan
+                ci_hi = float(pg['ci_upper'][idx]) if 'ci_upper' in pg else np.nan
 
                 mdata['energies'].append(float(ekey))
                 mdata['values'].append(val)
@@ -722,6 +725,8 @@ def plot_parameter_vs_energy(
                 mdata['ubs'].append(ub)
                 mdata['near_bound'].append(_near_bound(val, lb, ub, bound_tol_pct))
                 mdata['chi_sq'].append(float(rg.attrs.get('chi_sq_final', np.nan)))
+                mdata['ci_lower'].append(ci_lo)
+                mdata['ci_upper'].append(ci_hi)
 
             model_data[mname] = mdata
 
@@ -771,14 +776,27 @@ def plot_parameter_vs_energy(
         color  = colors[m_idx % len(colors)]
         marker = markers[m_idx % len(markers)]
 
-        E    = np.array(mdata['energies']) + refl_energy_shift
-        V    = np.array(mdata['values'])
-        LB   = np.array(mdata['lbs'])
-        UB   = np.array(mdata['ubs'])
-        flag = np.array(mdata['near_bound'], dtype=bool)
+        E     = np.array(mdata['energies']) + refl_energy_shift
+        V     = np.array(mdata['values'])
+        LB    = np.array(mdata['lbs'])
+        UB    = np.array(mdata['ubs'])
+        flag  = np.array(mdata['near_bound'], dtype=bool)
+        CI_LO = np.array(mdata['ci_lower'])
+        CI_HI = np.array(mdata['ci_upper'])
+        has_ci = np.isfinite(CI_LO) & np.isfinite(CI_HI)
 
-        ax_main.plot(E, V, marker=marker, linestyle='-', color=color,
-                     label=mname, zorder=2)
+        if np.any(has_ci):
+            yerr = np.array([
+                np.where(has_ci, V - CI_LO, 0.0),
+                np.where(has_ci, CI_HI - V, 0.0),
+            ])
+            ax_main.errorbar(E, V, yerr=yerr,
+                             marker=marker, linestyle='-', color=color,
+                             label=mname, zorder=2,
+                             capsize=3, capthick=1, elinewidth=1)
+        else:
+            ax_main.plot(E, V, marker=marker, linestyle='-', color=color,
+                         label=mname, zorder=2)
 
         if bound_tol_pct > 0 and np.any(flag):
             nb_label = '_nolegend_' if nb_label_used else 'near bound'
