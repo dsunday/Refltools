@@ -379,11 +379,14 @@ def run_fitting(objective, method='differential_evolution',
                         chain, objective.parameters)
 
             elif sampler == 'pymc':
-                from refnx.analysis import pymc_model
                 from refnx.analysis import process_chain as _process_chain
                 import pymc as pm
+                import pytensor.tensor as pt
+                from pytensor.compile.ops import as_op
+
                 step_fn = _skws.pop('step', pm.DEMetropolis())
                 nvary = len(objective.varying_parameters())
+
                 # DEMetropolis requires ≥ ndim+1 chains; silently bump if needed
                 n_chains = nwalkers
                 if isinstance(step_fn, pm.DEMetropolis):
@@ -393,12 +396,29 @@ def run_fitting(objective, method='differential_evolution',
                               f"for {nvary} parameters; bumping nwalkers "
                               f"{n_chains} → {min_chains}")
                         n_chains = min_chains
-                with pymc_model(objective) as _model:
-                    starter = {f"p{n}": p.value
-                               for n, p in enumerate(objective.varying_parameters())}
+
+                # Use a gradient-free as_op wrapper instead of refnx's
+                # _LogLikeWithGrad, which triggers numerical gradient evaluation
+                # at compile time and fails when bounds are tight.
+                @as_op(itypes=[pt.dvector], otypes=[pt.dscalar])
+                def _logl_op(theta):
+                    try:
+                        v = objective.logl(theta)
+                        result = v if np.isfinite(v) else -1e30
+                    except Exception:
+                        result = -1e30
+                    return np.array(result, dtype=np.float64)
+
+                vp = objective.varying_parameters()
+                with pm.Model() as _pm_model:
+                    params = [pm.Uniform(f"p{i}", lower=p.bounds.lb, upper=p.bounds.ub)
+                              for i, p in enumerate(vp)]
+                    pm.Potential("log-likelihood", _logl_op(pt.as_tensor_variable(params)))
+                    starter = {f"p{i}": p.value for i, p in enumerate(vp)}
                     trace = pm.sample(draws=steps, chains=n_chains,
                                       initvals=starter, step=step_fn,
                                       **_skws)
+
                 raw = np.stack([trace.posterior[f"p{i}"].data
                                 for i in range(nvary)], axis=-1)  # (chains, draws, nvary)
                 chain = raw.transpose(1, 0, 2)                    # (draws, chains, nvary)
@@ -478,11 +498,12 @@ def _stats_from_param_chains(objective):
         chain = getattr(p, 'chain', None)
         if chain is None or chain.size == 0:
             continue
+        flat = chain.ravel()   # param.chain may be (draws, walkers) — always flatten
         stats[p.name] = {
-            'mean':        float(np.mean(chain)),
-            'median':      float(np.median(chain)),
-            'std':         float(np.std(chain)),
-            'percentiles': np.percentile(chain, [16, 50, 84]),
+            'mean':        float(np.mean(flat)),
+            'median':      float(np.median(flat)),
+            'std':         float(np.std(flat)),
+            'percentiles': np.percentile(flat, [16, 50, 84]),
         }
     return stats
 
