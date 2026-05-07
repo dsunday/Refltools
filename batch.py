@@ -1059,3 +1059,380 @@ def batch_fit_sweep(batch_results, sweep_params, sample_name, model_name,
         'sample_name':     sample_name,
         'model_name':      model_name,
     }
+
+
+# ---------------------------------------------------------------------------
+# GPU-accelerated batch fitting functions
+# ---------------------------------------------------------------------------
+
+def batch_fit_selected_models_gpu(
+    objectives_dict,
+    energy_list=None,
+    popsize=20,
+    n_generations=300,
+    seed=0,
+    verbose=True,
+    sample_name=None,
+    model_name=None,
+    h5_filepath=None,
+    run_index=None,
+):
+    """
+    Fit reflectometry models for all energies simultaneously on GPU.
+
+    Replaces the sequential per-energy scipy DE loop in
+    batch_fit_selected_models with a batched JAX/evosax DE that optimises
+    all energies in parallel.  No MCMC sampling is performed.
+
+    Parameters
+    ----------
+    objectives_dict : dict {energy: refnx Objective}
+        Objectives ready for fitting (parameters configured with vary=True
+        and bounds set).
+    energy_list     : list of float, optional
+        Subset of energies to fit (default: all keys in objectives_dict).
+    popsize         : int
+        DE population size per energy (default 20).
+    n_generations   : int
+        Number of DE generations (default 300).
+    seed            : int
+        Random seed for reproducibility.
+    verbose         : bool
+        Print progress every 50 generations.
+    sample_name     : str, optional
+        HDF5 sample label; required if h5_filepath is given.
+    model_name      : str, optional
+        HDF5 model label (default 'Model1').
+    h5_filepath     : str or Path, optional
+        Save fitted objectives to this HDF5 file after all energies finish.
+    run_index       : int, optional
+        Explicit HDF5 run index (default: auto-increment).
+
+    Returns
+    -------
+    dict with keys matching batch_fit_selected_models output:
+        fitted_objectives  – {energy: Objective at best-fit params}
+        individual_results – {energy: {'objective': Objective, 'chisqr': float}}
+        summary_stats      – summary dict
+        fitted_energies    – sorted list of fitted energies
+        non_fitted_energies – []
+        elapsed_sec        – GPU wall time
+    """
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from gpu_sweep_optimizer import gpu_fit_models
+
+    if energy_list is None:
+        energy_list = sorted(objectives_dict.keys())
+
+    to_fit = [e for e in energy_list if e in objectives_dict]
+    if not to_fit:
+        print("batch_fit_selected_models_gpu: no valid energies found.")
+        return None
+
+    ename = model_name or "Model1"
+
+    print("=" * 60)
+    print("BATCH FITTING (GPU)")
+    print(f"  Energies: {len(to_fit)}  |  popsize: {popsize}  |  "
+          f"generations: {n_generations}")
+    print("=" * 60)
+
+    # Capture initial chi-squared before objectives are modified in-place
+    chi_init = {e: objectives_dict[e].chisqr() for e in to_fit}
+
+    gpu_result = gpu_fit_models(
+        objectives_dict=objectives_dict,
+        energy_list=to_fit,
+        popsize=popsize,
+        n_generations=n_generations,
+        seed=seed,
+        verbose=verbose,
+    )
+
+    fitted_objectives = gpu_result["fitted_objectives"]
+    best_chisqr_dict = gpu_result["best_chisqr"]
+
+    individual_results = {}
+    chi_init_total = chi_final_total = 0.0
+
+    for energy in to_fit:
+        ci = chi_init[energy]
+        chi_init_total += ci
+        fitted_obj = fitted_objectives[energy]
+        chi_final = float(best_chisqr_dict[energy])
+        chi_final_total += chi_final
+        individual_results[energy] = {
+            "objective": fitted_obj,
+            "chisqr": chi_final,
+        }
+        if verbose:
+            pct = (ci - chi_final) / ci * 100 if ci > 0 else 0.0
+            print(f"  {energy} eV: χ² {ci:.4g} → {chi_final:.4g}  "
+                  f"({pct:.1f}% improvement)")
+
+    summary = {
+        "total_models": len(to_fit),
+        "total_objectives_in_output": len(fitted_objectives),
+        "successful_fits": len(to_fit),
+        "failed_fits": 0,
+        "non_fitted_count": 0,
+        "initial_chi_squared_total": chi_init_total,
+        "final_chi_squared_total": chi_final_total,
+        "overall_improvement_percent": (
+            (chi_init_total - chi_final_total) / chi_init_total * 100
+            if chi_init_total > 0 else 0.0
+        ),
+        "elapsed_sec": gpu_result["elapsed_sec"],
+        "gpu_accelerated": True,
+    }
+
+    print(f"\nGPU fitting complete in {gpu_result['elapsed_sec']:.1f}s  "
+          f"(χ² improvement: {summary['overall_improvement_percent']:.1f}%)")
+
+    ret = {
+        "fitted_objectives":   fitted_objectives,
+        "individual_results":  individual_results,
+        "summary_stats":       summary,
+        "fitted_energies":     sorted(to_fit),
+        "non_fitted_energies": [],
+        "elapsed_sec":         gpu_result["elapsed_sec"],
+    }
+
+    if h5_filepath is not None and sample_name is not None:
+        save_batch_to_h5(
+            ret,
+            sample_name=sample_name,
+            model_name=ename,
+            filepath=h5_filepath,
+            energy_list=to_fit,
+            run_index=run_index,
+        )
+        print(f"Saved to {h5_filepath}")
+
+    return ret
+
+
+def batch_fit_sweep_gpu(
+    batch_results,
+    sweep_params,
+    sample_name,
+    model_name,
+    h5_filepath,
+    run_criteria='best',
+    uncertainty_percent=10,
+    popsize=20,
+    n_generations=200,
+    energy_list=None,
+    verbose=True,
+):
+    """
+    GPU-accelerated parameter sweep fitting across a batch of energies.
+
+    Drop-in replacement for batch_fit_sweep that uses JAX/evosax to run all
+    sweep-point optimizations simultaneously on GPU instead of sequentially
+    with scipy DE.
+
+    For each energy and each specified parameter, evaluates all sweep values
+    in a single batched GPU run, then extracts confidence intervals.
+
+    Parameters
+    ----------
+    batch_results       : dict
+        Output of batch_fit_selected_models or batch_fit_selected_models_gpu.
+        Must contain 'fitted_objectives'.
+    sweep_params        : list of dict
+        Each dict describes one parameter to sweep:
+            {'param': 'SOC - sld', 'delta': 1.0, 'step': 0.2}
+            {'param': 'SOC - sld', 'values': [4.0, 4.5, 5.0, 5.5]}
+    sample_name         : str
+        HDF5 sample label.
+    model_name          : str
+        HDF5 model label.
+    h5_filepath         : str or Path
+        Existing .h5 file to append sweep results to.
+    run_criteria        : 'best' | 'last' | int
+        Which run_N group to attach sweep results to per energy.
+    uncertainty_percent : float
+        GOF threshold for CI calculation.
+    popsize             : int
+        DE population size per sweep point (default 20).
+    n_generations       : int
+        DE generations per sweep (default 200).
+    energy_list         : list of float, optional
+        Subset of energies to process.
+    verbose             : bool
+
+    Returns
+    -------
+    Same dict structure as batch_fit_sweep:
+        sweep_results, ci_summary, swept_energies, skipped_energies,
+        h5_filepath, sample_name, model_name
+    """
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from gpu_sweep_optimizer import gpu_parameter_sweep, gpu_result_to_sweep_info
+
+    if 'fitted_objectives' not in batch_results:
+        raise ValueError("batch_results must contain 'fitted_objectives'.")
+
+    for i, spec in enumerate(sweep_params):
+        if 'param' not in spec:
+            raise ValueError(f"sweep_params[{i}] missing 'param' key.")
+        if 'values' not in spec and not ('delta' in spec and 'step' in spec):
+            raise ValueError(
+                f"sweep_params[{i}]: must have either 'values' or both "
+                f"'delta' and 'step'.")
+
+    if energy_list is not None:
+        working_energies = [
+            e for e in energy_list
+            if e in batch_results['fitted_objectives']
+        ]
+    else:
+        working_energies = batch_results.get(
+            'fitted_energies',
+            sorted(batch_results['fitted_objectives'].keys()))
+
+    all_sweep_results = {}
+    swept_energies    = []
+    skipped_energies  = []
+    ci_rows           = []
+
+    for energy in sorted(working_energies):
+        objective = batch_results['fitted_objectives'].get(energy)
+        if objective is None:
+            skipped_energies.append((energy, 'not in fitted_objectives'))
+            continue
+
+        if verbose:
+            print(f"\n{'─' * 60}")
+            print(f"  Energy: {energy} eV")
+
+        energy_sweep_data = {}
+
+        for spec in sweep_params:
+            param_name = spec['param']
+
+            if 'values' in spec:
+                sweep_values = np.asarray(spec['values'], dtype=float)
+            else:
+                delta = float(spec['delta'])
+                step  = float(spec['step'])
+
+                best_val = lb = ub = None
+                for p in objective.parameters.flattened(unique=True):
+                    if p.name == param_name:
+                        best_val = float(p.value)
+                        b = getattr(p, 'bounds', None)
+                        if b is not None:
+                            lb = float(b.lb) if hasattr(b, 'lb') else float(b[0])
+                            ub = float(b.ub) if hasattr(b, 'ub') else float(b[1])
+                        break
+
+                if best_val is None:
+                    print(f"  Warning: parameter '{param_name}' not found in "
+                          f"objective for {energy} eV — skipping sweep.")
+                    continue
+
+                raw_lo = best_val - delta
+                raw_hi = best_val + delta
+                clamped_lo = (max(raw_lo, lb) if lb is not None and np.isfinite(lb)
+                              else raw_lo)
+                clamped_hi = (min(raw_hi, ub) if ub is not None and np.isfinite(ub)
+                              else raw_hi)
+
+                if clamped_lo != raw_lo or clamped_hi != raw_hi:
+                    print(f"  Warning: sweep range for '{param_name}' at {energy} eV "
+                          f"clamped from [{raw_lo:.4g}, {raw_hi:.4g}] to "
+                          f"[{clamped_lo:.4g}, {clamped_hi:.4g}].")
+
+                sweep_values = np.arange(clamped_lo, clamped_hi + step / 2, step)
+                if len(sweep_values) == 0:
+                    print(f"  Warning: no sweep values generated for '{param_name}' "
+                          f"at {energy} eV after clamping — skipping.")
+                    continue
+
+            if verbose:
+                print(f"    Sweeping '{param_name}' (GPU): {len(sweep_values)} points "
+                      f"[{sweep_values[0]:.4g} → {sweep_values[-1]:.4g}]")
+
+            obj_copy = copy.deepcopy(objective)
+
+            try:
+                gpu_result = gpu_parameter_sweep(
+                    obj_copy,
+                    param_name=param_name,
+                    sweep_values=sweep_values,
+                    popsize=popsize,
+                    n_generations=n_generations,
+                    verbose=False,
+                )
+                sweep_info = gpu_result_to_sweep_info(
+                    gpu_result, obj_copy, param_name, sweep_values
+                )
+                ci_result = get_best_fit_with_uncertainty(
+                    sweep_info, uncertainty_percent
+                )
+            except ValueError as exc:
+                print(f"  Warning: sweep failed for '{param_name}' at "
+                      f"{energy} eV: {exc}")
+                continue
+            except Exception as exc:
+                print(f"  Warning: unexpected error sweeping '{param_name}' at "
+                      f"{energy} eV: {exc}")
+                continue
+
+            energy_sweep_data[param_name] = {
+                'sweep_info': sweep_info,
+                'ci_result':  ci_result,
+            }
+
+            lo, hi = ci_result['uncertainty_range']
+            ci_rows.append(dict(
+                energy=energy,
+                param_name=param_name,
+                best_value=ci_result['best_value'],
+                best_gof=ci_result['best_gof'],
+                ci_lower=lo,
+                ci_upper=hi,
+                uncertainty_width=ci_result['uncertainty_width'],
+                uncertainty_percent=ci_result['uncertainty_percent'],
+            ))
+
+            if verbose:
+                print(f"      CI ({uncertainty_percent}%): [{lo:.4g}, {hi:.4g}]  "
+                      f"width={ci_result['uncertainty_width']:.4g}  "
+                      f"best_gof={ci_result['best_gof']:.4g}  "
+                      f"elapsed={gpu_result['elapsed_sec']:.1f}s")
+
+        if energy_sweep_data:
+            save_sweep_results_to_h5(
+                energy_sweep_data, sample_name, model_name, h5_filepath,
+                energy, run_criteria=run_criteria,
+                uncertainty_percent=uncertainty_percent,
+            )
+            all_sweep_results[energy] = energy_sweep_data
+            swept_energies.append(energy)
+        else:
+            skipped_energies.append(
+                (energy, 'no sweep parameters produced results'))
+
+    ci_summary = (pd.DataFrame(ci_rows) if ci_rows
+                  else pd.DataFrame(columns=[
+                      'energy', 'param_name', 'best_value', 'best_gof',
+                      'ci_lower', 'ci_upper', 'uncertainty_width',
+                      'uncertainty_percent']))
+
+    print(f"\nGPU sweep complete: {len(swept_energies)} energies saved "
+          f"→ {h5_filepath}")
+
+    return {
+        'sweep_results':    all_sweep_results,
+        'ci_summary':       ci_summary,
+        'swept_energies':   swept_energies,
+        'skipped_energies': skipped_energies,
+        'h5_filepath':      str(h5_filepath),
+        'sample_name':      sample_name,
+        'model_name':       model_name,
+    }

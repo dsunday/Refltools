@@ -10,7 +10,7 @@ from scipy.interpolate import interp1d
 from refnx.dataset import ReflectDataset, Data1D
 from refnx.analysis import Transform, CurveFitter, Objective, Model, Parameter
 from refnx.reflect import SLD, Slab, ReflectModel, MaterialSLD
-from refnx.reflect.structure import isld_profile
+from refnx.reflect.structure import sld_profile as isld_profile
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
