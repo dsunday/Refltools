@@ -40,6 +40,7 @@ The schema is append-only: future versions may add new datasets or attributes
 inside run_N groups without breaking existing load code.
 """
 
+import os
 import datetime
 import numpy as np
 import h5py
@@ -323,6 +324,7 @@ def save_batch_to_h5(batch_results, sample_name, model_name, filepath,
     str_dt = h5py.string_dtype()
 
     saved = 0
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     with h5py.File(filepath, 'a') as f:
         for energy in energies:
             if energy not in fitted_objectives:
@@ -468,6 +470,7 @@ def save_sweep_results_to_h5(energy_sweep_data, sample_name, model_name,
     energy_key = str(float(energy))
     model_path = f"{sample_name}/{energy_key}/{model_name}"
 
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     with h5py.File(filepath, 'a') as f:
         if model_path not in f:
             raise KeyError(
@@ -649,6 +652,352 @@ def load_h5_objectives(filepath, sample_name, model_name,
     print(f"Loaded {len(objectives_dict)} objectives  "
           f"[{sample_name}/{model_name}, criteria={criteria!r}]  ← {filepath}")
     return objectives_dict, structures_dict
+
+
+def set_final_model(
+    filepath,
+    sample_name,
+    base_model,
+    overrides=None,
+    final_model_name='Final',
+    criteria='best',
+    overwrite=False,
+    verbose=True,
+):
+    """
+    Assemble a composite 'Final' model in the HDF5 file from pieces of existing models.
+
+    The *base_model* provides fitted parameters for every energy at which it
+    has data.  Each entry in *overrides* then replaces parameters for a
+    specific energy range or list with those from a different model.  Overrides
+    are applied in order, so later entries take precedence over earlier ones.
+
+    The resulting 'Final' (or *final_model_name*) group is written as a new
+    sibling of the source models — one ``run_0`` per energy, copied verbatim
+    from the winning source run.  Each copied run carries two extra attributes
+    recording provenance: ``source_model`` and ``source_run``.  The original
+    model data is never modified.
+
+    Because the copy is verbatim, energies that come from models with more
+    layers will have extra parameters (e.g. ``UL - sld``) that energies from
+    simpler models lack — this is fine and intentional.
+
+    Parameters
+    ----------
+    filepath : str or Path
+    sample_name : str
+    base_model : str
+        Model that provides the starting set of energies and parameters.
+    overrides : list of dict, optional
+        Each dict must contain ``'model'`` (str) plus either:
+
+        * ``'energy_range': (emin, emax)`` — all stored energies in
+          ``[emin, emax]`` (inclusive) are sourced from this model instead.
+        * ``'energy_list': [e1, e2, ...]`` — specific energies to override.
+
+        Example::
+
+            overrides = [
+                {'model': 'Model2', 'energy_range': (280, 282)},
+                {'model': 'Model3', 'energy_list': [285.0]},
+            ]
+
+    final_model_name : str
+        Name of the group to create.  Default ``'Final'``.
+    criteria : 'best' | 'last' | int
+        Run selection applied to each source model at each energy.
+        Default ``'best'`` (lowest ``chi_sq_final``).
+    overwrite : bool
+        If True, delete any existing *final_model_name* group at each energy
+        before writing.  If False (default), raise ``ValueError`` when the
+        Final group already exists at any energy.
+    verbose : bool
+        Print a summary line per energy.  Default True.
+
+    Returns
+    -------
+    dict
+        ``{energy: source_model_name}`` — the winning source model for every
+        energy written to the Final group.
+    """
+    from pathlib import Path as _Path
+
+    filepath = str(_Path(filepath).expanduser())
+
+    if overrides is None:
+        overrides = []
+
+    def _pick_run(model_grp):
+        run_keys = sorted(
+            [k for k in model_grp.keys() if k.startswith('run_')],
+            key=lambda k: int(k.split('_')[1]))
+        if not run_keys:
+            return None
+        if criteria == 'best':
+            return min(run_keys,
+                       key=lambda k: model_grp[k].attrs.get('chi_sq_final', np.inf))
+        if criteria == 'last':
+            return run_keys[-1]
+        if isinstance(criteria, int):
+            rkey = f'run_{criteria}'
+            return rkey if rkey in model_grp else None
+        raise ValueError(f"criteria must be 'best', 'last', or int — got {criteria!r}")
+
+    provenance = {}
+
+    with h5py.File(filepath, 'a') as f:
+        if sample_name not in f:
+            raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
+        sample_grp = f[sample_name]
+
+        # All energies present in the file
+        all_keys = sorted([k for k in sample_grp.keys() if _is_energy_key(k)], key=float)
+
+        # Build energy → source_model mapping starting from base_model
+        source_map = {}   # ekey (str) → model name
+        for ekey in all_keys:
+            if base_model in sample_grp[ekey]:
+                source_map[ekey] = base_model
+
+        # Apply overrides in order (later entries win)
+        for ov in overrides:
+            ov_model = ov['model']
+            if 'energy_range' in ov:
+                emin, emax = float(ov['energy_range'][0]), float(ov['energy_range'][1])
+                affected = [k for k in all_keys if emin <= float(k) <= emax]
+            elif 'energy_list' in ov:
+                wanted = {str(float(e)) for e in ov['energy_list']}
+                affected = [k for k in all_keys if k in wanted]
+            else:
+                raise ValueError(
+                    f"Each override must have 'energy_range' or 'energy_list': {ov!r}")
+
+            for ekey in affected:
+                if ov_model in sample_grp[ekey]:
+                    source_map[ekey] = ov_model
+                else:
+                    print(f"  Warning: '{ov_model}' not found at {ekey} eV — skipping override.")
+
+        if not source_map:
+            raise ValueError(
+                f"No energies found for base model '{base_model}' in '{sample_name}'.")
+
+        # Check for existing Final groups before writing anything
+        if not overwrite:
+            conflicts = [ekey for ekey in source_map
+                         if final_model_name in sample_grp[ekey]]
+            if conflicts:
+                raise ValueError(
+                    f"'{final_model_name}' already exists at energies: "
+                    f"{[float(k) for k in conflicts]}. "
+                    f"Pass overwrite=True to replace.")
+
+        # Write Final model
+        for ekey in sorted(source_map, key=float):
+            src_model = source_map[ekey]
+            energy_grp = sample_grp[ekey]
+            model_grp  = energy_grp[src_model]
+
+            src_rkey = _pick_run(model_grp)
+            if src_rkey is None:
+                print(f"  Warning: no runs found for '{src_model}' at {ekey} eV — skipping.")
+                continue
+
+            # Remove existing Final group at this energy if overwriting
+            if final_model_name in energy_grp:
+                del energy_grp[final_model_name]
+
+            final_grp = energy_grp.require_group(final_model_name)
+
+            # Copy the entire source run verbatim into Final/run_0
+            f.copy(model_grp[src_rkey], final_grp, name='run_0')
+
+            # Record provenance
+            final_grp['run_0'].attrs['source_model'] = src_model
+            final_grp['run_0'].attrs['source_run']   = src_rkey
+
+            provenance[float(ekey)] = src_model
+            if verbose:
+                chi = model_grp[src_rkey].attrs.get('chi_sq_final', float('nan'))
+                print(f"  {float(ekey):7.2f} eV  ←  {src_model}/{src_rkey}"
+                      f"  (χ² = {chi:.4g})")
+
+    n = len(provenance)
+    n_models = len(set(provenance.values()))
+    print(f"\n'{final_model_name}' written: {n} energies from {n_models} source model(s).")
+    return provenance
+
+
+def extract_sld_from_h5(
+    filepath,
+    sample_name,
+    model_names,
+    criteria='best',
+    materials_filter=None,
+    energy_list=None,
+    energy_range=None,
+    verbose=True,
+    save_path=None,
+):
+    """
+    Extract fitted SLD parameters from an HDF5 results file.
+
+    Mirrors the output of ``Model_Setup.extract_sld_from_objectives`` so the
+    two can be used interchangeably.  Parameters are filtered to only those
+    whose name indicates an SLD or density value (same logic as
+    ``get_param_type`` returning ``'sld_real'``, ``'sld_imag'``, or
+    ``'density'``).
+
+    Parameters
+    ----------
+    filepath : str or Path
+    sample_name : str
+    model_names : str or list of str
+        One or more model labels to extract.  A ``model`` column is always
+        included in the output so results from different models can be
+        distinguished when multiple names are given.
+    criteria : 'best' | 'last' | int
+        Run selection per energy.  ``'best'`` (default) picks the run with
+        the lowest ``chi_sq_final``.
+    materials_filter : str or list of str, optional
+        Only include parameters whose name contains at least one of these
+        substrings (case-insensitive).  Matches the *materials_filter*
+        argument of ``extract_sld_from_objectives``.  Default None = all SLD
+        parameters.
+    energy_list : list of float, optional
+        Subset of energies to extract.  Default = all energies in the file.
+    energy_range : (emin, emax), optional
+        Inclusive energy interval.  Ignored when *energy_list* is given.
+    verbose : bool
+        Print progress.  Default True.
+    save_path : str or Path, optional
+        When provided, saves a CSV of ``[Energy_eV, Real_SLD, Imag_SLD]``
+        in the same format as ``Model_Setup.save_material_sld``.  Works best
+        when ``model_names`` is a single model and ``materials_filter``
+        targets one material.  Skipped with a warning if multiple models are
+        requested.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns: ``energy``, ``model``, ``parameter``, ``value``,
+        ``stderr``, ``vary``.  Compatible with ``plot_material_sld`` and
+        ``save_material_sld`` from ``Model_Setup``.
+    """
+    import pandas as pd
+    from pathlib import Path as _Path
+
+    if isinstance(model_names, str):
+        model_names = [model_names]
+    if isinstance(materials_filter, str):
+        materials_filter = [materials_filter]
+
+    filepath = str(_Path(filepath).expanduser())
+
+    def _is_sld_param(name):
+        n = name.lower()
+        return 'isld' in n or 'sld' in n or '_density' in n
+
+    rows = []
+
+    with h5py.File(filepath, 'r') as f:
+        if sample_name not in f:
+            raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
+        sample_grp = f[sample_name]
+
+        all_keys = sorted([k for k in sample_grp.keys() if _is_energy_key(k)], key=float)
+        if energy_list is not None:
+            wanted = {str(float(e)) for e in energy_list}
+            energy_keys = [k for k in all_keys if k in wanted]
+        elif energy_range is not None:
+            emin, emax = float(energy_range[0]), float(energy_range[1])
+            energy_keys = [k for k in all_keys if emin <= float(k) <= emax]
+        else:
+            energy_keys = all_keys
+
+        for ekey in energy_keys:
+            energy_val = float(ekey)
+            energy_grp = sample_grp[ekey]
+
+            for mname in model_names:
+                if mname not in energy_grp:
+                    continue
+                model_grp = energy_grp[mname]
+
+                run_keys = sorted(
+                    [k for k in model_grp.keys() if k.startswith('run_')],
+                    key=lambda k: int(k.split('_')[1]))
+                if not run_keys:
+                    continue
+
+                if criteria == 'best':
+                    rkey = min(
+                        run_keys,
+                        key=lambda k: model_grp[k].attrs.get('chi_sq_final', np.inf))
+                elif criteria == 'last':
+                    rkey = run_keys[-1]
+                elif isinstance(criteria, int):
+                    rkey = f'run_{criteria}'
+                    if rkey not in model_grp:
+                        continue
+                else:
+                    raise ValueError(
+                        f"criteria must be 'best', 'last', or int — got {criteria!r}")
+
+                pg     = model_grp[rkey]['parameters']
+                pnames = _decode_strings(pg['names'][:])
+                vals   = pg['final_values'][:]
+                vary   = pg['final_vary'][:].astype(bool)
+                stderr = pg['stderr'][:] if 'stderr' in pg else np.full(len(pnames), np.nan)
+
+                for i, pname in enumerate(pnames):
+                    if not _is_sld_param(pname):
+                        continue
+                    if materials_filter and not any(
+                            m.lower() in pname.lower() for m in materials_filter):
+                        continue
+                    rows.append(dict(
+                        energy=energy_val,
+                        model=mname,
+                        parameter=pname,
+                        value=float(vals[i]),
+                        stderr=float(stderr[i]) if np.isfinite(stderr[i]) else None,
+                        vary=bool(vary[i]),
+                    ))
+
+            if verbose:
+                print(f"Processed {energy_val} eV ({len(rows)} params so far)")
+
+    df = pd.DataFrame(rows)
+
+    # ---- optional save ------------------------------------------------------
+    if save_path is not None:
+        if len(model_names) > 1:
+            print("  Warning: save_path is ignored when multiple models are "
+                  "requested — save separately per model.")
+        else:
+            import os
+            from pathlib import Path as _Path2
+            sub = df.copy()
+            real = sub[sub['parameter'].str.lower().str.contains('sld') &
+                        ~sub['parameter'].str.lower().str.contains('isld')]
+            imag = sub[sub['parameter'].str.lower().str.contains('isld')]
+            real = real[['energy', 'value']].rename(columns={'value': 'Real_SLD'})
+            imag = imag[['energy', 'value']].rename(columns={'value': 'Imag_SLD'})
+            merged = real.merge(imag, on='energy').sort_values('energy')
+            arr = merged[['energy', 'Real_SLD', 'Imag_SLD']].to_numpy(dtype=float)
+
+            mat_label = ('+'.join(materials_filter)
+                         if materials_filter else 'SLD')
+            sp = str(_Path2(save_path).expanduser())
+            if not sp.endswith('.csv'):
+                sp += '.csv'
+            os.makedirs(os.path.dirname(sp) or '.', exist_ok=True)
+            header = f'{mat_label} SLD data\nEnergy_eV,Real_SLD,Imag_SLD'
+            np.savetxt(sp, arr, delimiter=',', header=header, comments='')
+            print(f'Saved {mat_label} SLD ({len(arr)} energies) → {sp}')
+
+    return df
 
 
 def _near_bound(value, lb, ub, tol_pct):
@@ -1003,6 +1352,365 @@ def plot_parameter_vs_energy(
     return ax_main
 
 
+# ---------------------------------------------------------------------------
+# Private helpers for plot_material_comparison
+# ---------------------------------------------------------------------------
+
+def _plot_material_comparison_plotly(
+        model_data, model_names, material_name, sample_name,
+        show_pct_diff, figsize, xlim):
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+    import plotly.colors as pc
+
+    gf_title = 'Δχ²/min(χ²) [%]' if show_pct_diff else 'χ² (open = better fit)'
+    subplot_titles = ['SLD', 'iSLD', 'Thickness', 'Roughness', gf_title]
+    ylabels = [
+        f'{material_name} - sld (×10⁻⁶ Å⁻²)',
+        f'{material_name} - isld (×10⁻⁶ Å⁻²)',
+        f'{material_name} - thick (Å)',
+        f'{material_name} - rough (Å)',
+        gf_title,
+    ]
+
+    # 5-row × 1-col grid with shared x-axis so GF aligns with parameter points
+    fig = make_subplots(
+        rows=5, cols=1,
+        subplot_titles=['SLD', 'iSLD', 'Thickness', 'Roughness', gf_title],
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+    )
+    colors       = pc.qualitative.Plotly
+    base_markers = ['circle', 'square']
+    param_keys   = ['sld', 'isld', 'thick', 'rough']
+
+    # ---- main 4 parameter panels ----------------------------------------
+    for m_idx, mname in enumerate(model_names):
+        color      = colors[m_idx % len(colors)]
+        marker_sym = base_markers[m_idx % len(base_markers)]
+        mdata      = model_data[mname]
+        if len(mdata['energies']) == 0:
+            print(f"  Warning: no data found for model '{mname}'.")
+            continue
+        E = mdata['energies'].tolist()
+
+        for row, pkey in enumerate(param_keys, start=1):
+            V = mdata[pkey].tolist()
+            fig.add_trace(
+                go.Scatter(
+                    x=E, y=V,
+                    mode='lines+markers',
+                    name=mname,
+                    legendgroup=mname,
+                    showlegend=(row == 1),
+                    marker=dict(symbol=marker_sym, color=color, size=8),
+                    line=dict(color=color),
+                ),
+                row=row, col=1,
+            )
+
+    # ---- GF panel (row 5) -----------------------------------------------
+    mname_A, mname_B = model_names
+    dA, dB = model_data[mname_A], model_data[mname_B]
+    eA_map = {e: i for i, e in enumerate(dA['energies'].tolist())}
+    eB_map = {e: i for i, e in enumerate(dB['energies'].tolist())}
+
+    if show_pct_diff:
+        common_e = sorted(set(eA_map) & set(eB_map))
+        if common_e:
+            chi_A    = np.array([dA['chi_sq'][eA_map[e]] for e in common_e])
+            chi_B    = np.array([dB['chi_sq'][eB_map[e]] for e in common_e])
+            pct_diff = (chi_A - chi_B) / np.minimum(chi_A, chi_B) * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=common_e, y=pct_diff.tolist(),
+                    mode='lines+markers',
+                    name='Δχ²%',
+                    marker=dict(symbol='diamond', color='purple', size=8),
+                    line=dict(color='purple'),
+                ),
+                row=5, col=1,
+            )
+            fig.add_hline(y=0, line_dash='dash', line_color='gray', row=5, col=1)
+    else:
+        for m_idx, (mname, mdata, mmap, other_map, other_data) in enumerate([
+            (mname_A, dA, eA_map, eB_map, dB),
+            (mname_B, dB, eB_map, eA_map, dA),
+        ]):
+            color    = colors[m_idx % len(colors)]
+            base_sym = base_markers[m_idx % len(base_markers)]
+            E   = mdata['energies'].tolist()
+            chi = mdata['chi_sq'].tolist()
+
+            symbols = []
+            for e, c in zip(E, chi):
+                if e in other_map:
+                    other_c = float(other_data['chi_sq'][other_map[e]])
+                    symbols.append(f'{base_sym}-open' if c <= other_c else base_sym)
+                else:
+                    symbols.append(base_sym)
+
+            fig.add_trace(
+                go.Scatter(
+                    x=E, y=chi,
+                    mode='lines+markers',
+                    name=mname,
+                    legendgroup=mname,
+                    showlegend=False,
+                    marker=dict(symbol=symbols, color=color, size=8),
+                    line=dict(color=color),
+                ),
+                row=5, col=1,
+            )
+
+    # ---- axis labels --------------------------------------------------------
+    for row, ylabel in enumerate(ylabels, start=1):
+        fig.update_yaxes(title_text=ylabel, row=row, col=1)
+        if xlim is not None:
+            fig.update_xaxes(range=list(xlim), row=row, col=1)
+    fig.update_xaxes(title_text='Energy (eV)', row=5, col=1)
+
+    w, h = figsize if figsize else (700, 1100)
+    fig.update_layout(
+        width=w, height=h,
+        title_text=f'{sample_name}  —  {material_name}  (model comparison)',
+    )
+    return fig
+
+
+def _plot_material_comparison_mpl(
+        model_data, model_names, material_name, sample_name,
+        show_pct_diff, figsize, xlim):
+    import matplotlib.pyplot as plt
+
+    gf_title = 'Δχ²/min(χ²) [%]' if show_pct_diff else 'χ² (open = better fit)'
+    titles   = ['SLD', 'iSLD', 'Thickness', 'Roughness', gf_title]
+    ylabels  = [
+        f'{material_name} - sld (×10⁻⁶ Å⁻²)',
+        f'{material_name} - isld (×10⁻⁶ Å⁻²)',
+        f'{material_name} - thick (Å)',
+        f'{material_name} - rough (Å)',
+        gf_title,
+    ]
+
+    fig, axes = plt.subplots(5, 1, figsize=figsize or (8, 14), sharex=True)
+    colors      = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    mpl_markers = ['o', 's']
+    param_keys  = ['sld', 'isld', 'thick', 'rough']
+
+    # ---- main 4 parameter panels ----------------------------------------
+    for m_idx, mname in enumerate(model_names):
+        color  = colors[m_idx % len(colors)]
+        marker = mpl_markers[m_idx % len(mpl_markers)]
+        mdata  = model_data[mname]
+        if len(mdata['energies']) == 0:
+            print(f"  Warning: no data found for model '{mname}'.")
+            continue
+        E = mdata['energies']
+        for p_idx, pkey in enumerate(param_keys):
+            axes[p_idx].plot(E, mdata[pkey], marker=marker, linestyle='-',
+                             color=color, label=mname)
+
+    # ---- 5th panel: GF or % diff ----------------------------------------
+    mname_A, mname_B = model_names
+    dA, dB = model_data[mname_A], model_data[mname_B]
+    eA_map = {e: i for i, e in enumerate(dA['energies'].tolist())}
+    eB_map = {e: i for i, e in enumerate(dB['energies'].tolist())}
+
+    if show_pct_diff:
+        common_e = sorted(set(eA_map) & set(eB_map))
+        if common_e:
+            chi_A    = np.array([dA['chi_sq'][eA_map[e]] for e in common_e])
+            chi_B    = np.array([dB['chi_sq'][eB_map[e]] for e in common_e])
+            pct_diff = (chi_A - chi_B) / np.minimum(chi_A, chi_B) * 100
+            axes[4].plot(common_e, pct_diff, 'D-', color='purple',
+                         label=f'Δχ²%  ({mname_A} vs {mname_B})')
+            axes[4].axhline(0, color='gray', linestyle='--', lw=1)
+    else:
+        for m_idx, (mname, mdata, mmap, other_map, other_data) in enumerate([
+            (mname_A, dA, eA_map, eB_map, dB),
+            (mname_B, dB, eB_map, eA_map, dA),
+        ]):
+            color  = colors[m_idx % len(colors)]
+            marker = mpl_markers[m_idx % len(mpl_markers)]
+            E   = mdata['energies']
+            chi = mdata['chi_sq']
+
+            is_better = np.array([
+                e in other_map and chi[i] <= float(other_data['chi_sq'][other_map[e]])
+                for i, e in enumerate(E.tolist())
+            ], dtype=bool)
+
+            axes[4].plot(E, chi, linestyle='-', color=color, label='_nolegend_')
+            if np.any(is_better):
+                axes[4].plot(E[is_better], chi[is_better],
+                             marker=marker, linestyle='', color=color,
+                             markerfacecolor='none', markersize=8,
+                             label=f'{mname} (better)')
+            if np.any(~is_better):
+                axes[4].plot(E[~is_better], chi[~is_better],
+                             marker=marker, linestyle='', color=color,
+                             markerfacecolor=color, markersize=8,
+                             label=f'{mname} (worse)')
+
+    for ax, title, ylabel in zip(axes, titles, ylabels):
+        ax.set_title(title, fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.legend(fontsize=8)
+        if xlim is not None:
+            ax.set_xlim(xlim)
+    axes[-1].set_xlabel('Energy (eV)', fontsize=9)
+
+    fig.suptitle(f'{sample_name}  —  {material_name}  (model comparison)')
+    fig.tight_layout()
+    return axes
+
+
+def plot_material_comparison(
+    filepath,
+    sample_name,
+    material_name,
+    model_names,
+    criteria='best',
+    energy_list=None,
+    show_pct_diff=False,
+    figsize=None,
+    xlim=None,
+    interactive=True,
+):
+    """
+    Compare two fitted models side-by-side for all parameters of one material.
+
+    Produces five panels: SLD, iSLD, thickness, roughness (one per fitted
+    parameter), and a goodness-of-fit panel. In the GF panel the model with
+    the lower chi_sq at each energy is shown with an **open** marker; the
+    worse-fitting model uses a filled marker. Set ``show_pct_diff=True`` to
+    replace the GF panel with the percentage difference in chi_sq between
+    the two models.
+
+    Parameters
+    ----------
+    filepath : str or Path
+    sample_name : str
+    material_name : str
+        Material prefix as stored in HDF5 parameter names, e.g. ``'MOX'``
+        reads ``'MOX - sld'``, ``'MOX - isld'``, ``'MOX - thick'``,
+        ``'MOX - rough'``.
+    model_names : list of str
+        Exactly two model labels to compare.
+    criteria : 'best' | 'last' | int
+        Run selection per energy.  ``'best'`` (default) picks the run with
+        the lowest ``chi_sq_final``.
+    energy_list : list of float, optional
+        Subset of energies to include.  Defaults to all energies in the file.
+    show_pct_diff : bool
+        If True, the 5th panel shows the percentage difference in chi_sq:
+        ``(chi_A − chi_B) / min(chi_A, chi_B) × 100``.  Positive means
+        model A fits worse.  Default False.
+    figsize : (width, height), optional
+        Figure size.  Defaults to ``(700, 1100)`` pixels for plotly or
+        ``(8, 14)`` inches for matplotlib.
+    xlim : (xmin, xmax), optional
+        Applied to all subplots.
+    interactive : bool
+        If True (default) returns a plotly Figure with zoom/pan.
+        If False returns an ndarray of 5 matplotlib Axes.
+
+    Returns
+    -------
+    fig : plotly.graph_objects.Figure
+        Returned when ``interactive=True``.
+    axes : ndarray of matplotlib.axes.Axes, shape (5,)
+        Returned when ``interactive=False``.
+    """
+    import h5py
+    from pathlib import Path as _Path
+
+    if len(model_names) != 2:
+        raise ValueError(
+            f"plot_material_comparison requires exactly 2 model names, "
+            f"got {len(model_names)}: {model_names!r}")
+
+    filepath = str(_Path(filepath).expanduser())
+    param_suffixes = [
+        ('sld',   f'{material_name} - sld'),
+        ('isld',  f'{material_name} - isld'),
+        ('thick', f'{material_name} - thick'),
+        ('rough', f'{material_name} - rough'),
+    ]
+
+    # ---- collect data from HDF5 (file closed before any plotting) ----------
+    model_data = {
+        mname: {'energies': [], 'sld': [], 'isld': [],
+                'thick': [], 'rough': [], 'chi_sq': []}
+        for mname in model_names
+    }
+
+    with h5py.File(filepath, 'r') as f:
+        if sample_name not in f:
+            raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
+        sample_grp = f[sample_name]
+
+        energy_keys = sorted(
+            [k for k in sample_grp.keys() if _is_energy_key(k)], key=float)
+        if energy_list is not None:
+            wanted = {str(float(e)) for e in energy_list}
+            energy_keys = [k for k in energy_keys if k in wanted]
+
+        for mname in model_names:
+            mdata = model_data[mname]
+            for ekey in energy_keys:
+                energy_grp = sample_grp[ekey]
+                if mname not in energy_grp:
+                    continue
+                model_grp = energy_grp[mname]
+
+                run_keys = sorted(
+                    [k for k in model_grp.keys() if k.startswith('run_')],
+                    key=lambda k: int(k.split('_')[1]))
+                if not run_keys:
+                    continue
+
+                if criteria == 'best':
+                    rkey = min(
+                        run_keys,
+                        key=lambda k: model_grp[k].attrs.get('chi_sq_final', np.inf))
+                elif criteria == 'last':
+                    rkey = run_keys[-1]
+                elif isinstance(criteria, int):
+                    rkey = f'run_{criteria}'
+                    if rkey not in model_grp:
+                        continue
+                else:
+                    raise ValueError(
+                        f"criteria must be 'best', 'last', or int — got {criteria!r}")
+
+                rg           = model_grp[rkey]
+                pg           = rg['parameters']
+                pnames       = _decode_strings(pg['names'][:])
+                final_values = pg['final_values'][:]
+
+                mdata['energies'].append(float(ekey))
+                for key, pname in param_suffixes:
+                    mdata[key].append(
+                        float(final_values[pnames.index(pname)])
+                        if pname in pnames else np.nan)
+                mdata['chi_sq'].append(float(rg.attrs.get('chi_sq_final', np.nan)))
+
+    for mname in model_names:
+        d = model_data[mname]
+        for k in d:
+            d[k] = np.array(d[k])
+
+    if interactive:
+        return _plot_material_comparison_plotly(
+            model_data, model_names, material_name, sample_name,
+            show_pct_diff, figsize, xlim)
+    return _plot_material_comparison_mpl(
+        model_data, model_names, material_name, sample_name,
+        show_pct_diff, figsize, xlim)
+
+
 def plot_reflectivity(
     filepath,
     sample_name,
@@ -1213,6 +1921,616 @@ def plot_reflectivity(
     fig.suptitle(suptitle, fontsize=11)
     fig.tight_layout()
     return fig, axes_flat[:n_panels]
+
+
+def plot_stacked_reflectivity_h5(
+    filepath,
+    sample_name,
+    model_name,
+    energies_to_plot=None,
+    criteria='best',
+    spacing=10,
+    colormap='viridis',
+    figsize=(10, 12),
+    title=None,
+    show_legend=True,
+    sim_color=None,
+    label_color='black',
+    label_fontsize=9,
+    label_fontfamily=None,
+    label_fontweight='bold',
+    save_path=None,
+    save_dir=None,
+    save_name=None,
+    save_format='png',
+    save_dpi=300,
+    save_bbox_inches='tight',
+    show_save_ui=False,
+):
+    """
+    Stacked reflectivity plot (exp + sim) sourced from an HDF5 results file.
+
+    Drop-in equivalent of ``plot_stacked_reflectivity`` for HDF5 data.
+    Experimental data and fitted parameters are read directly from the file;
+    the simulated curve is reconstructed from the stored layer structure and
+    final parameter values.
+
+    Parameters
+    ----------
+    filepath : str or Path
+    sample_name : str
+    model_name : str
+        Model label to plot (e.g. ``'Model1'`` or ``'Final'``).
+    energies_to_plot : None | list of float | (emin, emax) | list of (emin, emax)
+        * ``None`` — all energies in the file.
+        * ``[e1, e2, ...]`` — explicit energy values.
+        * ``(emin, emax)`` — inclusive energy range.
+        * ``[(emin1, emax1), (emin2, emax2), ...]`` — union of ranges.
+    criteria : 'best' | 'last' | int
+        Run selection per energy.  Default ``'best'``.
+    spacing : float
+        Multiplicative offset between successive curves.  Default 10.
+    colormap : str
+        Matplotlib colormap name.  Default ``'viridis'``.
+    figsize : (width, height)
+        Figure size in inches.  Default ``(10, 12)``.
+    title : str, optional
+        Plot title.  Defaults to a generic stacked-reflectivity title.
+    show_legend : bool
+        Show legend.  Default True.
+    sim_color : color, optional
+        Fixed colour for all simulated lines.  Default: same as exp colour.
+    label_color : str
+        Colour of the inline energy labels.  Default ``'black'``.
+    label_fontsize : int
+        Font size for energy labels.  Default 9.
+    label_fontfamily : str, optional
+        Font family for energy labels.
+    label_fontweight : str
+        Font weight for energy labels.  Default ``'bold'``.
+    save_path : str, optional
+        Full path to save the figure directly.
+    save_dir : str, optional
+        Directory for save_dir + save_name saves.
+    save_name : str, optional
+        Filename (extension optional) for save_dir + save_name saves.
+    save_format : str
+        Format used when save_name has no extension.  Default ``'png'``.
+    save_dpi : int
+        DPI for raster formats.  Default 300.
+    save_bbox_inches : str
+        Passed to ``fig.savefig``.  Default ``'tight'``.
+    show_save_ui : bool
+        Display an ipywidgets save UI after the figure.  Default False.
+
+    Returns
+    -------
+    (fig, ax) : matplotlib.figure.Figure, matplotlib.axes.Axes
+    """
+    import os
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+    from pathlib import Path as _Path
+
+    filepath = str(_Path(filepath).expanduser())
+
+    # ---- collect data from HDF5 (file closed before plotting) --------------
+    with h5py.File(filepath, 'r') as f:
+        if sample_name not in f:
+            raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
+        sample_grp = f[sample_name]
+        all_keys = sorted([k for k in sample_grp.keys() if _is_energy_key(k)], key=float)
+        all_energies = [float(k) for k in all_keys]
+
+        # --- energy selection (mirrors plot_stacked_reflectivity logic) -----
+        if energies_to_plot is None:
+            selected_energies = all_energies
+        elif (isinstance(energies_to_plot, (list, tuple))
+              and len(energies_to_plot) == 2
+              and isinstance(energies_to_plot[0], (int, float))):
+            emin, emax = float(energies_to_plot[0]), float(energies_to_plot[1])
+            selected_energies = [e for e in all_energies if emin <= e <= emax]
+            if not selected_energies:
+                raise ValueError(f"No energies found in range ({emin}, {emax}).")
+        else:
+            energies_to_plot = list(energies_to_plot)
+            if energies_to_plot and isinstance(energies_to_plot[0], (list, tuple)):
+                selected_energies = []
+                for rng in energies_to_plot:
+                    mn, mx = float(rng[0]), float(rng[1])
+                    selected_energies.extend(e for e in all_energies if mn <= e <= mx)
+                selected_energies = sorted(set(selected_energies))
+                if not selected_energies:
+                    raise ValueError("No energies found in the specified ranges.")
+            else:
+                wanted = {float(e) for e in energies_to_plot}
+                selected_energies = [e for e in all_energies if e in wanted]
+                missing = wanted - set(selected_energies)
+                if missing:
+                    print(f"  Warning: energies not found in file: {sorted(missing)}")
+                if not selected_energies:
+                    raise ValueError("None of the specified energies were found.")
+
+        selected_energies = sorted(selected_energies)
+
+        # --- reconstruct exp + sim for each selected energy ------------------
+        panel_data = {}
+        ekey_map = {float(k): k for k in all_keys}
+
+        for energy in selected_energies:
+            ekey = ekey_map.get(energy)
+            if ekey is None or model_name not in sample_grp[ekey]:
+                print(f"  Warning: '{model_name}' not found at {energy} eV — skipping.")
+                continue
+            model_grp = sample_grp[ekey][model_name]
+
+            run_keys = sorted(
+                [k for k in model_grp.keys() if k.startswith('run_')],
+                key=lambda k: int(k.split('_')[1]))
+            if not run_keys:
+                continue
+
+            if criteria == 'best':
+                rkey = min(run_keys,
+                           key=lambda k: model_grp[k].attrs.get('chi_sq_final', np.inf))
+            elif criteria == 'last':
+                rkey = run_keys[-1]
+            elif isinstance(criteria, int):
+                rkey = f'run_{criteria}'
+                if rkey not in model_grp:
+                    continue
+            else:
+                raise ValueError(
+                    f"criteria must be 'best', 'last', or int — got {criteria!r}")
+
+            rg = model_grp[rkey]
+            pg = rg['parameters']
+            dg = rg['data']
+            q  = dg['q'][:]
+            R  = dg['R'][:]
+            dR = dg['dR'][:] if 'dR' in dg else None
+
+            try:
+                obj, _ = _reconstruct_objective(
+                    _decode_strings(rg['layer_names'][:]),
+                    rg['structure_slabs_final'][:],
+                    _decode_strings(pg['names'][:]),
+                    pg['final_values'][:],
+                    pg['final_lb'][:],
+                    pg['final_ub'][:],
+                    pg['final_vary'][:],
+                    q, R, dR,
+                    transform=rg.attrs.get('transform', 'logY'))
+                panel_data[energy] = (q, R, obj.model(q))
+            except Exception as exc:
+                print(f"  Warning: could not reconstruct {energy} eV: {exc}")
+
+    if not panel_data:
+        raise ValueError("No data could be loaded for the selected energies / model.")
+
+    selected_energies = sorted(panel_data.keys())
+    n_energies = len(selected_energies)
+
+    # ---- colours and offsets (identical to plot_stacked_reflectivity) -------
+    offsets = [spacing ** (n_energies - 1 - i) for i in range(n_energies)]
+
+    try:
+        cmap = cm.get_cmap(colormap)
+    except ValueError:
+        raise ValueError(f"Colormap '{colormap}' not found.")
+
+    color_values = [0.5] if n_energies == 1 else [i / (n_energies - 1) for i in range(n_energies)]
+    colors = [cmap(v) for v in color_values]
+
+    # ---- plot ---------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for i, energy in enumerate(selected_energies):
+        q, R_exp, R_sim = panel_data[energy]
+        offset = offsets[i]
+        color  = colors[i]
+
+        ax.plot(q, R_exp * offset, 'o',
+                markerfacecolor='none', markeredgecolor=color,
+                markersize=4, label=f'{energy} eV')
+        ax.plot(q, R_sim * offset, '-',
+                color=sim_color if sim_color is not None else color,
+                linewidth=1.5)
+
+    ax.set_yscale('log')
+    ax.set_xlabel(r'$q$ ($\AA^{-1}$)', fontsize=16)
+    ax.set_ylabel('Reflectivity (a.u.)', fontsize=16)
+    ax.set_title(title or 'Stacked Reflectivity: Experimental vs Simulated', fontsize=14)
+    if show_legend:
+        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(labelsize=10)
+
+    # inline energy labels at right end of simulated curve
+    for i, energy in enumerate(selected_energies):
+        q, _, R_sim = panel_data[energy]
+        offset = offsets[i]
+        end_q  = q[np.argmax(q)]
+        end_R  = R_sim[np.argmax(q)] * offset
+
+        text_kw = dict(verticalalignment='center', horizontalalignment='left',
+                       fontsize=label_fontsize, color=label_color, weight=label_fontweight)
+        if label_fontfamily is not None:
+            text_kw['fontfamily'] = label_fontfamily
+        ax.text(end_q, end_R, f' {energy} eV', **text_kw)
+
+    max_q_all = max(panel_data[e][0].max() for e in selected_energies)
+    cur_xlim  = ax.get_xlim()
+    ax.set_xlim(cur_xlim[0], max(cur_xlim[1], max_q_all * 1.15))
+
+    plt.tight_layout()
+
+    # ---- saving (identical helpers to plot_stacked_reflectivity) ------------
+    def _norm_name(name):
+        if name is None or str(name).strip() == '':
+            return None
+        name = str(name).strip()
+        if os.path.splitext(name)[1] == '':
+            name = f'{name}.{save_format}'
+        return name
+
+    def _save_to(path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+        fig.savefig(path, dpi=save_dpi, bbox_inches=save_bbox_inches)
+        print(f'Saved → {os.path.abspath(path)}')
+        return path
+
+    if save_path is not None:
+        _save_to(os.path.abspath(save_path))
+    else:
+        nname = _norm_name(save_name)
+        if save_dir is not None and nname is not None:
+            _save_to(os.path.abspath(os.path.join(save_dir, nname)))
+
+    if show_save_ui:
+        import ipywidgets as widgets
+        from IPython.display import display as _display
+
+        start_dir  = os.path.abspath(save_dir or os.getcwd())
+        dir_text   = widgets.Text(value=start_dir, description='Dir:',
+                                  layout=widgets.Layout(width='600px'))
+        refresh_btn = widgets.Button(description='Refresh folders')
+        folder_dd  = widgets.Dropdown(description='Folder:',
+                                      layout=widgets.Layout(width='600px'))
+        name_text  = widgets.Text(
+            value=_norm_name(save_name) or f'stacked_reflectivity.{save_format}',
+            description='File:', layout=widgets.Layout(width='600px'))
+        save_btn   = widgets.Button(description='Save figure', button_style='success')
+        out        = widgets.Output()
+
+        def _list_folders(base):
+            try:
+                base = os.path.abspath(os.path.expanduser(base))
+                return sorted(p for n in os.listdir(base)
+                              if os.path.isdir(p := os.path.join(base, n)))
+            except Exception:
+                return []
+
+        def refresh(_=None):
+            folders = _list_folders(dir_text.value)
+            folder_dd.options = folders
+            if folders:
+                folder_dd.value = folders[0]
+
+        def on_save(_):
+            chosen = folder_dd.value or dir_text.value
+            fname  = _norm_name(name_text.value)
+            with out:
+                out.clear_output()
+                if not fname:
+                    print('Please enter a filename.')
+                    return
+                try:
+                    _save_to(os.path.join(chosen, fname))
+                except Exception as e:
+                    print(f'Save failed: {e}')
+
+        refresh_btn.on_click(refresh)
+        save_btn.on_click(on_save)
+        refresh()
+
+        _display(widgets.VBox([
+            widgets.HBox([dir_text, refresh_btn]),
+            folder_dd, name_text, save_btn, out,
+        ]))
+
+    return fig, ax
+
+
+def plot_reflectivity_comparison(
+    filepath,
+    sample_name,
+    model_names,
+    criteria='best',
+    energy_list=None,
+    energy_range=None,
+    figsize=None,
+    xlim=None,
+    ylim=None,
+):
+    """
+    Interactive two-panel widget comparing two model fits across energies.
+
+    Returns an ``ipywidgets.VBox`` containing:
+
+    * **GF panel** — chi_sq vs energy for both models (full plotly zoom/pan).
+      Open marker = better fit at that energy, same convention as
+      ``plot_material_comparison``.
+    * **Energy selector** — ``SelectMultiple`` list.  Each entry is annotated
+      with which model fits better at that energy.  Ctrl/Cmd-click or
+      Shift-click to select multiple energies.
+    * **Reflectivity panel** — updates automatically when the selection
+      changes, showing exp data (black dots), Model A (solid line), and
+      Model B (dashed line).  Each selected energy gets its own colour.
+
+    Parameters
+    ----------
+    filepath : str or Path
+    sample_name : str
+    model_names : list of str
+        Exactly two model labels to compare.
+    criteria : 'best' | 'last' | int
+        Run selection per energy.  Default ``'best'``.
+    energy_list : list of float, optional
+        Explicit energies to include.  Takes precedence over *energy_range*.
+    energy_range : (emin, emax), optional
+        Inclusive energy interval.  Ignored when *energy_list* is provided.
+    figsize : (width, height), optional
+        Reflectivity panel size in pixels.  Defaults to ``(700, 480)``.
+        The GF panel always spans the full width (``width + 220`` px).
+    xlim : (xmin, xmax), optional
+        q-axis limits on the reflectivity panel.
+    ylim : (ymin, ymax), optional
+        R-axis limits on the reflectivity panel (linear values).
+
+    Returns
+    -------
+    widget : ipywidgets.VBox
+        Display with the variable name alone on the last line of a Jupyter
+        cell, or call ``IPython.display.display(widget)``.
+    """
+    import ipywidgets as widgets
+    import plotly.graph_objects as go
+    import plotly.colors as pc
+    from pathlib import Path as _Path
+
+    if isinstance(model_names, str):
+        model_names = [model_names]
+    if len(model_names) != 2:
+        raise ValueError(
+            f"plot_reflectivity_comparison requires exactly 2 model names, "
+            f"got {len(model_names)}: {model_names!r}")
+    mname_A, mname_B = model_names
+
+    filepath = str(_Path(filepath).expanduser())
+
+    # ---- collect data from HDF5 (file closed before any plotting) ----------
+    panel_data = {}
+
+    with h5py.File(filepath, 'r') as f:
+        if sample_name not in f:
+            raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
+        sample_grp = f[sample_name]
+
+        all_keys = sorted([k for k in sample_grp.keys() if _is_energy_key(k)], key=float)
+        if energy_list is not None:
+            wanted = {str(float(e)) for e in energy_list}
+            energy_keys = [k for k in all_keys if k in wanted]
+        elif energy_range is not None:
+            emin, emax = float(energy_range[0]), float(energy_range[1])
+            energy_keys = [k for k in all_keys if emin <= float(k) <= emax]
+        else:
+            energy_keys = all_keys
+
+        for ekey in energy_keys:
+            energy_val = float(ekey)
+            energy_grp = sample_grp[ekey]
+            entry = {'q': None, 'R_exp': None, 'dR': None,
+                     'R_A': None, 'R_B': None,
+                     'chi_A': np.nan, 'chi_B': np.nan}
+
+            for mname, r_key, chi_key in [(mname_A, 'R_A', 'chi_A'),
+                                           (mname_B, 'R_B', 'chi_B')]:
+                if mname not in energy_grp:
+                    continue
+                model_grp = energy_grp[mname]
+
+                run_keys = sorted(
+                    [k for k in model_grp.keys() if k.startswith('run_')],
+                    key=lambda k: int(k.split('_')[1]))
+                if not run_keys:
+                    continue
+
+                if criteria == 'best':
+                    rkey = min(
+                        run_keys,
+                        key=lambda k: model_grp[k].attrs.get('chi_sq_final', np.inf))
+                elif criteria == 'last':
+                    rkey = run_keys[-1]
+                elif isinstance(criteria, int):
+                    rkey = f'run_{criteria}'
+                    if rkey not in model_grp:
+                        continue
+                else:
+                    raise ValueError(
+                        f"criteria must be 'best', 'last', or int — got {criteria!r}")
+
+                rg = model_grp[rkey]
+                pg = rg['parameters']
+                dg = rg['data']
+                q  = dg['q'][:]
+                R  = dg['R'][:]
+                dR = dg['dR'][:] if 'dR' in dg else None
+
+                if entry['q'] is None:
+                    entry['q']     = q
+                    entry['R_exp'] = R
+                    entry['dR']    = dR
+
+                try:
+                    obj, _ = _reconstruct_objective(
+                        _decode_strings(rg['layer_names'][:]),
+                        rg['structure_slabs_final'][:],
+                        _decode_strings(pg['names'][:]),
+                        pg['final_values'][:],
+                        pg['final_lb'][:],
+                        pg['final_ub'][:],
+                        pg['final_vary'][:],
+                        q, R, dR,
+                        transform=rg.attrs.get('transform', 'logY'))
+                    entry[r_key]   = obj.model(q)
+                    entry[chi_key] = float(rg.attrs.get('chi_sq_final', np.nan))
+                except Exception as exc:
+                    print(f"  Warning: could not reconstruct "
+                          f"{energy_val} eV / {mname}: {exc}")
+
+            if entry['q'] is not None:
+                panel_data[energy_val] = entry
+
+    if not panel_data:
+        raise ValueError("No data found for the specified energies / models.")
+
+    energies = sorted(panel_data.keys())
+    colors   = pc.qualitative.Plotly
+    # persistent colour per energy index so colours stay stable across selections
+    e_colors = {e: colors[i % len(colors)] for i, e in enumerate(energies)}
+
+    refl_w, refl_h = figsize if figsize else (700, 480)
+    gf_w = refl_w + 220  # GF spans the full widget width
+
+    # ---- GF figure (always visible, full plotly interactivity) --------------
+    chi_A_arr = np.array([panel_data[e]['chi_A'] for e in energies])
+    chi_B_arr = np.array([panel_data[e]['chi_B'] for e in energies])
+
+    def _sym(base, chi_self, chi_other):
+        if np.isnan(chi_self) or np.isnan(chi_other):
+            return base
+        return f'{base}-open' if chi_self <= chi_other else base
+
+    syms_A = [_sym('circle', chi_A_arr[i], chi_B_arr[i]) for i in range(len(energies))]
+    syms_B = [_sym('square', chi_B_arr[i], chi_A_arr[i]) for i in range(len(energies))]
+
+    gf_fig = go.Figure()
+    gf_fig.add_trace(go.Scatter(
+        x=energies, y=chi_A_arr.tolist(),
+        mode='lines+markers', name=mname_A,
+        marker=dict(symbol=syms_A, color=colors[0], size=10),
+        line=dict(color=colors[0]),
+    ))
+    gf_fig.add_trace(go.Scatter(
+        x=energies, y=chi_B_arr.tolist(),
+        mode='lines+markers', name=mname_B,
+        marker=dict(symbol=syms_B, color=colors[1], size=10),
+        line=dict(color=colors[1]),
+    ))
+    gf_fig.update_layout(
+        width=gf_w, height=280,
+        title_text=(f'{sample_name}  —  {mname_A} vs {mname_B}'
+                    '  |  open marker = better fit'),
+        xaxis_title='Energy (eV)',
+        yaxis_title='χ²',
+        margin=dict(t=50, b=40),
+    )
+
+    gf_out = widgets.Output()
+    with gf_out:
+        gf_fig.show()
+
+    # ---- Energy selector ----------------------------------------------------
+    selector_options = []
+    for e in energies:
+        cA, cB = panel_data[e]['chi_A'], panel_data[e]['chi_B']
+        if np.isnan(cA) and np.isnan(cB):
+            tag = ''
+        elif np.isnan(cB) or cA <= cB:
+            tag = f'  [{mname_A}✓]'
+        else:
+            tag = f'  [{mname_B}✓]'
+        selector_options.append((f'{e:.2f} eV{tag}', e))
+
+    selector = widgets.SelectMultiple(
+        options=selector_options,
+        rows=min(18, len(energies)),
+        layout=widgets.Layout(width='210px'),
+    )
+    selector_box = widgets.VBox([
+        widgets.Label('Select energies  (Ctrl/Shift for multi):'),
+        selector,
+    ])
+
+    # ---- Reflectivity output ------------------------------------------------
+    refl_out = widgets.Output(
+        layout=widgets.Layout(width=f'{refl_w + 20}px'))
+
+    def _make_refl_fig(selected):
+        fig = go.Figure()
+        for energy in sorted(selected):
+            entry   = panel_data[energy]
+            e_color = e_colors[energy]
+            e_label = f'{energy:.2f} eV'
+            q       = entry['q']
+            R_exp   = entry['R_exp']
+            dR      = entry['dR']
+            valid_dR = (dR is not None
+                        and len(dR) == len(q)
+                        and not np.all(np.isnan(dR)))
+
+            exp_kw = dict(mode='markers', marker=dict(color='black', size=4),
+                          name=f'{e_label} exp', legendgroup=e_label,
+                          legendgrouptitle_text=e_label)
+            if valid_dR:
+                fig.add_trace(go.Scatter(
+                    x=q.tolist(), y=R_exp.tolist(),
+                    error_y=dict(type='data', array=dR.tolist(),
+                                 visible=True, thickness=0.8, width=2),
+                    **exp_kw))
+            else:
+                fig.add_trace(go.Scatter(
+                    x=q.tolist(), y=R_exp.tolist(), **exp_kw))
+
+            R_A = entry['R_A']
+            if R_A is not None:
+                fig.add_trace(go.Scatter(
+                    x=q.tolist(), y=R_A.tolist(), mode='lines',
+                    line=dict(color=e_color, width=2),
+                    name=f'{e_label} {mname_A}', legendgroup=e_label))
+
+            R_B = entry['R_B']
+            if R_B is not None:
+                fig.add_trace(go.Scatter(
+                    x=q.tolist(), y=R_B.tolist(), mode='lines',
+                    line=dict(color=e_color, width=2, dash='dash'),
+                    name=f'{e_label} {mname_B}', legendgroup=e_label))
+
+        fig.update_yaxes(type='log', title_text='R')
+        fig.update_xaxes(title_text='q (Å⁻¹)')
+        fig.update_layout(width=refl_w, height=refl_h,
+                          legend=dict(groupclick='toggleitem'),
+                          margin=dict(t=30))
+        if xlim is not None:
+            fig.update_xaxes(range=list(xlim))
+        if ylim is not None:
+            fig.update_yaxes(
+                range=[np.log10(float(ylim[0])), np.log10(float(ylim[1]))])
+        return fig
+
+    def _on_select(change):
+        with refl_out:
+            refl_out.clear_output(wait=True)
+            if selector.value:
+                _make_refl_fig(selector.value).show()
+
+    selector.observe(_on_select, names='value')
+
+    return widgets.VBox([
+        gf_out,
+        widgets.HBox([selector_box, refl_out]),
+    ])
 
 
 # ---------------------------------------------------------------------------

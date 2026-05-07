@@ -36,7 +36,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from refnx.analysis import CurveFitter
-from Model_Setup_Density import get_param_type
+from Model_Setup import get_param_type
 
 # -------------------------------
 # Load / Save helpers

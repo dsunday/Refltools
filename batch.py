@@ -33,7 +33,10 @@ from Model_Setup import (
 )
 from h5io import (save_batch_to_h5, save_sweep_results_to_h5,
                   load_h5_objectives, get_h5_info,
+                  extract_sld_from_h5, set_final_model,
                   plot_parameter_vs_energy, plot_reflectivity,
+                  plot_stacked_reflectivity_h5,
+                  plot_reflectivity_comparison, plot_material_comparison,
                   save_nexafs_to_h5, update_nexafs_sld,
                   load_nexafs_from_h5, list_nexafs_spectra)
 from parameter_sweep import (setup_parameter_sweep, run_parameter_sweep,

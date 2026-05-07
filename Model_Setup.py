@@ -1613,7 +1613,7 @@ def load_material_sld_array(file_path, has_header=True, verbose=True):
     if not os.path.exists(file_path):
         raise FileNotFoundError(file_path)
 
-    arr = np.loadtxt(file_path, delimiter=',', skiprows=(2 if has_header else 0))
+    arr = np.loadtxt(file_path, delimiter=',', skiprows=(1 if has_header else 0))
     if arr.ndim == 1:
         arr = arr.reshape(1, -1)
     if arr.shape[1] != 3:
