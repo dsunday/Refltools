@@ -15,7 +15,7 @@ modelcomparisonplot(obj_list, structure_list, ...)
 """
 
 import numpy as np
-from refnx.reflect.structure import isld_profile
+from refnx.reflect.structure import sld_profile as _sld_profile
 import matplotlib.pyplot as plt
 
 
@@ -38,7 +38,11 @@ def profileflip(structure, depth_shift=0):
         All arrays are 1-D numpy arrays.
     """
     Real_depth, Real_SLD = structure.sld_profile()
-    Imag_depth, Imag_SLD = isld_profile(structure.slabs())
+    # isld_profile was removed from refnx; compute imaginary profile by
+    # placing the iSLD column (col 2) into the real column (col 1) before calling
+    slabs_imag = structure.slabs().copy()
+    slabs_imag[:, 1] = slabs_imag[:, 2]
+    Imag_depth, Imag_SLD = _sld_profile(slabs_imag)
 
     Real_depth = (Real_depth - Real_depth.max()) * -1 - depth_shift
     Imag_depth = (Imag_depth - Imag_depth.max()) * -1 - depth_shift

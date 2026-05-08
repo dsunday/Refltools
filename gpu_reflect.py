@@ -20,11 +20,16 @@ When a refnx Objective uses Transform('logY') the GPU chi-squared is computed
 in log10 space with propagated uncertainties, matching objective.chisqr().
 """
 
+import os
 import copy
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import jit, vmap
+
+# Grow GPU memory on demand instead of pre-allocating ~75% of VRAM at startup.
+# Must be set before any JAX import triggers device initialisation.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 jax.config.update("jax_enable_x64", True)
 
@@ -159,6 +164,86 @@ def _jabeles_smeared_pos(q_quad, combo_weights, layers, scale, bkg):
 # M slab sets, shared q_quad and combo_weights → (M, n_q)
 _batched_smeared_reflectivity_jit = jit(
     vmap(_jabeles_smeared_pos, in_axes=(None, None, 0, 0, 0))
+)
+
+# Padded variant: each candidate has its own Q-quad grid (for multi-energy batching)
+# q_quad: (M, max_nq, quad_order)  layers: (M, n_rows, 4)  → output: (M, max_nq)
+_batched_smeared_padded_jit = jit(
+    vmap(_jabeles_smeared_pos, in_axes=(0, None, 0, 0, 0))
+)
+
+# ---------------------------------------------------------------------------
+# Fused per-energy chi-squared functions for ModelsBatchBuilder
+#
+# These avoid tiling the Q-quad array across candidates each generation.
+# Instead they use a nested vmap: outer over energies, inner over popsize.
+# All constant arrays (q_quad_pad, y_log_pad, mask, …) are passed as
+# persistent JAX device arrays, so no CPU→GPU transfer occurs.
+#
+# Input shapes (for the vmapped versions):
+#   q_quad_pad / q_pad : (n_energies, max_nq, quad_order) or (n_energies, max_nq)
+#   combo              : (quad_order,)
+#   y_*_pad / mask     : (n_energies, max_nq)
+#   layers             : (n_energies, popsize, n_slab, 4)
+#   scale / bkg        : (n_energies, popsize)
+# Output: (n_energies, popsize)
+# ---------------------------------------------------------------------------
+
+def _smeared_log_chi2_one_energy(q_quad_i, combo, y_log_i, y_err_log_i, mask_i,
+                                  layers_e, scale_e, bkg_e):
+    """Smeared log-chi2 for all candidates of a single energy."""
+    model_e = vmap(_jabeles_smeared_pos, in_axes=(None, None, 0, 0, 0))(
+        q_quad_i, combo, layers_e, scale_e, bkg_e
+    )  # (popsize, max_nq)
+    log_model = jnp.log10(jnp.maximum(model_e, 1e-100))
+    return jnp.sum(mask_i * ((y_log_i - log_model) / y_err_log_i) ** 2, axis=-1)
+
+
+_fused_smeared_log_jit = jit(
+    vmap(_smeared_log_chi2_one_energy, in_axes=(0, None, 0, 0, 0, 0, 0, 0))
+)
+
+
+def _smeared_linear_chi2_one_energy(q_quad_i, combo, y_i, y_err_i, mask_i,
+                                     layers_e, scale_e, bkg_e):
+    """Smeared linear-chi2 for all candidates of a single energy."""
+    model_e = vmap(_jabeles_smeared_pos, in_axes=(None, None, 0, 0, 0))(
+        q_quad_i, combo, layers_e, scale_e, bkg_e
+    )
+    return jnp.sum(mask_i * ((y_i - model_e) / y_err_i) ** 2, axis=-1)
+
+
+_fused_smeared_linear_jit = jit(
+    vmap(_smeared_linear_chi2_one_energy, in_axes=(0, None, 0, 0, 0, 0, 0, 0))
+)
+
+
+def _unsmeared_log_chi2_one_energy(q_i, y_log_i, y_err_log_i, mask_i,
+                                    layers_e, scale_e, bkg_e):
+    """Unsmeared log-chi2 for all candidates of a single energy."""
+    model_e = vmap(_jabeles_pos, in_axes=(None, 0, 0, 0))(
+        q_i, layers_e, scale_e, bkg_e
+    )
+    log_model = jnp.log10(jnp.maximum(model_e, 1e-100))
+    return jnp.sum(mask_i * ((y_log_i - log_model) / y_err_log_i) ** 2, axis=-1)
+
+
+_fused_unsmeared_log_jit = jit(
+    vmap(_unsmeared_log_chi2_one_energy, in_axes=(0, 0, 0, 0, 0, 0, 0))
+)
+
+
+def _unsmeared_linear_chi2_one_energy(q_i, y_i, y_err_i, mask_i,
+                                       layers_e, scale_e, bkg_e):
+    """Unsmeared linear-chi2 for all candidates of a single energy."""
+    model_e = vmap(_jabeles_pos, in_axes=(None, 0, 0, 0))(
+        q_i, layers_e, scale_e, bkg_e
+    )
+    return jnp.sum(mask_i * ((y_i - model_e) / y_err_i) ** 2, axis=-1)
+
+
+_fused_unsmeared_linear_jit = jit(
+    vmap(_unsmeared_linear_chi2_one_energy, in_axes=(0, 0, 0, 0, 0, 0, 0))
 )
 
 
@@ -297,6 +382,41 @@ def get_slabs_scale_bkg(objective):
     return slabs, float(objective.model.scale.value), float(objective.model.bkg.value)
 
 
+def _build_param_map(obj, free_params):
+    """
+    Build a mapping from free-parameter index to slab/scale/bkg position.
+
+    Perturbs each free parameter by a small amount and observes which entries
+    of the slab matrix, scale, or bkg change. Works for any refnx model,
+    including shared or constrained parameters.
+
+    Returns
+    -------
+    param_map : list of lists
+        param_map[k] = list of ('slab', row, col) | ('scale',) | ('bkg',)
+        tuples describing all positions affected by free_params[k].
+    """
+    base_slabs, base_scale, base_bkg = get_slabs_scale_bkg(obj)
+    param_map = []
+    for p in free_params:
+        orig = p.value
+        eps = 1e-6 * max(abs(orig), 1.0)
+        p.value = orig + eps
+        slabs2, scale2, bkg2 = get_slabs_scale_bkg(obj)
+        p.value = orig
+
+        mappings = []
+        diff = slabs2 - base_slabs
+        for row, col in zip(*np.where(np.abs(diff) > 1e-10 * eps)):
+            mappings.append(('slab', int(row), int(col)))
+        if abs(scale2 - base_scale) > 1e-10 * eps:
+            mappings.append(('scale',))
+        if abs(bkg2 - base_bkg) > 1e-10 * eps:
+            mappings.append(('bkg',))
+        param_map.append(mappings)
+    return param_map
+
+
 def _detect_objective_fitness_mode(objective):
     """
     Inspect an objective to determine which GPU fitness function to use.
@@ -407,6 +527,33 @@ class SweepBatchBuilder:
             self.y_log = np.log10(np.maximum(self.y, 1e-100))
             self.y_err_log = np.abs(self.y_err / (self.y * np.log(10)))
 
+        # Precompute base slab arrays (one per sweep point) and param map.
+        # base_slabs[i] = slab matrix with swept param fixed to sweep_values[i]
+        # and all free params at their current best-fit values.
+        self.base_slabs = np.stack(
+            [get_slabs_scale_bkg(obj)[0] for obj in self.objectives]
+        )  # (n_sweep, n_slab_rows, 4)
+        self.base_scale = np.array(
+            [get_slabs_scale_bkg(obj)[1] for obj in self.objectives]
+        )  # (n_sweep,)
+        self.base_bkg = np.array(
+            [get_slabs_scale_bkg(obj)[2] for obj in self.objectives]
+        )  # (n_sweep,)
+        # Param map is the same for all sweep points (same model structure)
+        self.param_map = _build_param_map(self.objectives[0], self.free_params)
+
+        # Persistent GPU arrays — constant data transferred to device once
+        self._q_gpu = jnp.array(self.q)
+        if self.use_smearing:
+            self._q_quad_gpu = jnp.array(self.q_quad)
+            self._combo_gpu = jnp.array(self.combo_weights)
+        if use_log:
+            self._y_log_gpu = jnp.array(self.y_log)
+            self._y_err_log_gpu = jnp.array(self.y_err_log)
+        else:
+            self._y_gpu = jnp.array(self.y)
+            self._y_err_gpu = jnp.array(self.y_err)
+
     def build_batch(self, pop_matrix):
         """
         Construct slab arrays for all sweep-point/population combinations.
@@ -422,22 +569,23 @@ class SweepBatchBuilder:
         scale_batch  : ndarray (n_sweep * popsize,)
         bkg_batch    : ndarray (n_sweep * popsize,)
         """
-        n_sweep, popsize, n_free = pop_matrix.shape
-        n_total = n_sweep * popsize
+        n_sweep, popsize, _ = pop_matrix.shape
+        pop_flat = pop_matrix.reshape(n_sweep * popsize, pop_matrix.shape[2])
 
-        layers_out = np.empty((n_total, self.n_slab_rows, 4), dtype=np.float64)
-        scale_out = np.empty(n_total, dtype=np.float64)
-        bkg_out = np.empty(n_total, dtype=np.float64)
+        # Broadcast per-sweep-point base values over popsize candidates
+        layers_out = np.repeat(self.base_slabs, popsize, axis=0).copy()
+        scale_out  = np.repeat(self.base_scale, popsize)
+        bkg_out    = np.repeat(self.base_bkg,   popsize)
 
-        for i in range(n_sweep):
-            obj_i = self.objectives[i]
-            for j in range(popsize):
-                set_free_params(obj_i, pop_matrix[i, j], self.swept_param_name)
-                slabs, scale, bkg = get_slabs_scale_bkg(obj_i)
-                idx = i * popsize + j
-                layers_out[idx] = slabs
-                scale_out[idx] = scale
-                bkg_out[idx] = bkg
+        # Apply free parameters via n_free NumPy array writes — no per-candidate loop
+        for k, mappings in enumerate(self.param_map):
+            for entry in mappings:
+                if entry[0] == 'slab':
+                    layers_out[:, entry[1], entry[2]] = pop_flat[:, k]
+                elif entry[0] == 'scale':
+                    scale_out[:] = pop_flat[:, k]
+                elif entry[0] == 'bkg':
+                    bkg_out[:] = pop_flat[:, k]
 
         return layers_out, scale_out, bkg_out
 
@@ -456,31 +604,40 @@ class SweepBatchBuilder:
         -------
         chisqr : ndarray (n_sweep, popsize)
         """
+        n_sweep, popsize, _ = pop_matrix.shape
         layers_batch, scale_batch, bkg_batch = self.build_batch(pop_matrix)
+        l_j = jnp.array(layers_batch, dtype=jnp.float64)
+        s_j = jnp.array(scale_batch,  dtype=jnp.float64)
+        b_j = jnp.array(bkg_batch,    dtype=jnp.float64)
 
         if self.use_smearing and self.use_log:
-            chi2_flat = batched_smeared_chisqr_log_gpu(
-                self.q_quad, self.combo_weights,
-                self.y_log, self.y_err_log,
-                layers_batch, scale_batch, bkg_batch,
+            model = _batched_smeared_reflectivity_jit(
+                self._q_quad_gpu, self._combo_gpu, l_j, s_j, b_j
             )
+            log_model = jnp.log10(jnp.maximum(model, 1e-100))
+            chi2_flat = np.array(jnp.sum(
+                ((self._y_log_gpu - log_model) / self._y_err_log_gpu) ** 2, axis=-1
+            ))
         elif self.use_smearing:
-            chi2_flat = batched_chisqr_gpu(
-                self.q, self.y, self.y_err,
-                layers_batch, scale_batch, bkg_batch,
+            model = _batched_smeared_reflectivity_jit(
+                self._q_quad_gpu, self._combo_gpu, l_j, s_j, b_j
             )
+            chi2_flat = np.array(jnp.sum(
+                ((self._y_gpu - model) / self._y_err_gpu) ** 2, axis=-1
+            ))
         elif self.use_log:
-            chi2_flat = batched_chisqr_log_gpu(
-                self.q, self.y_log, self.y_err_log,
-                layers_batch, scale_batch, bkg_batch,
-            )
+            model = _batched_reflectivity_jit(self._q_gpu, l_j, s_j, b_j)
+            log_model = jnp.log10(jnp.maximum(model, 1e-100))
+            chi2_flat = np.array(jnp.sum(
+                ((self._y_log_gpu - log_model) / self._y_err_log_gpu) ** 2, axis=-1
+            ))
         else:
-            chi2_flat = batched_chisqr_gpu(
-                self.q, self.y, self.y_err,
-                layers_batch, scale_batch, bkg_batch,
-            )
+            model = _batched_reflectivity_jit(self._q_gpu, l_j, s_j, b_j)
+            chi2_flat = np.array(jnp.sum(
+                ((self._y_gpu - model) / self._y_err_gpu) ** 2, axis=-1
+            ))
 
-        return chi2_flat.reshape(self.n_sweep, pop_matrix.shape[1])
+        return chi2_flat.reshape(n_sweep, popsize)
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +729,34 @@ class ModelsBatchBuilder:
         slabs_0, _, _ = get_slabs_scale_bkg(self.objectives[0])
         self.n_slab_rows = slabs_0.shape[0]
 
+        # Precompute base slab arrays (one per energy) and param map.
+        # All energies share the same model structure (same free param positions).
+        self.base_slabs = np.stack(
+            [get_slabs_scale_bkg(obj)[0] for obj in self.objectives]
+        )  # (n_energies, n_slab_rows, 4)
+        self.base_scale = np.array(
+            [get_slabs_scale_bkg(obj)[1] for obj in self.objectives]
+        )  # (n_energies,)
+        self.base_bkg = np.array(
+            [get_slabs_scale_bkg(obj)[2] for obj in self.objectives]
+        )  # (n_energies,)
+        self.param_map = _build_param_map(self.objectives[0], self.free_params)
+
+        # Persistent GPU arrays — constant data transferred to device once,
+        # reused every generation without CPU→GPU round-trips.
+        self._mask_gpu = jnp.array(self.mask)
+        if self.use_smearing:
+            self._q_quad_pad_gpu = jnp.array(self.q_quad_pad)
+            self._combo_gpu = jnp.array(self.combo_weights)
+        else:
+            self._q_pad_gpu = jnp.array(self.q_pad)
+        if use_log:
+            self._y_log_pad_gpu = jnp.array(self.y_log_pad)
+            self._y_err_log_pad_gpu = jnp.array(self.y_err_log_pad)
+        else:
+            self._y_pad_gpu = jnp.array(self.y_pad)
+            self._y_err_pad_gpu = jnp.array(self.y_err_pad)
+
     def _build_smear_pads(self, quad_order):
         """Precompute per-energy smearing Q-quad and weights, padded to max_nq."""
         abscissa, weights = gauss_legendre(quad_order)
@@ -612,22 +797,23 @@ class ModelsBatchBuilder:
         scale_batch  : ndarray (n_energies * popsize,)
         bkg_batch    : ndarray (n_energies * popsize,)
         """
-        n_energies, popsize, n_free = pop_matrix.shape
-        n_total = n_energies * popsize
+        n_energies, popsize, _ = pop_matrix.shape
+        pop_flat = pop_matrix.reshape(n_energies * popsize, pop_matrix.shape[2])
 
-        layers_out = np.empty((n_total, self.n_slab_rows, 4), dtype=np.float64)
-        scale_out = np.empty(n_total, dtype=np.float64)
-        bkg_out = np.empty(n_total, dtype=np.float64)
+        # Broadcast per-energy base values over popsize candidates
+        layers_out = np.repeat(self.base_slabs, popsize, axis=0).copy()
+        scale_out  = np.repeat(self.base_scale, popsize)
+        bkg_out    = np.repeat(self.base_bkg,   popsize)
 
-        for i in range(n_energies):
-            obj_i = self.objectives[i]
-            for j in range(popsize):
-                set_free_params(obj_i, pop_matrix[i, j])
-                slabs, scale, bkg = get_slabs_scale_bkg(obj_i)
-                idx = i * popsize + j
-                layers_out[idx] = slabs
-                scale_out[idx] = scale
-                bkg_out[idx] = bkg
+        # Apply free parameters via n_free NumPy array writes — no per-candidate loop
+        for k, mappings in enumerate(self.param_map):
+            for entry in mappings:
+                if entry[0] == 'slab':
+                    layers_out[:, entry[1], entry[2]] = pop_flat[:, k]
+                elif entry[0] == 'scale':
+                    scale_out[:] = pop_flat[:, k]
+                elif entry[0] == 'bkg':
+                    bkg_out[:] = pop_flat[:, k]
 
         return layers_out, scale_out, bkg_out
 
@@ -638,6 +824,9 @@ class ModelsBatchBuilder:
         Matches objective.chisqr(): applies log10 transform and smearing
         based on objective configuration.
 
+        Uses persistent GPU arrays for constant data (Q grids, y data, mask)
+        to avoid CPU→GPU transfers every generation.
+
         Parameters
         ----------
         pop_matrix : ndarray (n_energies, popsize, n_free)
@@ -647,53 +836,39 @@ class ModelsBatchBuilder:
         chisqr : ndarray (n_energies, popsize)
         """
         n_energies, popsize, _ = pop_matrix.shape
-        n_total = n_energies * popsize
+        layers_flat, scale_flat, bkg_flat = self.build_batch(pop_matrix)
 
-        layers_batch, scale_batch, bkg_batch = self.build_batch(pop_matrix)
-        energy_idx = np.repeat(np.arange(n_energies), popsize)
+        # Reshape to (n_energies, popsize, ...) for nested vmap
+        layers = jnp.array(
+            layers_flat.reshape(n_energies, popsize, self.n_slab_rows, 4),
+            dtype=jnp.float64,
+        )
+        scale = jnp.array(scale_flat.reshape(n_energies, popsize), dtype=jnp.float64)
+        bkg   = jnp.array(bkg_flat.reshape(n_energies, popsize),   dtype=jnp.float64)
 
-        if self.use_smearing:
-            # Per-candidate Q-quad grid tiled from padded per-energy arrays
-            q_quad_tiled = self.q_quad_pad[energy_idx]      # (n_total, max_nq, quad_order)
-            mask_tiled = self.mask[energy_idx]              # (n_total, max_nq)
-
-            # Smeared model: loop over candidates using padded Q-quad
-            # Use the padded variant: vmap over (q_quad, layers, scale, bkg)
-            q_quad_j = jnp.array(q_quad_tiled, dtype=jnp.float64)
-            combo_j = jnp.array(self.combo_weights, dtype=jnp.float64)
-            l_j = jnp.array(layers_batch, dtype=jnp.float64)
-            s_j = jnp.array(scale_batch, dtype=jnp.float64)
-            b_j = jnp.array(bkg_batch, dtype=jnp.float64)
-
-            _batched_smeared_padded = jit(
-                vmap(_jabeles_smeared_pos, in_axes=(0, None, 0, 0, 0))
+        if self.use_smearing and self.use_log:
+            chi2 = _fused_smeared_log_jit(
+                self._q_quad_pad_gpu, self._combo_gpu,
+                self._y_log_pad_gpu, self._y_err_log_pad_gpu, self._mask_gpu,
+                layers, scale, bkg,
             )
-            model_batch = np.array(
-                _batched_smeared_padded(q_quad_j, combo_j, l_j, s_j, b_j)
-            )  # (n_total, max_nq)
-        else:
-            q_tiled = self.q_pad[energy_idx]
-            model_batch = np.array(_batched_reflectivity_padded_jit(
-                jnp.array(q_tiled, dtype=jnp.float64),
-                jnp.array(layers_batch, dtype=jnp.float64),
-                jnp.array(scale_batch, dtype=jnp.float64),
-                jnp.array(bkg_batch, dtype=jnp.float64),
-            ))  # (n_total, max_nq)
-
-        mask_tiled = self.mask[energy_idx]  # (n_total, max_nq)
-
-        if self.use_log:
-            y_tiled = self.y_log_pad[energy_idx]
-            y_err_tiled = self.y_err_log_pad[energy_idx]
-            log_model = np.log10(np.maximum(model_batch, 1e-100))
-            chi2_flat = np.sum(
-                mask_tiled * ((y_tiled - log_model) / y_err_tiled) ** 2, axis=1
+        elif self.use_smearing:
+            chi2 = _fused_smeared_linear_jit(
+                self._q_quad_pad_gpu, self._combo_gpu,
+                self._y_pad_gpu, self._y_err_pad_gpu, self._mask_gpu,
+                layers, scale, bkg,
+            )
+        elif self.use_log:
+            chi2 = _fused_unsmeared_log_jit(
+                self._q_pad_gpu,
+                self._y_log_pad_gpu, self._y_err_log_pad_gpu, self._mask_gpu,
+                layers, scale, bkg,
             )
         else:
-            y_tiled = self.y_pad[energy_idx]
-            y_err_tiled = self.y_err_pad[energy_idx]
-            chi2_flat = np.sum(
-                mask_tiled * ((y_tiled - model_batch) / y_err_tiled) ** 2, axis=1
+            chi2 = _fused_unsmeared_linear_jit(
+                self._q_pad_gpu,
+                self._y_pad_gpu, self._y_err_pad_gpu, self._mask_gpu,
+                layers, scale, bkg,
             )
 
-        return chi2_flat.reshape(n_energies, popsize)
+        return np.array(chi2)  # (n_energies, popsize)

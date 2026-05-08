@@ -1213,6 +1213,149 @@ def batch_fit_selected_models_gpu(
     return ret
 
 
+def batch_fit_selected_models_cmaes(
+    objectives_dict,
+    energy_list=None,
+    popsize=20,
+    n_generations=500,
+    seed=0,
+    verbose=True,
+    tol=1e-4,
+    patience=5,
+    sample_name=None,
+    model_name=None,
+    h5_filepath=None,
+    run_index=None,
+):
+    """
+    Fit reflectometry models for all energies simultaneously using Sep-CMA-ES.
+
+    Drop-in replacement for batch_fit_selected_models_gpu that uses the
+    Separable CMA-ES algorithm instead of Differential Evolution.  In
+    benchmarks on reflectometry problems Sep-CMA-ES reaches ~2× lower
+    chi-squared in the same number of generations, and supports early
+    stopping when the fit has converged.
+
+    Parameters
+    ----------
+    objectives_dict : dict {energy: refnx Objective}
+    energy_list     : subset of energies to fit (default: all)
+    popsize         : population size per energy (default 20)
+    n_generations   : maximum generations; actual run may be shorter if
+                      early stopping fires (default 500)
+    seed            : random seed
+    verbose         : print per-checkpoint progress
+    tol             : relative improvement threshold for early stopping
+                      (default 1e-4 = 0.01%); set to 0 to disable
+    patience        : consecutive non-improving checks before stopping (default 5)
+    sample_name     : HDF5 sample label (required with h5_filepath)
+    model_name      : HDF5 model label (default 'Model1')
+    h5_filepath     : save fitted objectives here after completion
+    run_index       : explicit HDF5 run index (default: auto-increment)
+
+    Returns
+    -------
+    Same dict format as batch_fit_selected_models_gpu, with two extra keys:
+      'generations_run' – actual generations completed
+      'converged'       – True if early stopping fired
+    """
+    from gpu_sweep_optimizer import gpu_fit_models_cmaes
+
+    if energy_list is None:
+        energy_list = sorted(objectives_dict.keys())
+
+    to_fit = [e for e in energy_list if e in objectives_dict]
+    if not to_fit:
+        print("batch_fit_selected_models_cmaes: no valid energies found.")
+        return None
+
+    ename = model_name or "Model1"
+
+    print("=" * 60)
+    print("BATCH FITTING (GPU — Sep-CMA-ES)")
+    print(f"  Energies: {len(to_fit)}  |  popsize: {popsize}  |  "
+          f"max generations: {n_generations}  |  tol: {tol:.0e}")
+    print("=" * 60)
+
+    chi_init = {e: objectives_dict[e].chisqr() for e in to_fit}
+
+    gpu_result = gpu_fit_models_cmaes(
+        objectives_dict=objectives_dict,
+        energy_list=to_fit,
+        popsize=popsize,
+        n_generations=n_generations,
+        seed=seed,
+        verbose=verbose,
+        tol=tol,
+        patience=patience,
+    )
+
+    fitted_objectives = gpu_result["fitted_objectives"]
+    best_chisqr_dict  = gpu_result["best_chisqr"]
+
+    individual_results = {}
+    chi_init_total = chi_final_total = 0.0
+    for energy in to_fit:
+        ci = chi_init[energy]
+        chi_init_total += ci
+        fitted_obj  = fitted_objectives[energy]
+        chi_final   = float(best_chisqr_dict[energy])
+        chi_final_total += chi_final
+        individual_results[energy] = {"objective": fitted_obj, "chisqr": chi_final}
+        if verbose:
+            pct = (ci - chi_final) / ci * 100 if ci > 0 else 0.0
+            print(f"  {energy} eV: χ² {ci:.4g} → {chi_final:.4g}  ({pct:.1f}% improvement)")
+
+    summary = {
+        "total_models": len(to_fit),
+        "total_objectives_in_output": len(fitted_objectives),
+        "successful_fits": len(to_fit),
+        "failed_fits": 0,
+        "non_fitted_count": 0,
+        "initial_chi_squared_total": chi_init_total,
+        "final_chi_squared_total": chi_final_total,
+        "overall_improvement_percent": (
+            (chi_init_total - chi_final_total) / chi_init_total * 100
+            if chi_init_total > 0 else 0.0
+        ),
+        "elapsed_sec": gpu_result["elapsed_sec"],
+        "generations_run": gpu_result["generations_run"],
+        "converged": gpu_result["converged"],
+        "gpu_accelerated": True,
+        "algorithm": "Sep-CMA-ES",
+    }
+
+    conv_str = (f"converged at gen {gpu_result['generations_run']}"
+                if gpu_result["converged"] else
+                f"ran full {gpu_result['generations_run']} generations")
+    print(f"\nGPU fitting complete in {gpu_result['elapsed_sec']:.1f}s  "
+          f"({conv_str}, χ² improvement: {summary['overall_improvement_percent']:.1f}%)")
+
+    ret = {
+        "fitted_objectives":   fitted_objectives,
+        "individual_results":  individual_results,
+        "summary_stats":       summary,
+        "fitted_energies":     sorted(to_fit),
+        "non_fitted_energies": [],
+        "elapsed_sec":         gpu_result["elapsed_sec"],
+        "generations_run":     gpu_result["generations_run"],
+        "converged":           gpu_result["converged"],
+    }
+
+    if h5_filepath is not None and sample_name is not None:
+        save_batch_to_h5(
+            ret,
+            sample_name=sample_name,
+            model_name=ename,
+            filepath=h5_filepath,
+            energy_list=to_fit,
+            run_index=run_index,
+        )
+        print(f"Saved to {h5_filepath}")
+
+    return ret
+
+
 def batch_fit_sweep_gpu(
     batch_results,
     sweep_params,

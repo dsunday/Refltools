@@ -13,10 +13,13 @@ Test 2: Concurrency comparison (10 energies, 1 layer each)
 Run: python benchmark_gpu.py
 """
 
+import os
 import sys
 import copy
 import time
 import numpy as np
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
