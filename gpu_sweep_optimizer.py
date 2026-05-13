@@ -28,6 +28,8 @@ jax.config.update("jax_enable_x64", True)
 
 from evosax.algorithms import DifferentialEvolution
 from gpu_reflect import (
+    ModelsBatchBuilder,
+    MultiEnergySweepBatchBuilder,
     SweepBatchBuilder,
     extract_free_params,
     get_bounds_array,
@@ -215,6 +217,291 @@ def gpu_parameter_sweep(
 
 
 # ---------------------------------------------------------------------------
+# Sep-CMA-ES parameter sweep
+# ---------------------------------------------------------------------------
+
+def gpu_parameter_sweep_cmaes(
+    objective,
+    param_name,
+    sweep_values,
+    popsize=20,
+    n_generations=300,
+    seed=0,
+    verbose=False,
+    tol=1e-4,
+    patience=5,
+    check_every=10,
+):
+    """
+    Run all sweep-point optimizations simultaneously using Sep-CMA-ES.
+
+    Same interface as gpu_parameter_sweep but uses Sep-CMA-ES instead of DE,
+    with optional early stopping. Typically reaches lower chi-squared in fewer
+    generations on reflectometry problems.
+
+    Parameters
+    ----------
+    objective    : refnx Objective at best-fit parameters
+    param_name   : name of the parameter to sweep
+    sweep_values : 1D array of sweep values
+    popsize      : population size per sweep point (default 20)
+    n_generations: maximum generations (default 300)
+    seed         : random seed
+    verbose      : print progress every check_every generations
+    tol          : relative improvement threshold for early stopping (0 = off)
+    patience     : consecutive non-improving checks before stopping
+    check_every  : generations between convergence checks
+
+    Returns
+    -------
+    Same dict as gpu_parameter_sweep:
+      sweep_values, best_chisqr, best_params, free_param_names,
+      param_name, elapsed_sec, generations_run, converged
+    """
+    from evosax.algorithms import Sep_CMA_ES
+
+    sweep_values = np.asarray(sweep_values, dtype=np.float64)
+    n_sweep = len(sweep_values)
+
+    builder = SweepBatchBuilder(objective, param_name, sweep_values)
+    n_free = builder.n_free
+    bounds = builder.bounds
+
+    if n_free == 0:
+        raise ValueError(
+            f"No free parameters after excluding '{param_name}'. "
+            "Check that other parameters have vary=True."
+        )
+
+    lb = jnp.array(bounds[:, 0])
+    ub = jnp.array(bounds[:, 1])
+    mean_init = (lb + ub) / 2.0
+
+    solution_proto = np.zeros(n_free, dtype=np.float64)
+    strategy = Sep_CMA_ES(population_size=popsize, solution=solution_proto)
+    params = strategy.default_params
+
+    v_init = jax.jit(jax.vmap(strategy.init, in_axes=(0, None, None)))
+    v_ask  = jax.jit(jax.vmap(strategy.ask,  in_axes=(0, 0, None)))
+    v_tell = jax.jit(jax.vmap(strategy.tell, in_axes=(0, 0, 0, 0, None)))
+
+    master_key = jax.random.PRNGKey(seed)
+    master_key, init_key = jax.random.split(master_key)
+    init_keys = jax.random.split(init_key, n_sweep)
+
+    states = v_init(init_keys, mean_init, params)
+
+    prev_mean_best = np.inf
+    no_improve_count = 0
+    converged = False
+    generations_run = 0
+
+    t_start = time.perf_counter()
+    for gen in range(n_generations):
+        master_key, gen_key = jax.random.split(master_key)
+        keys = jax.random.split(gen_key, n_sweep)
+
+        populations, states = v_ask(keys, states, params)
+        populations = jnp.clip(populations, lb, ub)
+        pop_np = np.array(populations)
+        fitness = builder.fitness(pop_np)
+        states, _ = v_tell(
+            keys, populations,
+            jnp.array(fitness, dtype=jnp.float64),
+            states, params,
+        )
+        generations_run = gen + 1
+
+        if (gen + 1) % check_every == 0:
+            best = np.array(states.best_fitness)
+            mean_best = float(best.mean())
+
+            if verbose:
+                print(
+                    f"  gen {gen+1:4d}/{n_generations}  "
+                    f"mean_χ²={mean_best:.2f}  "
+                    f"min_χ²={float(best.min()):.2f}"
+                )
+
+            if tol > 0 and np.isfinite(prev_mean_best):
+                rel_improvement = (prev_mean_best - mean_best) / max(prev_mean_best, 1e-12)
+                if rel_improvement < tol:
+                    no_improve_count += 1
+                    if no_improve_count >= patience:
+                        if verbose:
+                            print(f"  Early stop at gen {gen+1}.")
+                        converged = True
+                        break
+                else:
+                    no_improve_count = 0
+            prev_mean_best = mean_best
+
+    elapsed = time.perf_counter() - t_start
+
+    best_chisqr = np.array(states.best_fitness)
+    best_solutions = np.array(states.best_solution)
+
+    return {
+        "sweep_values":    sweep_values,
+        "best_chisqr":     best_chisqr,
+        "best_params":     best_solutions,
+        "free_param_names": [p.name for p in builder.free_params],
+        "param_name":      param_name,
+        "elapsed_sec":     elapsed,
+        "generations_run": generations_run,
+        "converged":       converged,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Multi-energy batched CMA-ES sweep
+# ---------------------------------------------------------------------------
+
+def gpu_parameter_sweep_cmaes_batched_energies(
+    objectives_dict,
+    param_name,
+    sweep_values_per_energy,
+    popsize=20,
+    n_generations=300,
+    seed=0,
+    verbose=False,
+    tol=1e-4,
+    patience=5,
+    check_every=10,
+):
+    """
+    Run parameter sweep for all energies simultaneously using Sep-CMA-ES.
+
+    Replaces N_energies sequential calls to gpu_parameter_sweep_cmaes with a
+    single GPU run that batches n_energies × max_n_sweep optimization instances
+    together.  Energies with different sweep grid sizes are zero-padded.
+
+    Parameters
+    ----------
+    objectives_dict          : {energy: refnx Objective} at best-fit values
+    param_name               : parameter to sweep (held fixed per slot)
+    sweep_values_per_energy  : {energy: np.ndarray} — sweep grid per energy
+    popsize                  : population size per instance (default 20)
+    n_generations            : maximum generations (default 300)
+    seed                     : random seed
+    verbose                  : print progress every check_every generations
+    tol                      : relative improvement threshold for early stopping
+    patience                 : consecutive non-improving checks before stop
+    check_every              : generations between convergence checks
+
+    Returns
+    -------
+    dict {energy: result} where each result has the same keys as
+    gpu_parameter_sweep_cmaes:
+        sweep_values, best_chisqr, best_params, free_param_names,
+        param_name, elapsed_sec, generations_run, converged
+    """
+    from evosax.algorithms import Sep_CMA_ES
+
+    energies = sorted(objectives_dict.keys())
+
+    builder = MultiEnergySweepBatchBuilder(
+        objectives_dict, param_name, sweep_values_per_energy
+    )
+    n_total = builder.n_total
+    n_free  = builder.n_free
+    bounds  = builder.bounds
+
+    if n_free == 0:
+        raise ValueError(
+            f"No free parameters after excluding '{param_name}'. "
+            "Check that other parameters have vary=True."
+        )
+
+    lb = jnp.array(bounds[:, 0])
+    ub = jnp.array(bounds[:, 1])
+    mean_init = (lb + ub) / 2.0
+
+    solution_proto = np.zeros(n_free, dtype=np.float64)
+    strategy = Sep_CMA_ES(population_size=popsize, solution=solution_proto)
+    params = strategy.default_params
+
+    v_init = jax.jit(jax.vmap(strategy.init, in_axes=(0, None, None)))
+    v_ask  = jax.jit(jax.vmap(strategy.ask,  in_axes=(0, 0, None)))
+    v_tell = jax.jit(jax.vmap(strategy.tell, in_axes=(0, 0, 0, 0, None)))
+
+    master_key = jax.random.PRNGKey(seed)
+    master_key, init_key = jax.random.split(master_key)
+    init_keys = jax.random.split(init_key, n_total)
+
+    states = v_init(init_keys, mean_init, params)
+
+    prev_mean_best  = np.inf
+    no_improve_count = 0
+    converged       = False
+    generations_run = 0
+
+    t_start = time.perf_counter()
+    for gen in range(n_generations):
+        master_key, gen_key = jax.random.split(master_key)
+        keys = jax.random.split(gen_key, n_total)
+
+        populations, states = v_ask(keys, states, params)
+        populations = jnp.clip(populations, lb, ub)
+        pop_np = np.array(populations)
+        fitness = builder.fitness(pop_np)  # (n_total, popsize)
+        states, _ = v_tell(
+            keys, populations,
+            jnp.array(fitness, dtype=jnp.float64),
+            states, params,
+        )
+        generations_run = gen + 1
+
+        if (gen + 1) % check_every == 0:
+            best_all  = np.array(states.best_fitness)  # (n_total,)
+            valid_best = best_all[builder.valid_mask]
+            mean_best  = float(valid_best.mean())
+
+            if verbose:
+                print(
+                    f"  gen {gen+1:4d}/{n_generations}  "
+                    f"mean_χ²={mean_best:.2f}  "
+                    f"min_χ²={float(valid_best.min()):.2f}  "
+                    f"[{len(energies)} energies × {builder.max_n_sweep} sweep pts]"
+                )
+
+            if tol > 0 and np.isfinite(prev_mean_best):
+                rel_imp = (prev_mean_best - mean_best) / max(prev_mean_best, 1e-12)
+                if rel_imp < tol:
+                    no_improve_count += 1
+                    if no_improve_count >= patience:
+                        if verbose:
+                            print(f"  Early stop at gen {gen+1}.")
+                        converged = True
+                        break
+                else:
+                    no_improve_count = 0
+            prev_mean_best = mean_best
+
+    elapsed = time.perf_counter() - t_start
+
+    best_chisqr_all   = np.array(states.best_fitness)   # (n_total,)
+    best_solutions_all = np.array(states.best_solution)  # (n_total, n_free)
+
+    results = {}
+    for i, e in enumerate(energies):
+        sv  = np.asarray(sweep_values_per_energy[e], dtype=np.float64)
+        ns  = len(sv)
+        start = i * builder.max_n_sweep
+        results[e] = {
+            "sweep_values":     sv,
+            "best_chisqr":      best_chisqr_all[start : start + ns],
+            "best_params":      best_solutions_all[start : start + ns],
+            "free_param_names": [p.name for p in builder.free_params],
+            "param_name":       param_name,
+            "elapsed_sec":      elapsed,
+            "generations_run":  generations_run,
+            "converged":        converged,
+        }
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Result conversion: GPU sweep result → refnx sweep_info format
 # ---------------------------------------------------------------------------
 
@@ -314,8 +601,6 @@ def gpu_fit_models(
       'energies'            : list of processed energies
       'elapsed_sec'         : wall time
     """
-    from gpu_reflect import ModelsBatchBuilder
-
     if energy_list is None:
         energy_list = sorted(objectives_dict.keys())
 

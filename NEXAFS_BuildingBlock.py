@@ -67,6 +67,18 @@ def get_peak_names(peak_params: Dict) -> list:
     
     return sorted(list(peak_names))
 
+def _build_peak_colors(peak_params: Dict, peak_names: list) -> List[str]:
+    """Return a color for each peak, using peak_N_color from peak_params if provided."""
+    tab_colors = plt.cm.tab20.colors
+    colors = []
+    for i, peak_name in enumerate(peak_names):
+        key = f"{peak_name}_color"
+        if key in peak_params:
+            colors.append(peak_params[key])
+        else:
+            colors.append(mcolors.to_hex(tab_colors[i % len(tab_colors)]))
+    return colors
+
 def validate_peak_params(peak_params: Dict) -> bool:
     """
     Validate that all required parameters are present for each peak.
@@ -747,14 +759,10 @@ def plot_fit_results(results: Dict,
     # Get peak names and set up colors
     peak_names = get_peak_names(fitted_peak_params)
     n_peaks = len(peak_names)
-    
+
     if peak_colors is None:
-        if n_peaks <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, max(n_peaks, 3)))
-        else:
-            colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
-        peak_colors = [mcolors.to_hex(color) for color in colors]
-    
+        peak_colors = _build_peak_colors(fitted_peak_params, peak_names)
+
     # Plot experimental data (prefer full spectrum if available)
     ax1.plot(energy_exp_full, intensity_exp_full, 'ko', markersize=3, alpha=0.7, 
              label='Experimental Data', zorder=1)
@@ -935,13 +943,8 @@ def plot_nexafs_spectrum(energy: np.ndarray,
     n_peaks = len(peak_names)
     
     if peak_colors is None:
-        # Use a colormap to generate distinct colors
-        if n_peaks <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, max(n_peaks, 3)))
-        else:
-            colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
-        peak_colors = [mcolors.to_hex(color) for color in colors]
-    
+        peak_colors = _build_peak_colors(peak_params, peak_names)
+
     # Plot experimental/input data
     ax.plot(energy, intensity, 'ko', markersize=3, alpha=0.7, 
              label='Data', zorder=1)
@@ -1099,15 +1102,10 @@ def plot_nexafs_fit(results: Dict,
     # Get peak names and set up colors
     peak_names = get_peak_names(plot_peak_params)
     n_peaks = len(peak_names)
-    
+
     if peak_colors is None:
-        # Use a colormap to generate distinct colors
-        if n_peaks <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, max(n_peaks, 3)))
-        else:
-            colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
-        peak_colors = [mcolors.to_hex(color) for color in colors]
-    
+        peak_colors = _build_peak_colors(plot_peak_params, peak_names)
+
     # Plot experimental data
     ax1.plot(energy_exp, intensity_exp, 'ko', markersize=3, alpha=0.7, 
              label='Experimental Data', zorder=1)
@@ -1426,13 +1424,8 @@ def _get_color_for_peak_energy(peak_energy: float,
     # Count how many unique energy positions we have
     n_unique_energies = len(_peak_energy_color_map)
     
-    # Use tab10 for up to 10 unique energies, tab20 for more
-    if n_unique_energies < 10:
-        colors = plt.cm.tab10(np.linspace(0, 1, 10))
-        color = colors[n_unique_energies % 10]
-    else:
-        colors = plt.cm.tab20(np.linspace(0, 1, 20))
-        color = colors[n_unique_energies % 20]
+    tab_colors = plt.cm.tab20.colors
+    color = tab_colors[n_unique_energies % len(tab_colors)]
     
     color_hex = mcolors.to_hex(color)
     
@@ -1467,7 +1460,12 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
                                  xlim: Optional[Tuple[float, float]] = None,
                                  ylim: Optional[Tuple[float, float]] = None,
                                  show_peaks_subplot: bool = False,
-                                 peaks_subplot_height: float = 0.8) -> plt.Figure:
+                                 peaks_subplot_height: float = 0.8,
+                                 xlabel: str = 'Energy (eV)',
+                                 ylabel: str = 'Intensity (arb. units)',
+                                 label_fontsize: int = 12,
+                                 label_font: Optional[str] = None,
+                                 legend_ncol: int = 4) -> plt.Figure:
     """
     Plot NEXAFS spectrum with peak decomposition using separate energy axes for 
     experimental data and simulated components.
@@ -1507,7 +1505,18 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
         (no baseline and no step edge contribution).
     peaks_subplot_height : float, default 0.8
         Height ratio for the peaks-only subplot relative to the main plot.
-        
+    xlabel : str, default 'Energy (eV)'
+        X-axis label text.
+    ylabel : str, default 'Intensity (arb. units)'
+        Y-axis label text.
+    label_fontsize : int, default 12
+        Font size for axis labels.
+    label_font : str, optional
+        Font family for axis labels (e.g. 'Arial', 'Times New Roman'). If None,
+        uses the current matplotlib default.
+    legend_ncol : int, default 4
+        Number of columns in the legend placed below the plot.
+
     Returns:
     matplotlib.figure.Figure
         The created figure object
@@ -1531,13 +1540,8 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
     n_peaks = len(peak_names)
     
     if peak_colors is None:
-        # Use a colormap to generate distinct colors
-        if n_peaks <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, max(n_peaks, 3)))
-        else:
-            colors = plt.cm.tab20(np.linspace(0, 1, n_peaks))
-        peak_colors = [mcolors.to_hex(color) for color in colors]
-    
+        peak_colors = _build_peak_colors(peak_params, peak_names)
+
     # Plot experimental data using original energy axis (no recalculation)
     if use_experimental_data:
         ax.plot(energy, intensity, 'ko--', markersize=3, alpha=0.7, 
@@ -1635,35 +1639,41 @@ def plot_simulated_nexafs_spectrum(energy: np.ndarray,
             ax_peaks.fill_between(energy_sim, 0.0, peak_spectrum, color=color, alpha=max(0.0, peak_alpha * 0.6), zorder=1)
     
     # Formatting
+    font_kw = {'fontfamily': label_font} if label_font is not None else {}
     if ax_peaks is None:
-        ax.set_xlabel('Energy (eV)', fontsize=12)
-    ax.set_ylabel('Intensity (arb. units)', fontsize=12)
+        ax.set_xlabel(xlabel, fontsize=label_fontsize, **font_kw)
+    ax.set_ylabel(ylabel, fontsize=label_fontsize, **font_kw)
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right', fontsize=10)
+
+    # Legend below the plot
+    legend_anchor_y = -0.18 if ax_peaks is None else -0.05
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, legend_anchor_y),
+              ncol=legend_ncol, fontsize=10, frameon=True)
 
     if ax_peaks is not None:
-        ax_peaks.set_xlabel('Energy (eV)', fontsize=12)
-        ax_peaks.set_ylabel('Peaks', fontsize=11)
+        ax_peaks.set_xlabel(xlabel, fontsize=label_fontsize, **font_kw)
+        ax_peaks.set_ylabel('Peaks', fontsize=label_fontsize - 1, **font_kw)
         ax_peaks.grid(True, alpha=0.2)
         ax_peaks.set_ylim(bottom=0.0)
-    
+
     # Set axis limits if provided
     if xlim is not None:
         ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
-    
+
     # Add information about energy axes
     # energy_spacing_exp = np.median(np.diff(energy))
     # energy_spacing_sim = np.median(np.diff(energy_sim))
     # info_text = f'Exp. spacing: {energy_spacing_exp:.3f} eV\nSim. spacing: {energy_spacing_sim:.3f} eV'
-    # ax.text(0.98, 0.02, info_text, transform=ax.transAxes, 
+    # ax.text(0.98, 0.02, info_text, transform=ax.transAxes,
     #         fontsize=9, verticalalignment='bottom', horizontalalignment='right',
     #         bbox=dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.7))
-    
-    # Adjust layout
+
+    # Extra bottom margin so the below-axes legend isn't clipped
     plt.tight_layout()
+    plt.subplots_adjust(bottom=0.18)
     
     # Save figure if path provided
     if save_path is not None:

@@ -1579,3 +1579,256 @@ def batch_fit_sweep_gpu(
         'sample_name':      sample_name,
         'model_name':       model_name,
     }
+
+
+def batch_fit_sweep_cmaes(
+    batch_results,
+    sweep_params,
+    sample_name,
+    model_name,
+    h5_filepath,
+    run_criteria='best',
+    uncertainty_percent=10,
+    popsize=20,
+    n_generations=300,
+    tol=1e-4,
+    patience=5,
+    energy_list=None,
+    verbose=True,
+):
+    """
+    GPU parameter sweep using Sep-CMA-ES — drop-in replacement for batch_fit_sweep_gpu.
+
+    Runs the sweep-point optimizations with Sep-CMA-ES instead of DE.
+    Supports early stopping: each energy's sweep halts once convergence is
+    detected across sweep points, rather than always running to n_generations.
+
+    Parameters
+    ----------
+    batch_results       : output of batch_fit_selected_models_cmaes or _gpu
+    sweep_params        : list of dicts, each describing one parameter to sweep:
+                            {'param': 'layer1 - thick', 'delta': 20.0, 'step': 2.0}
+                            {'param': 'layer1 - thick', 'values': [30, 40, 50, 60]}
+    sample_name         : HDF5 sample label
+    model_name          : HDF5 model label
+    h5_filepath         : existing .h5 file to append sweep results to
+    run_criteria        : 'best' | 'last' | int — which run to attach results to
+    uncertainty_percent : GOF threshold for CI calculation (default 10%)
+    popsize             : population size per sweep point (default 20)
+    n_generations       : maximum generations per sweep (default 300)
+    tol                 : early stopping relative improvement threshold (default 1e-4)
+    patience            : consecutive non-improving checks before stopping (default 5)
+    energy_list         : subset of energies to process (default: all fitted)
+    verbose             : print per-energy progress
+
+    Returns
+    -------
+    Same dict as batch_fit_sweep_gpu:
+        sweep_results, ci_summary, swept_energies, skipped_energies,
+        h5_filepath, sample_name, model_name
+    """
+    from gpu_sweep_optimizer import (
+        gpu_parameter_sweep_cmaes_batched_energies,
+        gpu_result_to_sweep_info,
+    )
+
+    if 'fitted_objectives' not in batch_results:
+        raise ValueError("batch_results must contain 'fitted_objectives'.")
+
+    for i, spec in enumerate(sweep_params):
+        if 'param' not in spec:
+            raise ValueError(f"sweep_params[{i}] missing 'param' key.")
+        if 'values' not in spec and not ('delta' in spec and 'step' in spec):
+            raise ValueError(
+                f"sweep_params[{i}]: must have either 'values' or both "
+                f"'delta' and 'step'.")
+
+    if energy_list is not None:
+        working_energies = [
+            e for e in energy_list
+            if e in batch_results['fitted_objectives']
+        ]
+    else:
+        working_energies = batch_results.get(
+            'fitted_energies',
+            sorted(batch_results['fitted_objectives'].keys()))
+
+    all_sweep_results = {}
+    swept_energies    = []
+    skipped_energies  = []
+    ci_rows           = []
+
+    # Accumulate per-energy sweep data across all sweep params before saving to HDF5.
+    # {energy: {param_name: {'sweep_info': ..., 'ci_result': ...}}}
+    energy_sweep_data_all = {}
+
+    for spec in sweep_params:
+        param_name = spec['param']
+
+        # ── Phase 1: build per-energy objectives and sweep grids ──────────────
+        objectives_for_sweep    = {}
+        sweep_values_per_energy = {}
+
+        for energy in sorted(working_energies):
+            objective = batch_results['fitted_objectives'].get(energy)
+            if objective is None:
+                if not any(e == energy for e, _ in skipped_energies):
+                    skipped_energies.append((energy, 'not in fitted_objectives'))
+                continue
+
+            if 'values' in spec:
+                sv = np.asarray(spec['values'], dtype=float)
+            else:
+                delta = float(spec['delta'])
+                step  = float(spec['step'])
+
+                best_val = lb = ub = None
+                for p in objective.parameters.flattened(unique=True):
+                    if p.name == param_name:
+                        best_val = float(p.value)
+                        b = getattr(p, 'bounds', None)
+                        if b is not None:
+                            lb = float(b.lb) if hasattr(b, 'lb') else float(b[0])
+                            ub = float(b.ub) if hasattr(b, 'ub') else float(b[1])
+                        break
+
+                if best_val is None:
+                    print(f"  Warning: parameter '{param_name}' not found in "
+                          f"objective for {energy} eV — skipping.")
+                    continue
+
+                raw_lo = best_val - delta
+                raw_hi = best_val + delta
+                clamped_lo = (max(raw_lo, lb) if lb is not None and np.isfinite(lb)
+                              else raw_lo)
+                clamped_hi = (min(raw_hi, ub) if ub is not None and np.isfinite(ub)
+                              else raw_hi)
+
+                if clamped_lo != raw_lo or clamped_hi != raw_hi:
+                    print(f"  Warning: sweep range for '{param_name}' at {energy} eV "
+                          f"clamped from [{raw_lo:.4g}, {raw_hi:.4g}] to "
+                          f"[{clamped_lo:.4g}, {clamped_hi:.4g}].")
+
+                sv = np.arange(clamped_lo, clamped_hi + step / 2, step)
+                if len(sv) == 0:
+                    print(f"  Warning: no sweep values generated for '{param_name}' "
+                          f"at {energy} eV after clamping — skipping.")
+                    continue
+
+            objectives_for_sweep[energy]    = copy.deepcopy(objective)
+            sweep_values_per_energy[energy] = sv
+
+        if not objectives_for_sweep:
+            continue
+
+        if verbose:
+            print(f"\n{'─' * 60}")
+            print(f"  Sweeping '{param_name}' (Sep-CMA-ES, batched): "
+                  f"{len(objectives_for_sweep)} energies")
+            for energy, sv in sweep_values_per_energy.items():
+                print(f"    {energy} eV: {len(sv)} points "
+                      f"[{sv[0]:.4g} → {sv[-1]:.4g}]")
+
+        # ── Phase 2: one batched GPU call for all energies ────────────────────
+        try:
+            results_by_energy = gpu_parameter_sweep_cmaes_batched_energies(
+                objectives_for_sweep,
+                param_name,
+                sweep_values_per_energy,
+                popsize=popsize,
+                n_generations=n_generations,
+                tol=tol,
+                patience=patience,
+                verbose=verbose,
+            )
+        except ValueError as exc:
+            print(f"  Warning: batched sweep failed for '{param_name}': {exc}")
+            continue
+        except Exception as exc:
+            print(f"  Warning: unexpected error during batched sweep of "
+                  f"'{param_name}': {exc}")
+            continue
+
+        # ── Phase 3: post-process per energy ──────────────────────────────────
+        sample_result = next(iter(results_by_energy.values()))
+        conv_str = (
+            f"converged gen {sample_result['generations_run']}"
+            if sample_result['converged']
+            else f"gen {sample_result['generations_run']}"
+        )
+
+        for energy, gpu_result in results_by_energy.items():
+            obj_copy = objectives_for_sweep[energy]
+            sv = sweep_values_per_energy[energy]
+
+            try:
+                sweep_info = gpu_result_to_sweep_info(
+                    gpu_result, obj_copy, param_name, sv
+                )
+                ci_result = get_best_fit_with_uncertainty(
+                    sweep_info, uncertainty_percent
+                )
+            except Exception as exc:
+                print(f"  Warning: post-processing failed for '{param_name}' at "
+                      f"{energy} eV: {exc}")
+                continue
+
+            if energy not in energy_sweep_data_all:
+                energy_sweep_data_all[energy] = {}
+            energy_sweep_data_all[energy][param_name] = {
+                'sweep_info': sweep_info,
+                'ci_result':  ci_result,
+            }
+
+            lo, hi = ci_result['uncertainty_range']
+            ci_rows.append(dict(
+                energy=energy,
+                param_name=param_name,
+                best_value=ci_result['best_value'],
+                best_gof=ci_result['best_gof'],
+                ci_lower=lo,
+                ci_upper=hi,
+                uncertainty_width=ci_result['uncertainty_width'],
+                uncertainty_percent=ci_result['uncertainty_percent'],
+            ))
+
+            if verbose:
+                print(f"    {energy} eV  CI ({uncertainty_percent}%): "
+                      f"[{lo:.4g}, {hi:.4g}]  "
+                      f"width={ci_result['uncertainty_width']:.4g}  "
+                      f"best_gof={ci_result['best_gof']:.4g}  "
+                      f"elapsed={gpu_result['elapsed_sec']:.1f}s  ({conv_str})")
+
+    # ── Save per energy to HDF5 (all sweep params combined) ───────────────────
+    for energy in sorted(working_energies):
+        energy_sweep_data = energy_sweep_data_all.get(energy, {})
+        if energy_sweep_data:
+            save_sweep_results_to_h5(
+                energy_sweep_data, sample_name, model_name, h5_filepath,
+                energy, run_criteria=run_criteria,
+                uncertainty_percent=uncertainty_percent,
+            )
+            all_sweep_results[energy] = energy_sweep_data
+            swept_energies.append(energy)
+        elif not any(e == energy for e, _ in skipped_energies):
+            skipped_energies.append(
+                (energy, 'no sweep parameters produced results'))
+
+    ci_summary = (pd.DataFrame(ci_rows) if ci_rows
+                  else pd.DataFrame(columns=[
+                      'energy', 'param_name', 'best_value', 'best_gof',
+                      'ci_lower', 'ci_upper', 'uncertainty_width',
+                      'uncertainty_percent']))
+
+    print(f"\nSep-CMA-ES sweep complete: {len(swept_energies)} energies saved "
+          f"→ {h5_filepath}")
+
+    return {
+        'sweep_results':    all_sweep_results,
+        'ci_summary':       ci_summary,
+        'swept_energies':   swept_energies,
+        'skipped_energies': skipped_energies,
+        'h5_filepath':      str(h5_filepath),
+        'sample_name':      sample_name,
+        'model_name':       model_name,
+    }

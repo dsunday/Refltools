@@ -2624,9 +2624,13 @@ class LariatDataProcessor:
         return anim
 
 
-    def create_spectral_animation(self, spectrum_np=None, roi=None, roi_list=None, roi_labels=None, 
-                                output_filename='spectrum_animation.gif', dpi=100, total_time=10.0, 
-                                energy_range=None, contrast_percentiles=(5, 95), max_fps=30):
+    def create_spectral_animation(self, spectrum_np=None, roi=None, roi_list=None, roi_labels=None,
+                                output_filename='spectrum_animation.gif', dpi=100, total_time=10.0,
+                                energy_range=None, contrast_percentiles=(5, 95), max_fps=30,
+                                do_pre_edge_norm=False, do_pre_edge_sub=False, do_post_edge_norm=False,
+                                pre_edge_norm_range=None, pre_edge_sub_range=None, post_edge_range=None,
+                                normalize_image_series=False, image_norm_energy=270,
+                                cmap='tab10', cmap_range=(0.0, 1.0)):
         """
         Create an animation showing the xarray data at each energy alongside the spectrum.
         A vertical line moves through the spectrum to indicate the current energy.
@@ -2658,7 +2662,28 @@ class LariatDataProcessor:
         max_fps : int, optional
             Maximum fps for animation. If needed fps exceeds this, energy points will be subsampled.
             Default is 30.
-            
+        do_pre_edge_norm : bool, optional
+            If True, apply pre-edge slope normalisation to each ROI spectrum. Default is False.
+        do_pre_edge_sub : bool, optional
+            If True, subtract pre-edge background from each ROI spectrum. Default is False.
+        do_post_edge_norm : bool, optional
+            If True, normalise each ROI spectrum by the post-edge average. Default is False.
+        pre_edge_norm_range : tuple, optional
+            (min_energy, max_energy) for pre-edge slope fit. Defaults to first 20% of range.
+        pre_edge_sub_range : tuple, optional
+            (min_energy, max_energy) for pre-edge subtraction. Defaults to first 10% of range.
+        post_edge_range : tuple, optional
+            (min_energy, max_energy) for post-edge normalisation. Defaults to last 20% of range.
+        normalize_image_series : bool, optional
+            If True, divide every image frame by the frame at image_norm_energy. Default is False.
+        image_norm_energy : float, optional
+            Reference energy (eV) used when normalize_image_series=True. Default is 270 eV.
+        cmap : str, optional
+            Matplotlib colormap name used to colour ROI boxes and spectrum lines. Default is 'tab10'.
+        cmap_range : tuple, optional
+            (start, end) positions within the colormap [0, 1] from which colours are sampled.
+            E.g. cmap='cool', cmap_range=(0.9, 0.3) samples from 0.9 down to 0.3. Default is (0.0, 1.0).
+
         Returns:
         --------
         animation : matplotlib.animation.Animation
@@ -2669,10 +2694,10 @@ class LariatDataProcessor:
         import matplotlib.animation as animation
         from matplotlib.patches import Rectangle
         from scipy.interpolate import interp1d
-        
+
         if self.data is None:
             raise ValueError("No data loaded. Please load data first using load_data().")
-        
+
         # Handle ROI inputs and extract spectra
         spectra_list = []
         display_rois = []
@@ -2750,13 +2775,35 @@ class LariatDataProcessor:
                 spec_energy_mask = (spectrum[:, 0] >= energy_range[0]) & (spectrum[:, 0] <= energy_range[1])
                 filtered_spectra.append(spectrum[spec_energy_mask])
             spectra_list = filtered_spectra
-            
+
             print(f"Animation limited to energy range: {energy_range[0]:.2f} - {energy_range[1]:.2f} eV")
-        
+
+        # Apply normalisations to each spectrum in spectra_list
+        if do_pre_edge_norm or do_pre_edge_sub or do_post_edge_norm:
+            normalised_spectra = []
+            for spectrum in spectra_list:
+                s = spectrum.copy()
+                if do_pre_edge_norm:
+                    s, _ = self.normalize_by_pre_edge_slope(s, fit_range=pre_edge_norm_range)
+                if do_pre_edge_sub:
+                    s, _ = self.subtract_pre_edge(s, pre_edge_range=pre_edge_sub_range)
+                if do_post_edge_norm:
+                    s, _ = self.normalize_by_post_edge(s, post_edge_range=post_edge_range)
+                normalised_spectra.append(s)
+            spectra_list = normalised_spectra
+
+        # Normalise image series by a reference energy frame
+        if normalize_image_series:
+            ref_frame = data_to_use.sel(energy=image_norm_energy, method='nearest')
+            actual_ref_energy = float(ref_frame.energy.values)
+            print(f"Normalising image series by frame at {actual_ref_energy:.2f} eV "
+                  f"(requested {image_norm_energy} eV)")
+            data_to_use = data_to_use / (ref_frame + 1e-10)
+
         # Extract energy values from filtered data
         all_energies = data_to_use.energy.values
         n_total_energies = len(all_energies)
-        
+
         if n_total_energies == 0:
             raise ValueError("No energy points found in the specified range.")
         
@@ -2817,9 +2864,12 @@ class LariatDataProcessor:
         ax_img.set_xlabel('Pixel X')
         ax_img.set_ylabel('Pixel Y')
         
-        # Generate colors for multiple ROIs/spectra
-        colors = plt.cm.tab10(np.linspace(0, 1, len(spectra_list)))
-        
+        # Generate colors for multiple ROIs/spectra from the chosen colormap
+        cmap_obj = plt.get_cmap(cmap)
+        n_colors = max(len(spectra_list), 1)
+        sample_points = np.linspace(cmap_range[0], cmap_range[1], n_colors)
+        colors = cmap_obj(sample_points)
+
         # Add ROI rectangles if we have display_rois
         roi_patches = []
         if display_rois:
@@ -2827,16 +2877,16 @@ class LariatDataProcessor:
                 x_min, y_min, x_max, y_max = roi_bounds
                 width = x_max - x_min
                 height = y_max - y_min
-                
-                rect = Rectangle((x_min, y_min), width, height, 
+
+                rect = Rectangle((x_min, y_min), width, height,
                                 edgecolor=colors[i], facecolor='none', linewidth=2)
                 ax_img.add_patch(rect)
                 roi_patches.append(rect)
-                
-                # Add label
-                ax_img.text(x_min + width/2, y_min + height + 2, label, 
-                        color=colors[i], fontweight='bold', ha='center',
-                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+
+                # Label inside the box, top-left corner
+                ax_img.text(x_min + 4, y_max - 4, label,
+                        color=colors[i], fontweight='bold', ha='left', va='top',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.5))
         
         # Plot all spectra
         spectrum_lines = []
@@ -2869,19 +2919,6 @@ class LariatDataProcessor:
         # Add legend
         ax_spec.legend(loc='upper right', fontsize=10)
         
-        # Add energy text and animation info on the spectrum plot
-        energy_text = ax_spec.text(0.02, 0.98, f'Current: {animation_energies[0]:.2f} eV', 
-                                transform=ax_spec.transAxes, verticalalignment='top',
-                                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-        
-        info_text = (f'Duration: {actual_total_time:.1f}s | FPS: {actual_fps:.1f}\n'
-                    f'Frames: {n_animation_frames}/{n_total_energies}\n'
-                    f'Spectra: {len(spectra_list)}')
-        time_text = ax_spec.text(0.02, 0.86, info_text, 
-                                transform=ax_spec.transAxes, verticalalignment='top',
-                                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
-                                fontsize=9)
-        
         # Function to update the animation for each frame
         def update_frame(frame):
             # Get the actual energy index for this animation frame
@@ -2900,12 +2937,9 @@ class LariatDataProcessor:
             
             # Update all vertical lines
             for energy_line in energy_lines:
-                energy_line.set_xdata(current_energy)
+                energy_line.set_xdata([current_energy])
             
-            # Update energy text
-            energy_text.set_text(f'Current: {current_energy:.2f} eV')
-            
-            return [img, img_title, energy_text] + energy_lines
+            return [img, img_title] + energy_lines
         
         # Create the animation with calculated interval
         anim = animation.FuncAnimation(fig, update_frame, frames=n_animation_frames, 

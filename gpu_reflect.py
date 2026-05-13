@@ -872,3 +872,270 @@ class ModelsBatchBuilder:
             )
 
         return np.array(chi2)  # (n_energies, popsize)
+
+
+# ---------------------------------------------------------------------------
+# MultiEnergySweepBatchBuilder — batches n_energies × max_n_sweep simultaneously
+# ---------------------------------------------------------------------------
+
+class MultiEnergySweepBatchBuilder:
+    """
+    Batches n_energies × max_n_sweep optimization instances simultaneously.
+
+    Combines per-energy Q/data/optical-constant variation (like ModelsBatchBuilder)
+    with per-sweep-value parameter-fixing (like SweepBatchBuilder).  Total batch
+    size: n_total = n_energies × max_n_sweep.
+
+    For delta/step sweeps where different energies produce different n_sweep
+    counts, slots beyond each energy's real sweep count are padded; padded
+    slots return fitness = 1e30 and never become best solutions.
+
+    fitness(pop_matrix) accepts (n_total, popsize, n_free)
+    and returns (n_total, popsize).
+
+    Results are indexed as: slot index = energy_index * max_n_sweep + sweep_index.
+    """
+
+    def __init__(self, objectives_dict, param_name, sweep_values_per_energy):
+        """
+        Parameters
+        ----------
+        objectives_dict          : {energy: refnx Objective} at best-fit values
+        param_name               : str — parameter to sweep (held fixed per slot)
+        sweep_values_per_energy  : {energy: array-like} — sweep values per energy
+        """
+        self.param_name = param_name
+        self.energies = sorted(objectives_dict.keys())
+        self.n_energies = len(self.energies)
+
+        self.sweep_values_per_energy = {
+            e: np.asarray(sweep_values_per_energy[e], dtype=np.float64)
+            for e in self.energies
+        }
+
+        n_sweeps = [len(self.sweep_values_per_energy[e]) for e in self.energies]
+        self.max_n_sweep = max(n_sweeps)
+        self.n_total = self.n_energies * self.max_n_sweep
+
+        # valid_mask[i] = True for real slots (flat index = e_idx * max_n_sweep + s_idx)
+        self.valid_mask = np.zeros(self.n_total, dtype=bool)
+        for i, ns in enumerate(n_sweeps):
+            self.valid_mask[i * self.max_n_sweep : i * self.max_n_sweep + ns] = True
+
+        # Build free params and bounds from first energy (structure shared across energies)
+        ref_obj_copy = copy.deepcopy(objectives_dict[self.energies[0]])
+        for p in ref_obj_copy.parameters.flattened():
+            if p.name == param_name:
+                p.vary = False
+                break
+        self.free_params = extract_free_params(ref_obj_copy, excluded_name=param_name)
+        self.n_free = len(self.free_params)
+        self.bounds = get_bounds_array(self.free_params)
+
+        # Validate n_free is consistent across energies
+        for e in self.energies[1:]:
+            other_free = [
+                p for p in objectives_dict[e].parameters.flattened()
+                if p.vary and p.name != param_name
+            ]
+            if len(other_free) != self.n_free:
+                raise ValueError(
+                    f"Energy {e} has {len(other_free)} free parameters "
+                    f"(excluding '{param_name}'), but {self.energies[0]} has "
+                    f"{self.n_free}. All energies must have the same n_free."
+                )
+
+        # Slab shape from reference
+        slabs_0, _, _ = get_slabs_scale_bkg(ref_obj_copy)
+        self.n_slab_rows = slabs_0.shape[0]
+
+        # Precompute base slabs for all n_total slots — one deep copy per energy
+        self.base_slabs = np.empty((self.n_total, self.n_slab_rows, 4), dtype=np.float64)
+        self.base_scale = np.empty(self.n_total, dtype=np.float64)
+        self.base_bkg   = np.empty(self.n_total, dtype=np.float64)
+
+        for i, e in enumerate(self.energies):
+            obj_copy = copy.deepcopy(objectives_dict[e])
+            sv = self.sweep_values_per_energy[e]
+            ns = len(sv)
+            swept_p = next(
+                (p for p in obj_copy.parameters.flattened() if p.name == param_name),
+                None,
+            )
+            for s in range(self.max_n_sweep):
+                val = float(sv[min(s, ns - 1)])  # repeat last value for padding
+                if swept_p is not None:
+                    swept_p.value = val
+                slabs, scale, bkg = get_slabs_scale_bkg(obj_copy)
+                idx = i * self.max_n_sweep + s
+                self.base_slabs[idx] = slabs
+                self.base_scale[idx] = scale
+                self.base_bkg[idx]   = bkg
+
+        # param_map is the same for all instances (shared model structure)
+        self.param_map = _build_param_map(ref_obj_copy, self.free_params)
+
+        # Detect transform and smearing from first objective
+        use_log, dqvals_fwhm_0, quad_order = _detect_objective_fitness_mode(
+            objectives_dict[self.energies[0]]
+        )
+        self.use_log = use_log
+
+        # Build Q/data padded arrays: each energy's arrays are tiled max_n_sweep times
+        q_list, y_list, y_err_list, n_q_list = [], [], [], []
+        for e in self.energies:
+            q, y, y_err = objective_data(objectives_dict[e])
+            q_list.append(q); y_list.append(y); y_err_list.append(y_err)
+            n_q_list.append(len(q))
+
+        self.max_nq = max(n_q_list)
+
+        self.q_pad_all     = np.zeros((self.n_total, self.max_nq), dtype=np.float64)
+        self.y_pad_all     = np.zeros((self.n_total, self.max_nq), dtype=np.float64)
+        self.y_err_pad_all = np.ones( (self.n_total, self.max_nq), dtype=np.float64)
+        self.mask_all      = np.zeros((self.n_total, self.max_nq), dtype=np.float64)
+
+        for i, (nq, q, y, y_err) in enumerate(
+            zip(n_q_list, q_list, y_list, y_err_list)
+        ):
+            rows = slice(i * self.max_n_sweep, (i + 1) * self.max_n_sweep)
+            self.q_pad_all[rows, :nq]     = q
+            self.y_pad_all[rows, :nq]     = y
+            self.y_err_pad_all[rows, :nq] = y_err
+            self.mask_all[rows, :nq]      = 1.0
+
+        if dqvals_fwhm_0 is not None:
+            self.use_smearing = True
+            self._build_smear_pads(objectives_dict, quad_order)
+        else:
+            self.use_smearing = False
+
+        if use_log:
+            self.y_log_pad     = np.log10(np.maximum(self.y_pad_all, 1e-100))
+            y_safe             = np.where(self.mask_all > 0, self.y_pad_all, 1.0)
+            self.y_err_log_pad = np.abs(self.y_err_pad_all / (y_safe * np.log(10)))
+
+        # Transfer constant arrays to GPU once
+        self._mask_gpu = jnp.array(self.mask_all)
+        if self.use_smearing:
+            self._q_quad_pad_gpu = jnp.array(self.q_quad_pad)
+            self._combo_gpu      = jnp.array(self.combo_weights)
+        else:
+            self._q_pad_gpu = jnp.array(self.q_pad_all)
+        if use_log:
+            self._y_log_pad_gpu     = jnp.array(self.y_log_pad)
+            self._y_err_log_pad_gpu = jnp.array(self.y_err_log_pad)
+        else:
+            self._y_pad_gpu     = jnp.array(self.y_pad_all)
+            self._y_err_pad_gpu = jnp.array(self.y_err_pad_all)
+
+    def _build_smear_pads(self, objectives_dict, quad_order):
+        """Precompute per-energy smearing Q-quad arrays, tiled max_n_sweep times."""
+        abscissa, weights = gauss_legendre(quad_order)
+        abscissa = np.asarray(abscissa, dtype=np.float64)
+        weights  = np.asarray(weights,  dtype=np.float64)
+        prefactor = 1.0 / np.sqrt(2 * np.pi)
+        gaussvals = prefactor * np.exp(-0.5 * (abscissa * _INTLIMIT) ** 2)
+        self.combo_weights = (gaussvals * weights).astype(np.float64)
+
+        n_quad = len(abscissa)
+        self.q_quad_pad = np.zeros(
+            (self.n_total, self.max_nq, n_quad), dtype=np.float64
+        )
+
+        for i, e in enumerate(self.energies):
+            obj = objectives_dict[e]
+            q = obj.data.x.astype(np.float64)
+            nq = len(q)
+            _, dqvals_fwhm, _ = _detect_objective_fitness_mode(obj)
+            if dqvals_fwhm is None:
+                dqvals_fwhm = np.zeros_like(q)
+            q_quad_i, _ = compute_smear_params(q, dqvals_fwhm, n_quad)
+            rows = slice(i * self.max_n_sweep, (i + 1) * self.max_n_sweep)
+            self.q_quad_pad[rows, :nq, :] = q_quad_i
+            if nq < self.max_nq:
+                self.q_quad_pad[rows, nq:, :] = q_quad_i[-1]
+
+    def build_batch(self, pop_matrix):
+        """
+        Build slab batches for all n_total instances and population members.
+
+        Parameters
+        ----------
+        pop_matrix : ndarray (n_total, popsize, n_free)
+
+        Returns
+        -------
+        layers_batch : ndarray (n_total * popsize, n_slab_rows, 4)
+        scale_batch  : ndarray (n_total * popsize,)
+        bkg_batch    : ndarray (n_total * popsize,)
+        """
+        n_total, popsize, _ = pop_matrix.shape
+        pop_flat = pop_matrix.reshape(n_total * popsize, self.n_free)
+
+        layers_out = np.repeat(self.base_slabs, popsize, axis=0).copy()
+        scale_out  = np.repeat(self.base_scale, popsize)
+        bkg_out    = np.repeat(self.base_bkg,   popsize)
+
+        for k, mappings in enumerate(self.param_map):
+            for entry in mappings:
+                if entry[0] == 'slab':
+                    layers_out[:, entry[1], entry[2]] = pop_flat[:, k]
+                elif entry[0] == 'scale':
+                    scale_out[:] = pop_flat[:, k]
+                elif entry[0] == 'bkg':
+                    bkg_out[:] = pop_flat[:, k]
+
+        return layers_out, scale_out, bkg_out
+
+    def fitness(self, pop_matrix):
+        """
+        Chi-squared for all n_total instances and population members.
+        Padded slots (outside each energy's real sweep range) return 1e30.
+
+        Parameters
+        ----------
+        pop_matrix : ndarray (n_total, popsize, n_free)
+
+        Returns
+        -------
+        chisqr : ndarray (n_total, popsize)
+        """
+        n_total, popsize, _ = pop_matrix.shape
+        layers_flat, scale_flat, bkg_flat = self.build_batch(pop_matrix)
+
+        layers = jnp.array(
+            layers_flat.reshape(n_total, popsize, self.n_slab_rows, 4),
+            dtype=jnp.float64,
+        )
+        scale = jnp.array(scale_flat.reshape(n_total, popsize), dtype=jnp.float64)
+        bkg   = jnp.array(bkg_flat.reshape(n_total, popsize),   dtype=jnp.float64)
+
+        if self.use_smearing and self.use_log:
+            chi2 = _fused_smeared_log_jit(
+                self._q_quad_pad_gpu, self._combo_gpu,
+                self._y_log_pad_gpu, self._y_err_log_pad_gpu, self._mask_gpu,
+                layers, scale, bkg,
+            )
+        elif self.use_smearing:
+            chi2 = _fused_smeared_linear_jit(
+                self._q_quad_pad_gpu, self._combo_gpu,
+                self._y_pad_gpu, self._y_err_pad_gpu, self._mask_gpu,
+                layers, scale, bkg,
+            )
+        elif self.use_log:
+            chi2 = _fused_unsmeared_log_jit(
+                self._q_pad_gpu,
+                self._y_log_pad_gpu, self._y_err_log_pad_gpu, self._mask_gpu,
+                layers, scale, bkg,
+            )
+        else:
+            chi2 = _fused_unsmeared_linear_jit(
+                self._q_pad_gpu,
+                self._y_pad_gpu, self._y_err_pad_gpu, self._mask_gpu,
+                layers, scale, bkg,
+            )
+
+        chi2_np = np.array(chi2)  # (n_total, popsize)
+        chi2_np[~self.valid_mask, :] = 1e30
+        return chi2_np
