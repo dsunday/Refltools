@@ -993,7 +993,7 @@ def extract_sld_from_h5(
             if not sp.endswith('.csv'):
                 sp += '.csv'
             os.makedirs(os.path.dirname(sp) or '.', exist_ok=True)
-            header = f'{mat_label} SLD data\nEnergy_eV,Real_SLD,Imag_SLD'
+            header = 'Energy_eV,Real_SLD,Imag_SLD'
             np.savetxt(sp, arr, delimiter=',', header=header, comments='')
             print(f'Saved {mat_label} SLD ({len(arr)} energies) → {sp}')
 
@@ -2891,3 +2891,92 @@ def get_h5_info(filepath, sample_name=None):
                         })
                     info[skey][energy_val][mkey] = runs
     return info
+
+
+def print_parameters(filepath, sample_name, energy, model_name=None, run_index=-1, tol_eV=0.5):
+    """
+    Print fitted parameters stored in an HDF5 results file.
+
+    Parameters
+    ----------
+    filepath    : str   – path to the .h5 file
+    sample_name : str   – top-level sample group
+    energy      : float – energy in eV to look up (matched to nearest key within tol_eV)
+    model_name  : str or None – if None, print all models at that energy
+    run_index   : int   – which run to display; -1 means the last run (default)
+    tol_eV      : float – how close the energy key must be (default 0.5 eV)
+    """
+    with h5py.File(filepath, 'r') as f:
+        if sample_name not in f:
+            raise KeyError(f"Sample '{sample_name}' not found in {filepath}")
+        sgrp = f[sample_name]
+
+        energy_keys = [k for k in sgrp.keys() if _is_energy_key(k)]
+        if not energy_keys:
+            raise KeyError(f"No energy groups found under '{sample_name}'")
+        closest = min(energy_keys, key=lambda k: abs(float(k) - energy))
+        if abs(float(closest) - energy) > tol_eV:
+            raise KeyError(
+                f"No energy within {tol_eV} eV of {energy}. "
+                f"Available: {sorted(float(k) for k in energy_keys)}"
+            )
+        egrp = sgrp[closest]
+        print(f"\n{'='*60}")
+        print(f"  Sample : {sample_name}   Energy : {float(closest):.1f} eV")
+        print(f"{'='*60}")
+
+        model_keys = [model_name] if model_name else list(egrp.keys())
+        for mkey in model_keys:
+            if mkey not in egrp:
+                print(f"  Model '{mkey}' not found at this energy.")
+                continue
+            mgrp = egrp[mkey]
+            run_keys = sorted(
+                [k for k in mgrp.keys() if k.startswith('run_')],
+                key=lambda k: int(k.split('_')[1])
+            )
+            if not run_keys:
+                print(f"  Model '{mkey}': no runs found.")
+                continue
+            rkey = run_keys[run_index]
+            rgrp = mgrp[rkey]
+
+            chi_i = rgrp.attrs.get('chi_sq_initial', np.nan)
+            chi_f = rgrp.attrs.get('chi_sq_final',   np.nan)
+            has_mcmc = bool(rgrp.attrs.get('has_mcmc', False))
+            print(f"\n  Model : {mkey}   Run : {rkey}")
+            print(f"  chi² initial={chi_i:.4g}   final={chi_f:.4g}"
+                  + ("   [MCMC]" if has_mcmc else ""))
+            print()
+
+            pg = rgrp['parameters']
+            names  = _decode_strings(pg['names'][:])
+            values = pg['final_values'][:]
+            lb     = pg['final_lb'][:]
+            ub     = pg['final_ub'][:]
+            vary   = pg['final_vary'][:]
+            stderr = pg['stderr'][:]
+            ci_lo  = pg['ci_lower'][:] if 'ci_lower' in pg else np.full(len(names), np.nan)
+            ci_hi  = pg['ci_upper'][:] if 'ci_upper' in pg else np.full(len(names), np.nan)
+
+            col_w = max(len(n) for n in names) + 2
+            header = f"  {'Parameter':<{col_w}}  {'Value':>14}  {'Stderr':>10}  {'Bounds':>22}  Vary"
+            if has_mcmc:
+                header += "   95% CI"
+            print(header)
+            print("  " + "-" * (len(header) - 2))
+
+            for name, val, se, lo, hi, v, clo, chi in zip(
+                    names, values, stderr, lb, ub, vary, ci_lo, ci_hi):
+                lo_str = f"{lo:.4g}" if np.isfinite(lo) else "-inf"
+                hi_str = f"{hi:.4g}" if np.isfinite(hi) else "+inf"
+                se_str = f"{se:.4g}" if np.isfinite(se) else "n/a"
+                line = (f"  {name:<{col_w}}  {val:>14.6g}  {se_str:>10}  "
+                        f"[{lo_str}, {hi_str}]  {'yes' if v else 'no ':>3}")
+                if has_mcmc:
+                    if np.isfinite(clo) and np.isfinite(chi):
+                        line += f"   [{clo:.4g}, {chi:.4g}]"
+                    else:
+                        line += "   n/a"
+                print(line)
+        print()

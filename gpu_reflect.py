@@ -725,6 +725,12 @@ class ModelsBatchBuilder:
         self.n_free = len(self.free_params)
         self.bounds = get_bounds_array(self.free_params)
 
+        # Per-energy bounds: (n_energies, n_free, 2)
+        # Used for correct clipping when bounds differ across energies (e.g. energy-dependent SLDs)
+        self.per_energy_bounds = np.stack(
+            [get_bounds_array(extract_free_params(obj)) for obj in self.objectives]
+        )  # (n_energies, n_free, 2)
+
         # Slab shape
         slabs_0, _, _ = get_slabs_scale_bkg(self.objectives[0])
         self.n_slab_rows = slabs_0.shape[0]

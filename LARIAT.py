@@ -1247,10 +1247,43 @@ class LariatDataProcessor:
         # Copy attributes from original data
         data_normalized.attrs.update(self.data.attrs)
         data_normalized.attrs['normalized_by_izero'] = 'True'
-        
+
         # Update the data in the class
         self.data = data_normalized
-    
+
+    def normalize_by_reference_frame(self, reference_energy, in_place=True):
+        """
+        Normalize the xarray data cube by dividing all energy frames by a reference frame.
+
+        Parameters:
+        -----------
+        reference_energy : float
+            Energy (eV) of the reference frame. The nearest available energy is used.
+        in_place : bool, optional
+            If True (default), modifies self.data in place. If False, returns the
+            normalized DataArray without modifying self.data.
+
+        Returns:
+        --------
+        None or xarray.DataArray
+            None if in_place=True; normalized DataArray if in_place=False.
+        """
+        if self.data is None:
+            raise ValueError("No data loaded. Please load data first using load_data().")
+
+        ref_frame = self.data.sel(energy=reference_energy, method='nearest')
+        actual_ref_energy = float(ref_frame.energy.values)
+        print(f"Normalising by frame at {actual_ref_energy:.2f} eV (requested {reference_energy} eV)")
+
+        normalized = self.data / (ref_frame + 1e-10)
+        normalized.attrs.update(self.data.attrs)
+        normalized.attrs['normalized_by_reference_frame'] = str(actual_ref_energy)
+
+        if in_place:
+            self.data = normalized
+            return None
+        return normalized
+
     def extract_and_process_spectrum(self, roi, pre_edge_norm_range=None, pre_edge_sub_range=None, 
                                     post_edge_range=None, do_pre_edge_norm=True, do_pre_edge_sub=True,
                                     do_post_edge_norm=True, plot=False, energy_slice=None, 
@@ -6688,8 +6721,347 @@ class LariatDataProcessor:
                 title = f'{base_title}\n{len(roi_list)} ROIs detected from {n_clusters} clusters'
             
             ax.set_title(title)
-            
+
             plt.tight_layout()
             plt.show()
-        
+
         return roi_list, roi_labels, cluster_info
+
+
+def plot_roi_comparison(selections, labels=None, plot_raw=True, plot_processed=True,
+                        title=None, figsize=None, xlim=None, ylim=None):
+    """
+    Plot intensity vs energy for a custom selection of ROIs drawn from one or more
+    results dictionaries returned by extract_and_process_multiple_spectra.
+
+    Parameters
+    ----------
+    selections : list of (dict, str)
+        Each element is a (results_dict, roi_key) pair.  roi_key must be a key
+        that exists in the corresponding results_dict.
+        Example:
+            plot_roi_comparison([
+                (dict1, "ROI 1"),
+                (dict2, "ROI 2"),
+                (dict2, "ROI 3"),
+            ])
+    labels : list of str, optional
+        Display labels for each selection, in the same order as *selections*.
+        Defaults to the roi_key strings from each pair.
+    plot_raw : bool, optional
+        Include a panel showing the raw (pre-processing) spectra. Default True.
+    plot_processed : bool, optional
+        Include a panel showing the fully processed spectra. Default True.
+    title : str, optional
+        Overall figure title.
+    figsize : tuple, optional
+        Figure size passed to plt.subplots. Auto-sized when omitted.
+    xlim : tuple, optional
+        (xmin, xmax) applied to all panels.
+    ylim : tuple, optional
+        (ymin, ymax) applied to all panels.
+
+    Returns
+    -------
+    fig, axes : matplotlib Figure and array of Axes
+    """
+    if not plot_raw and not plot_processed:
+        raise ValueError("At least one of plot_raw or plot_processed must be True.")
+
+    n_panels = int(plot_raw) + int(plot_processed)
+    if figsize is None:
+        figsize = (8 * n_panels, 6)
+
+    fig, axes = plt.subplots(1, n_panels, figsize=figsize)
+    if n_panels == 1:
+        axes = [axes]
+
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(selections), 1)))
+
+    if labels is None:
+        labels = [roi_key for _, roi_key in selections]
+
+    ax_raw = axes[0] if plot_raw else None
+    ax_proc = axes[-1] if plot_processed else None
+    if plot_raw and plot_processed and n_panels == 1:
+        ax_proc = axes[0]
+
+    for i, ((results_dict, roi_key), label) in enumerate(zip(selections, labels)):
+        if roi_key not in results_dict:
+            raise KeyError(f"ROI key '{roi_key}' not found in results_dict. "
+                           f"Available keys: {list(results_dict.keys())}")
+        _, spectrum_np, spectrum_final, _ = results_dict[roi_key]
+        c = colors[i]
+
+        if ax_raw is not None:
+            ax_raw.plot(spectrum_np[:, 0], spectrum_np[:, 1], 'o-', color=c, label=label)
+        if ax_proc is not None:
+            ax_proc.plot(spectrum_final[:, 0], spectrum_final[:, 1], 'o-', color=c, label=label)
+
+    panel_titles = []
+    if plot_raw:
+        panel_titles.append(("Raw Spectra", ax_raw))
+    if plot_processed:
+        panel_titles.append(("Processed Spectra", ax_proc))
+
+    for panel_title, ax in panel_titles:
+        ax.set_xlabel("Energy")
+        ax.set_ylabel("Intensity")
+        ax.set_title(panel_title)
+        ax.legend()
+        ax.grid(True)
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+
+    if title:
+        fig.suptitle(title, fontsize=13, fontweight='bold')
+
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
+
+
+def generate_roi_grid(x_range, y_range, roi_size, clip_to_image=None):
+    """
+    Generate a list of square ROIs and matching labels tiling a rectangular region.
+
+    ROIs are placed on a regular grid with step = roi_size (no overlap, no gap).
+    Grid positions are taken from np.arange(start, stop, roi_size), so *stop* is
+    exclusive — the last tile starts at the largest multiple of roi_size that is
+    strictly less than stop.
+
+    Parameters
+    ----------
+    x_range : tuple of int
+        (x_start, x_stop) — range of x_min positions.
+        Single column: x_range=(400, 500) with roi_size=100 gives x=400 only.
+    y_range : tuple of int
+        (y_start, y_stop) — range of y_min positions.
+    roi_size : int
+        Side length of each square ROI (used for both width/height and step size).
+    clip_to_image : int, optional
+        If provided, any ROI whose right or bottom edge would exceed this value
+        is dropped.  Useful when the last tile would run off the detector edge.
+
+    Returns
+    -------
+    roi_list : list of (x_min, y_min, width, height)
+    roi_labels : list of str  — e.g. "x400_y300"
+
+    Example
+    -------
+    # Reproduce your 8-ROI vertical strip:
+    roi_list, roi_labels = generate_roi_grid(
+        x_range=(400, 500), y_range=(300, 1100), roi_size=100
+    )
+    """
+    x_positions = np.arange(x_range[0], x_range[1], roi_size)
+    y_positions = np.arange(y_range[0], y_range[1], roi_size)
+
+    roi_list = []
+    roi_labels = []
+
+    for x in x_positions:
+        for y in y_positions:
+            if clip_to_image is not None:
+                if x + roi_size > clip_to_image or y + roi_size > clip_to_image:
+                    continue
+            roi_list.append((int(x), int(y), roi_size, roi_size))
+            roi_labels.append(f"x{int(x)}_y{int(y)}")
+
+    return roi_list, roi_labels
+
+
+def analyze_roi_intensity_ratio(
+    results_dicts,
+    energy_1=288.0,
+    energy_2=288.4,
+    roi_key=None,
+    use_processed=True,
+    cmap='viridis',
+    title=None,
+    figsize=None,
+    xlim=None,
+    ylim=None,
+    vmin=None,
+    vmax=None,
+    heatmap_titles=None,
+    calibration_roi=None,
+    calibration_roi_color='white',
+):
+    """
+    Compute a per-ROI intensity ratio and display a spectrum + spatial heatmaps.
+
+    Parameters
+    ----------
+    results_dicts : dict or list of dict
+        One results dict or a list of 1–4 dicts, each being the output of
+        extract_and_process_multiple_spectra.  Keys must be in the
+        "x{int}_y{int}" format produced by generate_roi_grid.
+        A plain dict is accepted for backwards compatibility.
+    energy_1, energy_2 : float
+        Energies (eV) used for the ratio I(energy_1) / I(energy_2).
+        Nearest data point is used for each.
+    roi_key : str, optional
+        Label of the ROI whose spectrum is plotted (taken from the first dict).
+        Defaults to the middle entry of that dict.
+    use_processed : bool
+        If True (default), use spectrum_final; otherwise use spectrum_np.
+    cmap : str
+        Colormap for the heatmaps.
+    title : str, optional
+        Overall figure suptitle.
+    figsize : tuple, optional
+        Figure size.  Defaults to (4 + 4*n_maps, 5).
+    xlim, ylim : tuple, optional
+        (min, max) limits for the spectrum panel axes.
+    vmin, vmax : float, optional
+        Shared colorbar limits for all heatmaps.  Auto-scaled to the combined
+        [2, 98] percentile across all maps when omitted.
+    heatmap_titles : list of str, optional
+        Per-panel titles for the heatmap axes.  Falls back to
+        'Relative Intensity Map N' for any missing entries.
+    calibration_roi : tuple, optional
+        (x, y, width, height) in pixel coordinates.  When provided, a rectangle
+        is drawn on every heatmap panel as a visual calibration reference.
+        Does not affect any calculations.
+    calibration_roi_color : str
+        Edge colour of the calibration rectangle.  Default 'white'.
+
+    Returns
+    -------
+    fig, axes : matplotlib Figure and tuple of Axes
+        axes[0] is the spectrum panel; axes[1:] are the heatmap panels.
+    """
+    import re
+
+    # Accept a plain dict for backwards compatibility.
+    if isinstance(results_dicts, dict):
+        results_dicts = [results_dicts]
+
+    if not results_dicts:
+        raise ValueError("results_dicts is empty.")
+
+    n_maps = len(results_dicts)
+    if n_maps > 4:
+        raise ValueError("At most 4 results dicts are supported.")
+
+    # --- Helper: compute ratio grid for one results dict ---
+    def _nearest_intensity(spectrum, energy):
+        idx = np.argmin(np.abs(spectrum[:, 0] - energy))
+        return spectrum[idx, 1]
+
+    def _build_ratio_grid(rdict):
+        ratios = {}
+        for label, (_, sp_np, sp_final, _) in rdict.items():
+            sp = sp_final if use_processed else sp_np
+            i1 = _nearest_intensity(sp, energy_1)
+            i2 = _nearest_intensity(sp, energy_2)
+            ratios[label] = i1 / i2 if i2 != 0 else np.nan
+
+        positions = {}
+        for label in rdict:
+            m = re.match(r'x(\d+)_y(\d+)', label)
+            if m is None:
+                raise ValueError(
+                    f"Label '{label}' does not match the required 'x{{int}}_y{{int}}' format. "
+                    "Use generate_roi_grid to produce compatible labels."
+                )
+            positions[label] = (int(m.group(1)), int(m.group(2)))
+
+        ux = sorted(set(p[0] for p in positions.values()))
+        uy = sorted(set(p[1] for p in positions.values()))
+        xi = {x: i for i, x in enumerate(ux)}
+        yi = {y: i for i, y in enumerate(uy)}
+
+        grid = np.full((len(uy), len(ux)), np.nan)
+        for label, (x, y) in positions.items():
+            grid[yi[y], xi[x]] = ratios[label]
+        return grid, ux, uy
+
+    # --- Step 1: build all ratio grids ---
+    grids = [_build_ratio_grid(rd) for rd in results_dicts]
+
+    # --- Step 2: shared color scale ---
+    if vmin is not None and vmax is not None:
+        _vmin, _vmax = vmin, vmax
+    else:
+        all_valid = np.concatenate([g[np.isfinite(g)] for g, _, _ in grids])
+        _vmin = vmin if vmin is not None else (np.nanpercentile(all_valid, 2)  if all_valid.size else 0)
+        _vmax = vmax if vmax is not None else (np.nanpercentile(all_valid, 98) if all_valid.size else 1)
+
+    # --- Step 3: select ROI for spectrum panel (from first dict) ---
+    first_dict = results_dicts[0]
+    keys = list(first_dict.keys())
+    if roi_key is None:
+        roi_key = keys[len(keys) // 2]
+    elif roi_key not in first_dict:
+        raise KeyError(f"roi_key '{roi_key}' not found. Available keys: {keys}")
+
+    _, spectrum_np_sel, spectrum_final_sel, _ = first_dict[roi_key]
+    spectrum = spectrum_final_sel if use_processed else spectrum_np_sel
+
+    # --- Step 4: build figure ---
+    if figsize is None:
+        figsize = (4 + 4 * n_maps, 5)
+
+    fig, axes = plt.subplots(
+        1, 1 + n_maps, figsize=figsize,
+        gridspec_kw={'width_ratios': [1.5] + [1] * n_maps},
+    )
+    ax_spec = axes[0]
+    heat_axes = axes[1:]
+
+    # Spectrum panel
+    ax_spec.plot(spectrum[:, 0], spectrum[:, 1], 'o-', color='steelblue', markersize=3)
+    ax_spec.axvline(energy_1, color='tomato',    linestyle='--', label=f'{energy_1} eV')
+    ax_spec.axvline(energy_2, color='darkorange', linestyle='--', label=f'{energy_2} eV')
+    ax_spec.set_xlabel('Energy (eV)')
+    ax_spec.set_ylabel('Processed Intensity' if use_processed else 'Intensity')
+    ax_spec.set_title(f'Spectrum — {roi_key}')
+    ax_spec.legend()
+    ax_spec.grid(True)
+    if xlim is not None:
+        ax_spec.set_xlim(xlim)
+    if ylim is not None:
+        ax_spec.set_ylim(ylim)
+
+    # Heatmap panels
+    for i, (ax_heat, (ratio_grid, unique_x, unique_y)) in enumerate(zip(heat_axes, grids)):
+        dx = (unique_x[1] - unique_x[0]) if len(unique_x) > 1 else 1
+        dy = (unique_y[1] - unique_y[0]) if len(unique_y) > 1 else 1
+        extent = [
+            unique_x[0] - dx / 2, unique_x[-1] + dx / 2,
+            unique_y[0] - dy / 2, unique_y[-1] + dy / 2,
+        ]
+
+        im = ax_heat.imshow(
+            ratio_grid, origin='lower', cmap=cmap,
+            vmin=_vmin, vmax=_vmax, extent=extent, aspect='equal',
+        )
+        plt.colorbar(im, ax=ax_heat, label=f'I({energy_1} eV) / I({energy_2} eV)')
+        ax_heat.set_xlabel('X position (px)')
+        ax_heat.set_ylabel('Y position (px)')
+
+        if calibration_roi is not None:
+            cx, cy, cw, ch = calibration_roi
+            ax_heat.add_patch(
+                plt.Rectangle((cx, cy), cw, ch,
+                               linewidth=1.5, edgecolor=calibration_roi_color,
+                               facecolor='none')
+            )
+
+        if heatmap_titles and i < len(heatmap_titles):
+            panel_title = heatmap_titles[i]
+        else:
+            panel_title = f'Relative Intensity Map {i + 1}' if n_maps > 1 else 'Relative Intensity Map'
+        ax_heat.set_title(panel_title)
+
+    if title:
+        fig.suptitle(title, fontsize=13, fontweight='bold')
+
+    plt.tight_layout()
+    plt.show()
+    return fig, tuple(axes)

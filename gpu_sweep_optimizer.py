@@ -735,10 +735,11 @@ def gpu_fit_models_cmaes(
     builder = ModelsBatchBuilder(objectives_dict, energy_list)
     n_energies = builder.n_energies
     n_free = builder.n_free
-    bounds = builder.bounds
-    lb = jnp.array(bounds[:, 0])
-    ub = jnp.array(bounds[:, 1])
-    mean_init = (lb + ub) / 2.0
+    # per_lb/per_ub: (n_energies, n_free) — each energy's own bounds
+    per_lb = jnp.array(builder.per_energy_bounds[:, :, 0])  # (n_energies, n_free)
+    per_ub = jnp.array(builder.per_energy_bounds[:, :, 1])  # (n_energies, n_free)
+    # mean_init per energy, centred within that energy's bounds
+    mean_init_shared = jnp.array((builder.bounds[:, 0] + builder.bounds[:, 1]) / 2.0)
 
     solution_proto = np.zeros(n_free, dtype=np.float64)
     strategy = Sep_CMA_ES(population_size=popsize, solution=solution_proto)
@@ -752,7 +753,7 @@ def gpu_fit_models_cmaes(
     master_key, init_key = jax.random.split(master_key)
     init_keys = jax.random.split(init_key, n_energies)
 
-    states = v_init(init_keys, mean_init, params)
+    states = v_init(init_keys, mean_init_shared, params)
 
     prev_mean_best = np.inf
     no_improve_count = 0
@@ -765,7 +766,8 @@ def gpu_fit_models_cmaes(
         keys = jax.random.split(gen_key, n_energies)
 
         populations, states = v_ask(keys, states, params)
-        populations = jnp.clip(populations, lb, ub)
+        # populations: (n_energies, popsize, n_free); per_lb/per_ub: (n_energies, n_free)
+        populations = jnp.clip(populations, per_lb[:, None, :], per_ub[:, None, :])
         fitness = builder.fitness(np.array(populations))
         states, _ = v_tell(
             keys, populations,
@@ -807,6 +809,12 @@ def gpu_fit_models_cmaes(
     elapsed = time.perf_counter() - t_start
 
     best_solutions = np.array(states.best_solution)
+    # Clip each energy's solution to its own bounds (per_energy_bounds: n_energies x n_free x 2)
+    best_solutions = np.clip(
+        best_solutions,
+        builder.per_energy_bounds[:, :, 0],
+        builder.per_energy_bounds[:, :, 1],
+    )
     best_chisqr_arr = np.array(states.best_fitness)
 
     fitted_objectives = {}
