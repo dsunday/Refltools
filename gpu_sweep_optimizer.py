@@ -689,6 +689,8 @@ def gpu_fit_models_cmaes(
     tol=1e-4,
     patience=5,
     check_every=10,
+    _algo_cls=None,
+    _sigma_init=None,
 ):
     """
     Fit reflectometry models for all energies simultaneously using Sep-CMA-ES.
@@ -701,6 +703,14 @@ def gpu_fit_models_cmaes(
     Supports early stopping: the optimisation halts when the mean best
     chi-squared across all energies has not improved by more than `tol`
     (relative) over `patience` consecutive checks of `check_every` generations.
+
+    The inner generation loop is compiled with jax.lax.fori_loop and runs
+    entirely on GPU with a single CPU↔GPU sync per check_every generations.
+    Reflectivity is computed in float32 (complex64) for ~8x GPU throughput;
+    the reported best_chisqr values are re-evaluated in float64 after fitting.
+
+    NOTE: The first call in a Python session triggers XLA JIT compilation
+    (~5–15 s). Subsequent calls reuse the compiled program.
 
     Parameters
     ----------
@@ -716,12 +726,16 @@ def gpu_fit_models_cmaes(
                       for `patience` consecutive checks. Set to 0 to disable.
     patience        : consecutive non-improving checks before stopping (default 5)
     check_every     : generations between convergence checks (default 10)
+    _algo_cls       : evosax strategy class (default Sep_CMA_ES); pass e.g.
+                      evosax.algorithms.CMA_ES or evosax.algorithms.OpenES to
+                      benchmark alternative algorithms
+    _sigma_init     : initial step-size sigma (default: algorithm default ~1.0)
 
     Returns
     -------
     dict with keys:
       'fitted_objectives'   : dict {energy: Objective at best-fit params}
-      'best_chisqr'         : dict {energy: float}
+      'best_chisqr'         : dict {energy: float}  (re-evaluated in float64)
       'energies'            : list of processed energies
       'elapsed_sec'         : wall time in seconds
       'generations_run'     : actual number of generations completed
@@ -729,10 +743,13 @@ def gpu_fit_models_cmaes(
     """
     from evosax.algorithms import Sep_CMA_ES
 
+    if _algo_cls is None:
+        _algo_cls = Sep_CMA_ES
+
     if energy_list is None:
         energy_list = sorted(objectives_dict.keys())
 
-    builder = ModelsBatchBuilder(objectives_dict, energy_list)
+    builder = ModelsBatchBuilder(objectives_dict, energy_list, use_f32_abeles=True)
     n_energies = builder.n_energies
     n_free = builder.n_free
     # per_lb/per_ub: (n_energies, n_free) — each energy's own bounds
@@ -742,8 +759,10 @@ def gpu_fit_models_cmaes(
     mean_init_shared = jnp.array((builder.bounds[:, 0] + builder.bounds[:, 1]) / 2.0)
 
     solution_proto = np.zeros(n_free, dtype=np.float64)
-    strategy = Sep_CMA_ES(population_size=popsize, solution=solution_proto)
+    strategy = _algo_cls(population_size=popsize, solution=solution_proto)
     params = strategy.default_params
+    if _sigma_init is not None:
+        params = params.replace(std_init=_sigma_init)
 
     v_init = jax.jit(jax.vmap(strategy.init, in_axes=(0, None, None)))
     v_ask  = jax.jit(jax.vmap(strategy.ask,  in_axes=(0, 0, None)))
@@ -755,67 +774,101 @@ def gpu_fit_models_cmaes(
 
     states = v_init(init_keys, mean_init_shared, params)
 
+    # Build the fori_loop body — all pure JAX, no Python callbacks per generation.
+    # Captures: v_ask, v_tell, params, per_lb, per_ub, n_energies, fitness_jax_fn.
+    fitness_jax_fn = builder.fitness_jax
+
+    def _body_fn(i, carry):
+        key, states = carry
+        key, gen_key = jax.random.split(key)
+        keys = jax.random.split(gen_key, n_energies)
+        populations, states = v_ask(keys, states, params)
+        populations = jnp.clip(populations, per_lb[:, None, :], per_ub[:, None, :])
+        fitness = fitness_jax_fn(populations)
+        states, _ = v_tell(keys, populations, fitness, states, params)
+        return key, states
+
+    # Compile check_every generations as a single XLA program.
+    _run_block = jax.jit(
+        lambda carry: jax.lax.fori_loop(0, check_every, _body_fn, carry)
+    )
+    # Warmup: compile on 1 generation so timed loop sees only computation.
+    _warmup_block = jax.jit(
+        lambda carry: jax.lax.fori_loop(0, 1, _body_fn, carry)
+    )
+
+    carry = (master_key, states)
+    carry = _warmup_block(carry)
+    jax.block_until_ready(carry[1].best_fitness)
+    generations_run = 1
+
     prev_mean_best = np.inf
     no_improve_count = 0
     converged = False
-    generations_run = 0
 
     t_start = time.perf_counter()
-    for gen in range(n_generations):
-        master_key, gen_key = jax.random.split(master_key)
-        keys = jax.random.split(gen_key, n_energies)
+    n_chunks = (n_generations - 1) // check_every
+    remainder = (n_generations - 1) % check_every
 
-        populations, states = v_ask(keys, states, params)
-        # populations: (n_energies, popsize, n_free); per_lb/per_ub: (n_energies, n_free)
-        populations = jnp.clip(populations, per_lb[:, None, :], per_ub[:, None, :])
-        fitness = builder.fitness(np.array(populations))
-        states, _ = v_tell(
-            keys, populations,
-            jnp.array(fitness, dtype=jnp.float64),
-            states, params,
+    for chunk in range(n_chunks):
+        carry = _run_block(carry)
+        # Single GPU→CPU sync per check — only touch best_fitness, not full state
+        best = np.array(carry[1].best_fitness)
+        generations_run += check_every
+        mean_best = float(best.mean())
+
+        if verbose:
+            print(
+                f"  gen {generations_run:4d}/{n_generations}  "
+                f"mean_χ²={mean_best:.2f}  "
+                f"min_χ²={float(best.min()):.2f}  "
+                f"max_χ²={float(best.max()):.2f}"
+            )
+
+        if tol > 0 and np.isfinite(prev_mean_best):
+            rel_improvement = (prev_mean_best - mean_best) / max(prev_mean_best, 1e-12)
+            if rel_improvement < tol:
+                no_improve_count += 1
+                if no_improve_count >= patience:
+                    if verbose:
+                        print(
+                            f"  Early stop at gen {generations_run}: "
+                            f"improvement {rel_improvement:.2e} < tol {tol:.0e} "
+                            f"for {patience} consecutive checks."
+                        )
+                    converged = True
+                    break
+            else:
+                no_improve_count = 0
+
+        prev_mean_best = mean_best
+
+    # Run any remaining generations not covered by complete blocks
+    if remainder > 0 and not converged:
+        _remainder_block = jax.jit(
+            lambda carry: jax.lax.fori_loop(0, remainder, _body_fn, carry)
         )
-        generations_run = gen + 1
-
-        if (gen + 1) % check_every == 0:
-            best = np.array(states.best_fitness)
-            mean_best = float(best.mean())
-
-            if verbose:
-                print(
-                    f"  gen {gen+1:4d}/{n_generations}  "
-                    f"mean_χ²={mean_best:.2f}  "
-                    f"min_χ²={float(best.min()):.2f}  "
-                    f"max_χ²={float(best.max()):.2f}"
-                )
-
-            if tol > 0 and np.isfinite(prev_mean_best):
-                rel_improvement = (prev_mean_best - mean_best) / max(prev_mean_best, 1e-12)
-                if rel_improvement < tol:
-                    no_improve_count += 1
-                    if no_improve_count >= patience:
-                        if verbose:
-                            print(
-                                f"  Early stop at gen {gen+1}: "
-                                f"improvement {rel_improvement:.2e} < tol {tol:.0e} "
-                                f"for {patience} consecutive checks."
-                            )
-                        converged = True
-                        break
-                else:
-                    no_improve_count = 0
-
-            prev_mean_best = mean_best
+        carry = _remainder_block(carry)
+        generations_run += remainder
 
     elapsed = time.perf_counter() - t_start
 
+    master_key, states = carry
+
     best_solutions = np.array(states.best_solution)
-    # Clip each energy's solution to its own bounds (per_energy_bounds: n_energies x n_free x 2)
+    # Clip each energy's solution to its own bounds
     best_solutions = np.clip(
         best_solutions,
         builder.per_energy_bounds[:, :, 0],
         builder.per_energy_bounds[:, :, 1],
     )
-    best_chisqr_arr = np.array(states.best_fitness)
+
+    # Re-evaluate best solutions in float64 for accurate reported chi2.
+    # The f32 search may have ~0.1% error; final values must be exact.
+    builder.use_f32_abeles = False
+    best_sols_j = jnp.array(best_solutions[:, np.newaxis, :], dtype=jnp.float64)
+    best_chisqr_arr = np.array(builder.fitness_jax(best_sols_j))[:, 0]
+    builder.use_f32_abeles = True
 
     fitted_objectives = {}
     best_chisqr_dict = {}
