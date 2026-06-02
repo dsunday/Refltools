@@ -240,6 +240,7 @@ def plot_intensity_vs_energy(data_dicts, labels, q_targets,
         xlim              : (emin, emax) or None
         ylim              : (imin, imax) or None
         ncols             : number of columns in the panel grid (default 1)
+        save_path         : file path to save the figure (e.g. 'fig.png'); None = no save
 
     Returns:
         (fig, axes)  – axes is a 2-D array of shape (n_rows, ncols)
@@ -322,6 +323,8 @@ def plot_intensity_vs_energy(data_dicts, labels, q_targets,
         axes[row, col].set_visible(False)
 
     fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches='tight', dpi=150)
     return fig, axes
 
 
