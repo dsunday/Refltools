@@ -99,7 +99,7 @@ def plot_data_comparison(data_dicts, labels, energies,
                          tolerance=0.6, log_y=True,
                          figsize_per_panel=(6, 4), colors=None,
                          show_errorbars=False, xlim=None, ylim=None,
-                         scales=None, ncols=1):
+                         scales=None, ncols=1, save_path=None):
     """
     Overlay reflectivity data from multiple samples at a set of energies.
 
@@ -124,6 +124,7 @@ def plot_data_comparison(data_dicts, labels, energies,
                                - list of float   → one factor per sample (same at all energies)
                                - list of lists   → scales[sample_idx][energy_idx]
         ncols              : number of columns in the panel grid (default 1)
+        save_path          : file path to save the figure (e.g. 'fig.png'); None = no save
 
     Returns:
         (fig, axes)  – axes is a 2-D array of shape (n_rows, ncols)
@@ -208,13 +209,16 @@ def plot_data_comparison(data_dicts, labels, energies,
         axes[row, col].set_visible(False)
 
     fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches='tight', dpi=150)
     return fig, axes
 
 
 def plot_intensity_vs_energy(data_dicts, labels, q_targets,
                               colors=None, figsize_per_panel=(7, 4),
                               log_y=True, scales=None,
-                              xlim=None, ylim=None, ncols=1):
+                              xlim=None, ylim=None, ncols=1,
+                              save_path=None):
     """
     Plot intensity (R) vs energy at fixed Q values for multiple samples.
 
