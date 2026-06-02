@@ -95,6 +95,232 @@ def import_batch_reflectivity(folder_path, file_type='smoothed'):
     return data_dict, energy_list
 
 
+def plot_data_comparison(data_dicts, labels, energies,
+                         tolerance=0.6, log_y=True,
+                         figsize_per_panel=(6, 4), colors=None,
+                         show_errorbars=False, xlim=None, ylim=None,
+                         scales=None, ncols=1):
+    """
+    Overlay reflectivity data from multiple samples at a set of energies.
+
+    All samples are drawn on the same axes for each energy.  Panels are
+    arranged in a grid of ncols columns (energies fill left-to-right,
+    top-to-bottom).
+
+    Args:
+        data_dicts         : list of data_dict objects from import_batch_reflectivity
+        labels             : list of sample names matching data_dicts
+        energies           : list of target energies (eV) to plot
+        tolerance          : max eV distance for matching keys in each dict (default 0.6)
+        log_y              : log scale on R axis (default True)
+        figsize_per_panel  : (width, height) for each individual panel (default (6, 4))
+        colors             : list of colours, one per sample (default matplotlib cycle)
+        show_errorbars     : draw R error bars (default False)
+        xlim               : (qmin, qmax) or None
+        ylim               : (rmin, rmax) or None
+        scales             : multiplicative scale factors for R, one of:
+                               - None            → no scaling (default)
+                               - float           → same factor for all samples/energies
+                               - list of float   → one factor per sample (same at all energies)
+                               - list of lists   → scales[sample_idx][energy_idx]
+        ncols              : number of columns in the panel grid (default 1)
+
+    Returns:
+        (fig, axes)  – axes is a 2-D array of shape (n_rows, ncols)
+    """
+    import math
+    import matplotlib.pyplot as plt
+
+    if len(data_dicts) != len(labels):
+        raise ValueError("data_dicts and labels must have the same length.")
+
+    n_samples = len(data_dicts)
+    n_energies = len(energies)
+    n_rows = math.ceil(n_energies / ncols)
+
+    # Normalise scales into a 2-D list [sample_idx][energy_idx]
+    if scales is None:
+        _scales = [[1.0] * n_energies for _ in range(n_samples)]
+    elif isinstance(scales, (int, float)):
+        _scales = [[float(scales)] * n_energies for _ in range(n_samples)]
+    elif isinstance(scales[0], (int, float)):
+        _scales = [[float(s)] * n_energies for s in scales]
+    else:
+        _scales = [[float(s) for s in row] for row in scales]
+
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    if colors is None:
+        colors = [prop_cycle[i % len(prop_cycle)] for i in range(n_samples)]
+
+    fig, axes = plt.subplots(
+        n_rows, ncols,
+        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * n_rows),
+        squeeze=False,
+    )
+
+    for idx, target_e in enumerate(energies):
+        row, col = divmod(idx, ncols)
+        ax = axes[row, col]
+        found_any = False
+
+        for si, (dd, label, color) in enumerate(zip(data_dicts, labels, colors)):
+            keys = list(dd.keys())
+            if not keys:
+                continue
+            closest = min(keys, key=lambda e: abs(e - target_e))
+            if abs(closest - target_e) > tolerance:
+                continue
+
+            ds = dd[closest]
+            q = ds.x
+            scale = _scales[si][idx]
+            r = ds.y * scale
+            dr = ds.y_err * scale if ds.y_err is not None else None
+
+            scale_str = f' ×{scale}' if scale != 1.0 else ''
+            leg_label = f"{label} ({closest:.2f} eV){scale_str}"
+
+            if show_errorbars and dr is not None and np.any(dr > 0):
+                ax.errorbar(q, r, yerr=dr, fmt='-', color=color,
+                            label=leg_label, linewidth=1.2,
+                            elinewidth=0.6, capsize=2)
+            else:
+                ax.plot(q, r, '-', color=color, label=leg_label, linewidth=1.2)
+            found_any = True
+
+        if log_y:
+            ax.set_yscale('log')
+        ax.set_xlabel(r'Q ($\AA^{-1}$)')
+        ax.set_ylabel('Reflectivity')
+        ax.set_title(f'{target_e} eV')
+        ax.legend(fontsize=8)
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+        if not found_any:
+            ax.text(0.5, 0.5, f'No data within {tolerance} eV of {target_e} eV',
+                    transform=ax.transAxes, ha='center', va='center', color='grey')
+
+    # Hide any unused panels in the last row
+    for idx in range(n_energies, n_rows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row, col].set_visible(False)
+
+    fig.tight_layout()
+    return fig, axes
+
+
+def plot_intensity_vs_energy(data_dicts, labels, q_targets,
+                              colors=None, figsize_per_panel=(7, 4),
+                              log_y=True, scales=None,
+                              xlim=None, ylim=None, ncols=1):
+    """
+    Plot intensity (R) vs energy at fixed Q values for multiple samples.
+
+    For each target Q the closest available Q point is used from each
+    dataset at each energy.  All samples are overlaid per panel.  Panels
+    are arranged in a grid of ncols columns (Q values fill left-to-right,
+    top-to-bottom).
+
+    Args:
+        data_dicts        : list of data_dicts from import_batch_reflectivity
+        labels            : list of sample names matching data_dicts
+        q_targets         : list of Q values (Å⁻¹) to extract
+        colors            : list of colours, one per sample (default cycle)
+        figsize_per_panel : (width, height) for each individual panel (default (7, 4))
+        log_y             : log scale on intensity axis (default True)
+        scales            : multiplicative scale factors for R — same format
+                            as plot_data_comparison (None, float, list of
+                            float, or list of lists [sample][q_index])
+        xlim              : (emin, emax) or None
+        ylim              : (imin, imax) or None
+        ncols             : number of columns in the panel grid (default 1)
+
+    Returns:
+        (fig, axes)  – axes is a 2-D array of shape (n_rows, ncols)
+    """
+    import math
+    import matplotlib.pyplot as plt
+
+    if len(data_dicts) != len(labels):
+        raise ValueError("data_dicts and labels must have the same length.")
+
+    n_samples = len(data_dicts)
+    n_q = len(q_targets)
+    n_rows = math.ceil(n_q / ncols)
+
+    # Normalise scales into 2-D list [sample_idx][q_idx]
+    if scales is None:
+        _scales = [[1.0] * n_q for _ in range(n_samples)]
+    elif isinstance(scales, (int, float)):
+        _scales = [[float(scales)] * n_q for _ in range(n_samples)]
+    elif isinstance(scales[0], (int, float)):
+        _scales = [[float(s)] * n_q for s in scales]
+    else:
+        _scales = [[float(s) for s in row] for row in scales]
+
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    if colors is None:
+        colors = [prop_cycle[i % len(prop_cycle)] for i in range(n_samples)]
+
+    fig, axes = plt.subplots(
+        n_rows, ncols,
+        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * n_rows),
+        squeeze=False,
+    )
+
+    for qi, q_target in enumerate(q_targets):
+        row, col = divmod(qi, ncols)
+        ax = axes[row, col]
+
+        for si, (dd, label, color) in enumerate(zip(data_dicts, labels, colors)):
+            energies_sorted = sorted(dd.keys())
+            if not energies_sorted:
+                continue
+
+            scale = _scales[si][qi]
+            plot_energies, plot_intensities, actual_qs = [], [], []
+
+            for energy in energies_sorted:
+                ds = dd[energy]
+                q_arr = ds.x
+                if q_arr is None or len(q_arr) == 0:
+                    continue
+                idx = int(np.argmin(np.abs(q_arr - q_target)))
+                plot_energies.append(energy)
+                plot_intensities.append(ds.y[idx] * scale)
+                actual_qs.append(q_arr[idx])
+
+            if not plot_energies:
+                continue
+
+            q_mean = np.mean(actual_qs)
+            scale_str = f' ×{scale}' if scale != 1.0 else ''
+            leg_label = f"{label} (Q≈{q_mean:.4f} Å⁻¹){scale_str}"
+            ax.plot(plot_energies, plot_intensities, '-o', color=color,
+                    label=leg_label, linewidth=1.2, markersize=3)
+
+        if log_y:
+            ax.set_yscale('log')
+        ax.set_xlabel('Energy (eV)')
+        ax.set_ylabel('Intensity (R)')
+        ax.set_title(f'Q = {q_target} Å⁻¹')
+        ax.legend(fontsize=8)
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+
+    # Hide unused panels
+    for qi in range(n_q, n_rows * ncols):
+        row, col = divmod(qi, ncols)
+        axes[row, col].set_visible(False)
+
+    fig.tight_layout()
+    return fig, axes
+
+
 # ---------------------------------------------------------------------------
 # Model building helpers
 # ---------------------------------------------------------------------------
@@ -1222,6 +1448,7 @@ def batch_fit_selected_models_cmaes(
     verbose=True,
     tol=1e-4,
     patience=5,
+    check_every=10,
     sample_name=None,
     model_name=None,
     h5_filepath=None,
@@ -1248,6 +1475,9 @@ def batch_fit_selected_models_cmaes(
     tol             : relative improvement threshold for early stopping
                       (default 1e-4 = 0.01%); set to 0 to disable
     patience        : consecutive non-improving checks before stopping (default 5)
+    check_every     : generations between convergence checks and GPU→CPU syncs
+                      (default 10); each block of check_every generations is
+                      compiled as a single XLA program on GPU
     sample_name     : HDF5 sample label (required with h5_filepath)
     model_name      : HDF5 model label (default 'Model1')
     h5_filepath     : save fitted objectives here after completion
@@ -1274,7 +1504,8 @@ def batch_fit_selected_models_cmaes(
     print("=" * 60)
     print("BATCH FITTING (GPU — Sep-CMA-ES)")
     print(f"  Energies: {len(to_fit)}  |  popsize: {popsize}  |  "
-          f"max generations: {n_generations}  |  tol: {tol:.0e}")
+          f"max generations: {n_generations}  |  tol: {tol:.0e}  |  "
+          f"check_every: {check_every}")
     print("=" * 60)
 
     chi_init = {e: objectives_dict[e].chisqr() for e in to_fit}
@@ -1288,6 +1519,7 @@ def batch_fit_selected_models_cmaes(
         verbose=verbose,
         tol=tol,
         patience=patience,
+        check_every=check_every,
     )
 
     fitted_objectives = gpu_result["fitted_objectives"]

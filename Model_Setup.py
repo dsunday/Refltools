@@ -1057,18 +1057,26 @@ def get_sld_profile(structure):
     Returns:
         (z_real, sld_real, z_imag, sld_imag)
     """
+    from refnx.reflect.structure import sld_profile as _refnx_sld_profile
+
+    def _imag_profile(slabs, z):
+        # refnx sld_profile only uses col 1 (real SLD); compute imag by
+        # swapping col 2 into col 1 and reusing the same smoothing logic
+        slabs_imag = slabs.copy()
+        slabs_imag[:, 1] = slabs[:, 2]
+        _, sld_i = _refnx_sld_profile(slabs_imag, z=z)
+        return sld_i
+
     try:
-        z, sld = structure.sld_profile()
-        if hasattr(sld, 'real') and hasattr(sld, 'imag'):
-            return z, sld.real, z, sld.imag
-        return z, sld, z, np.zeros_like(z)
+        slabs = structure.slabs()
+        z, sld_real = structure.sld_profile()
+        return z, sld_real, z, _imag_profile(slabs, z)
     except Exception:
         try:
+            slabs = structure.slabs()
             z = np.linspace(-10, 300, 1000)
-            sld = structure.sld_profile(z)
-            if hasattr(sld, 'real'):
-                return z, sld.real, z, sld.imag
-            return z, sld, z, np.zeros_like(z)
+            _, sld_real = _refnx_sld_profile(slabs, z=z)
+            return z, sld_real, z, _imag_profile(slabs, z)
         except Exception:
             z = np.linspace(0, 300, 1000)
             return z, np.zeros_like(z), z, np.zeros_like(z)

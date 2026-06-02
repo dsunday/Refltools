@@ -778,7 +778,12 @@ class RSoXRTrimWidget:
         # Initialize scaling override storage
         # Dictionary keyed by (group_idx, file_idx) tuple to store manual scaling overrides
         self.scaling_overrides = {}
-        
+
+        # Track which scans are dropped (excluded) from stitching/processing
+        self.dropped_scans = {}
+        for i in range(len(self.scan_groups)):
+            self.dropped_scans[i] = set()
+
         # Store loaded scan data for the current group
         self.current_group_data = None
         
@@ -981,7 +986,17 @@ class RSoXRTrimWidget:
             tooltip='Reset trims and background for the current file',
             icon='undo'
         )
-        
+
+        # Drop/restore scan button
+        self.drop_scan_button = widgets.Button(
+            description='Drop Scan',
+            disabled=False,
+            button_style='danger',
+            tooltip='Exclude this scan from stitching and processing',
+            icon='ban',
+            layout=widgets.Layout(width='15%')
+        )
+
         # Reset all button for current group
         self.reset_group_button = widgets.Button(
             description='Reset Group',
@@ -1174,7 +1189,8 @@ class RSoXRTrimWidget:
         ])
         
         self.button_container = widgets.HBox([
-            self.reset_file_button, 
+            self.reset_file_button,
+            self.drop_scan_button,
             self.reset_group_button,
             self.preview_stitching_button,
             self.process_button,
@@ -1211,6 +1227,7 @@ class RSoXRTrimWidget:
         # Update button states based on current group
         self._update_group_navigation_buttons()
         self.reset_file_button.on_click(self._on_reset_file)
+        self.drop_scan_button.on_click(self._on_drop_scan)
         self.reset_group_button.on_click(self._on_reset_group)
         self.process_button.on_click(self._on_process_group)
         self.save_button.on_click(self._on_save_settings)
@@ -1231,6 +1248,65 @@ class RSoXRTrimWidget:
             # Update navigation button states after initial group selection
             self._update_group_navigation_buttons()
     
+    def _update_file_options(self, group_idx):
+        """Build file dropdown options, prefixing dropped scans with [DROPPED]."""
+        group = self.scan_groups[group_idx]
+        dropped = self.dropped_scans.get(group_idx, set())
+        file_options = []
+        for i, (filename, scan_num) in enumerate(zip(group['files'], group['scan_numbers'])):
+            prefix = "[DROPPED] " if i in dropped else ""
+            file_options.append(f"{i+1}: {prefix}Scan {scan_num} - {os.path.basename(filename)}")
+        return file_options
+
+    def _update_drop_button(self, group_idx, file_idx):
+        """Sync drop button label and style to current scan's dropped state."""
+        if file_idx in self.dropped_scans.get(group_idx, set()):
+            self.drop_scan_button.description = 'Restore Scan'
+            self.drop_scan_button.button_style = 'success'
+        else:
+            self.drop_scan_button.description = 'Drop Scan'
+            self.drop_scan_button.button_style = 'danger'
+
+    def _on_drop_scan(self, b):
+        """Toggle drop/restore for the currently selected scan."""
+        group_str = self.group_select.value
+        group_idx = int(group_str.split(':')[0].split()[1]) - 1
+
+        file_str = self.file_select.value
+        file_idx = int(file_str.split(':')[0]) - 1
+
+        scan_number = self.scan_groups[group_idx]['scan_numbers'][file_idx]
+
+        if file_idx in self.dropped_scans[group_idx]:
+            self.dropped_scans[group_idx].discard(file_idx)
+            action = "restored to"
+        else:
+            self.dropped_scans[group_idx].add(file_idx)
+            action = "dropped from"
+
+        # Rebuild dropdown options with updated [DROPPED] markers
+        file_options = self._update_file_options(group_idx)
+        self.file_select.unobserve(self._on_file_change, names='value')
+        self.file_select.options = file_options
+        self.file_select.value = file_options[file_idx]
+        self.file_select.observe(self._on_file_change, names='value')
+
+        # Sync button and trim info
+        self._update_drop_button(group_idx, file_idx)
+        is_dropped = file_idx in self.dropped_scans[group_idx]
+        if is_dropped:
+            self.trim_info.value = f"<span style='color:red'><b>Scan #{scan_number} — DROPPED</b></span>"
+        else:
+            current_trim = self.current_trims[group_idx][file_idx]
+            original_trim = self.original_trims[group_idx][file_idx]
+            if current_trim != original_trim:
+                self.trim_info.value = f"<span style='color:orange'>Modified: Original trim was {original_trim}</span>"
+            else:
+                self.trim_info.value = f"<span style='color:green'>Scan #{scan_number}</span>"
+
+        print(f"Scan #{scan_number} {action} group {group_idx + 1}.")
+        self._on_preview_stitching(None)
+
     def _apply_background_subtraction(self, data, background_value):
         """Apply background subtraction to data"""
         if background_value == 0.0:
@@ -1450,10 +1526,8 @@ class RSoXRTrimWidget:
         # Check if energy is within open beam range and warn if not
         is_within_range, min_energy, max_energy, distance = self._check_open_beam_energy_range(energy)
         
-        # Update file dropdown with scan numbers
-        file_options = []
-        for i, (filename, scan_num) in enumerate(zip(group['files'], group['scan_numbers'])):
-            file_options.append(f"{i+1}: Scan {scan_num} - {os.path.basename(filename)}")
+        # Update file dropdown with scan numbers (marks dropped scans)
+        file_options = self._update_file_options(group_idx)
         
         self.file_select.options = file_options
         self.file_select.value = file_options[0] if file_options else ""
@@ -1533,10 +1607,17 @@ class RSoXRTrimWidget:
             self.scaling_override_value.value = 1.0
         
         # Update trim info display with scan number
-        if current_trim != original_trim:
+        is_dropped = file_idx in self.dropped_scans.get(group_idx, set())
+        if is_dropped:
+            self.trim_info.value = f"<span style='color:red'><b>Scan #{scan_number} — DROPPED</b></span>"
+        elif current_trim != original_trim:
             self.trim_info.value = f"<span style='color:orange'>Modified: Original trim was {original_trim}</span>"
         else:
             self.trim_info.value = f"<span style='color:green'>Scan #{scan_number}</span>"
+
+        # Update drop button label/style
+        if hasattr(self, 'drop_scan_button'):
+            self._update_drop_button(group_idx, file_idx)
         
         # Update background info display
         if current_background != 0.0:
@@ -1770,14 +1851,25 @@ class RSoXRTrimWidget:
         override_key = (group_idx, file_idx)
         if override_key in self.scaling_overrides:
             del self.scaling_overrides[override_key]
-        
+
+        # Restore scan if it was dropped
+        self.dropped_scans[group_idx].discard(file_idx)
+
+        # Rebuild file dropdown to remove any [DROPPED] marker
+        file_options = self._update_file_options(group_idx)
+        self.file_select.unobserve(self._on_file_change, names='value')
+        self.file_select.options = file_options
+        self.file_select.value = file_options[file_idx]
+        self.file_select.observe(self._on_file_change, names='value')
+
         # Update the UI
-        self._on_file_change({'new': self.file_select.value})
-        
+        self._on_file_change({'new': file_options[file_idx]})
+
         with self.output_area:
             print(f"Reset trim values for scan #{scan_number} to original: {self.original_trims[group_idx][file_idx]}")
             print(f"Reset background to 0.0")
             print(f"Cleared scaling override for scan #{scan_number}")
+            print(f"Restored scan #{scan_number} (no longer dropped)")
     
     def _on_reset_group(self, b):
         """UPDATED: Reset all trims, backgrounds, and scaling overrides for the current group with correct indexing"""
@@ -1793,7 +1885,17 @@ class RSoXRTrimWidget:
         keys_to_remove = [key for key in self.scaling_overrides.keys() if key[0] == group_idx]
         for key in keys_to_remove:
             del self.scaling_overrides[key]
-        
+
+        # Clear dropped scans for this group
+        self.dropped_scans[group_idx] = set()
+
+        # Rebuild file dropdown to remove any [DROPPED] markers
+        file_options = self._update_file_options(group_idx)
+        self.file_select.unobserve(self._on_file_change, names='value')
+        self.file_select.options = file_options
+        self.file_select.value = file_options[0] if file_options else ""
+        self.file_select.observe(self._on_file_change, names='value')
+
         # Update the UI
         self._on_file_change({'new': self.file_select.value})
         
@@ -1854,10 +1956,14 @@ class RSoXRTrimWidget:
             scan_labels = []  # Store scan numbers for labels
             
             for i, data in enumerate(self.current_group_data):
+                if i in self.dropped_scans.get(group_idx, set()):
+                    print(f"Skipping dropped scan {i+1} (Scan #{group['scan_numbers'][i]})")
+                    continue
+
                 if data is None:
                     print(f"Warning: Data for scan {i+1} is not available")
                     continue
-                    
+
                 # Get scan number for labeling
                 scan_number = group['scan_numbers'][i]
                     
@@ -2222,7 +2328,18 @@ class RSoXRTrimWidget:
             if g_idx == group_idx and f_idx < len(scaling_overrides_list):
                 scaling_overrides_list[f_idx] = scale_value
         group['scaling_overrides'] = scaling_overrides_list
-        
+
+        # Remove dropped scans from the group before processing
+        dropped = self.dropped_scans.get(group_idx, set())
+        if dropped:
+            keep = [i for i in range(len(group['files'])) if i not in dropped]
+            group['files'] = [group['files'][i] for i in keep]
+            group['trims'] = [group['trims'][i] for i in keep]
+            group['backgrounds'] = [group['backgrounds'][i] for i in keep]
+            group['scan_numbers'] = [group['scan_numbers'][i] for i in keep]
+            group['scaling_overrides'] = [group['scaling_overrides'][i] for i in keep]
+            print(f"Excluding {len(dropped)} dropped scan(s) from processing.")
+
         # Create output directory if it doesn't exist
         output_dir = self.output_dir.value
         os.makedirs(output_dir, exist_ok=True)
@@ -2738,6 +2855,7 @@ class RSoXRTrimWidget:
                         'Background Value': background_value,
                         'Trim Modified': original_trim != current_trim,
                         'Background Applied': background_value != 0.0,
+                        'Dropped': file_idx in self.dropped_scans.get(group_idx, set()),
                         'Groups Source': self.groups_source
                     })
             
@@ -2764,11 +2882,13 @@ class RSoXRTrimWidget:
                 print(f"Total scans: {total_scans}")
                 
                 print("\nSummary of modifications:")
-                modified_df = df[(df['Trim Modified']) | (df['Background Applied'])]
+                modified_df = df[(df['Trim Modified']) | (df['Background Applied']) | (df['Dropped'])]
                 if len(modified_df) > 0:
                     print("Scans with modifications:")
                     for _, row in modified_df.iterrows():
                         changes = []
+                        if row['Dropped']:
+                            changes.append("DROPPED")
                         if row['Trim Modified']:
                             changes.append(f"Trim: [{row['Current Trim Start']}, {row['Current Trim End']}]")
                         if row['Background Applied']:
@@ -2776,6 +2896,9 @@ class RSoXRTrimWidget:
                         print(f"  Group {int(row['Group'])}, Scan #{int(row['Scan Number'])}: {', '.join(changes)}")
                 else:
                     print("No modifications were made from original values.")
+                dropped_total = sum(len(d) for d in self.dropped_scans.values())
+                if dropped_total > 0:
+                    print(f"\nNote: {dropped_total} scan(s) are marked as dropped and will be excluded from processing.")
                     
         except Exception as e:
             with self.output_area:
