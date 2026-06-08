@@ -1460,6 +1460,7 @@ def batch_fit_selected_models_cmaes(
     model_name=None,
     h5_filepath=None,
     run_index=None,
+    normalize=False,
 ):
     """
     Fit reflectometry models for all energies simultaneously using Sep-CMA-ES.
@@ -1527,6 +1528,7 @@ def batch_fit_selected_models_cmaes(
         tol=tol,
         patience=patience,
         check_every=check_every,
+        normalize=normalize,
     )
 
     fitted_objectives = gpu_result["fitted_objectives"]

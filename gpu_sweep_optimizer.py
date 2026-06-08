@@ -96,6 +96,7 @@ def gpu_parameter_sweep(
     n_generations=200,
     seed=0,
     verbose=False,
+    normalize=False,
 ):
     """
     Run all sweep-point DE optimizations simultaneously on GPU.
@@ -128,7 +129,8 @@ def gpu_parameter_sweep(
     n_sweep = len(sweep_values)
 
     # Build batch evaluator (deep-copies objectives, fixes swept param)
-    builder = SweepBatchBuilder(objective, param_name, sweep_values)
+    builder = SweepBatchBuilder(objective, param_name, sweep_values,
+                                normalize_by_n_q=normalize)
     n_free = builder.n_free
     bounds = builder.bounds  # (n_free, 2)
 
@@ -231,6 +233,7 @@ def gpu_parameter_sweep_cmaes(
     tol=1e-4,
     patience=5,
     check_every=10,
+    normalize=False,
 ):
     """
     Run all sweep-point optimizations simultaneously using Sep-CMA-ES.
@@ -263,7 +266,8 @@ def gpu_parameter_sweep_cmaes(
     sweep_values = np.asarray(sweep_values, dtype=np.float64)
     n_sweep = len(sweep_values)
 
-    builder = SweepBatchBuilder(objective, param_name, sweep_values)
+    builder = SweepBatchBuilder(objective, param_name, sweep_values,
+                                normalize_by_n_q=normalize)
     n_free = builder.n_free
     bounds = builder.bounds
 
@@ -691,6 +695,7 @@ def gpu_fit_models_cmaes(
     check_every=10,
     _algo_cls=None,
     _sigma_init=None,
+    normalize=False,
 ):
     """
     Fit reflectometry models for all energies simultaneously using Sep-CMA-ES.
@@ -749,14 +754,21 @@ def gpu_fit_models_cmaes(
     if energy_list is None:
         energy_list = sorted(objectives_dict.keys())
 
-    builder = ModelsBatchBuilder(objectives_dict, energy_list, use_f32_abeles=True)
+    builder = ModelsBatchBuilder(objectives_dict, energy_list, use_f32_abeles=True,
+                                 normalize_by_n_q=normalize)
     n_energies = builder.n_energies
     n_free = builder.n_free
     # per_lb/per_ub: (n_energies, n_free) — each energy's own bounds
     per_lb = jnp.array(builder.per_energy_bounds[:, :, 0])  # (n_energies, n_free)
     per_ub = jnp.array(builder.per_energy_bounds[:, :, 1])  # (n_energies, n_free)
-    # mean_init per energy, centred within that energy's bounds
-    mean_init_shared = jnp.array((builder.bounds[:, 0] + builder.bounds[:, 1]) / 2.0)
+    # mean_init: start from the current parameter values (clipped to bounds).
+    # Starting from the current objective values rather than bounds center means
+    # CMA-ES explores around the user's starting point, which is typically a
+    # physically meaningful initial guess and often much closer to the true optimum.
+    current_vals = np.array([p.value for p in builder.free_params], dtype=np.float64)
+    lb_shared = builder.bounds[:, 0]
+    ub_shared = builder.bounds[:, 1]
+    mean_init_shared = jnp.array(np.clip(current_vals, lb_shared, ub_shared))
 
     solution_proto = np.zeros(n_free, dtype=np.float64)
     strategy = _algo_cls(population_size=popsize, solution=solution_proto)

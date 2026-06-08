@@ -95,7 +95,11 @@ def apply_params_jax(base_slabs, base_scale, base_bkg, theta, param_map):
     for k, mappings in enumerate(param_map):
         for entry in mappings:
             if entry[0] == 'slab':
-                layers = layers.at[entry[1], entry[2]].set(theta[k])
+                # slab_value = intercept + slope * param_value
+                # This correctly handles density→SLD and other indirect mappings.
+                slope     = entry[3]
+                intercept = entry[4]
+                layers = layers.at[entry[1], entry[2]].set(intercept + slope * theta[k])
             elif entry[0] == 'scale':
                 scale = theta[k]
             elif entry[0] == 'bkg':
@@ -115,6 +119,7 @@ def make_log_prob_fn(
     use_log=False,
     q_quad_j=None,
     combo_weights_j=None,
+    normalize_by_n_q=False,
 ):
     """
     Build a pure-JAX log-probability function for BlackJAX samplers.
@@ -152,7 +157,7 @@ def make_log_prob_fn(
         else:
             model = _jabeles_pos(q_j, layers, scale, bkg)
 
-        # 4. Log-likelihood
+        # 4. Log-likelihood (optionally normalised by n_q to reduce gradient magnitude)
         if use_log:
             log_model = jnp.log10(jnp.maximum(model, 1e-100))
             log_data  = jnp.log10(jnp.maximum(y_j,  1e-100))
@@ -160,6 +165,8 @@ def make_log_prob_fn(
             ll = -0.5 * jnp.sum(((log_data - log_model) / y_err_log) ** 2)
         else:
             ll = -0.5 * jnp.sum(((y_j - model) / y_err_j) ** 2)
+        if normalize_by_n_q:
+            ll = ll / y_j.shape[0]
 
         # 5. Log-Jacobian correction for logit transform:
         #    dθ/dy = σ(y)·(1−σ(y))·(ub−lb)
@@ -378,7 +385,7 @@ class BlackjaxSampler:
     seed : int
     """
 
-    def __init__(self, objective, sampler='nuts', n_chains=4, seed=0):
+    def __init__(self, objective, sampler='nuts', n_chains=4, seed=0, normalize=False):
         if sampler not in ('nuts', 'mclmc'):
             raise ValueError(f"sampler must be 'nuts' or 'mclmc', got {sampler!r}")
 
@@ -490,6 +497,7 @@ class BlackjaxSampler:
             use_log=use_log,
             q_quad_j=self._q_quad,
             combo_weights_j=self._combo,
+            normalize_by_n_q=normalize,
         )
 
         # Set by warmup()
@@ -673,15 +681,36 @@ class BlackjaxSampler:
 
             extra_keys = ('energy_change',)
 
-        # ── Chunked scan loop ─────────────────────────────────────────────
-        n_chunks      = n_samples // chunk_size
-        remainder     = n_samples % chunk_size
-        n_chunks_run  = n_chunks + (1 if remainder else 0)
-        n_total       = n_chunks_run * chunk_size
+        # ── Sampling loop ──────────────────────────────────────────────────
+        # NUTS uses lax.while_loop internally for tree-building.  Nesting
+        # lax.scan(vmap(while_loop)) forces XLA to unroll the dynamic loop
+        # across all scan iterations, producing a computation graph that can
+        # take hours to compile even for short runs.  For NUTS we therefore
+        # use a plain Python loop (effective chunk_size=1) so each JIT-compiled
+        # step is a single NUTS proposal.  MCLMC has a fixed computation graph
+        # so lax.scan compiles quickly and gives better GPU utilisation.
+        _use_scan = (self.sampler_name != 'nuts')
+        _chunk    = chunk_size if _use_scan else 1
 
-        @jax.jit
-        def run_chunk(states, keys):
-            return jax.lax.scan(one_step_all_chains, states, keys)
+        n_chunks     = n_samples // _chunk
+        remainder    = n_samples % _chunk
+        n_chunks_run = n_chunks + (1 if remainder else 0)
+        n_total      = n_chunks_run * _chunk
+
+        if _use_scan:
+            @jax.jit
+            def run_chunk(states, keys):
+                return jax.lax.scan(one_step_all_chains, states, keys)
+        else:
+            # Single-step JIT — avoids scan(while_loop) compilation catastrophe
+            one_step_jit = jax.jit(one_step_all_chains)
+
+            def run_chunk(states, keys):
+                # keys has shape (1, 2) — unwrap the single key
+                single_key = keys[0]
+                new_states, out = one_step_jit(states, single_key)
+                # Wrap outputs to match the (chunk_size, ...) shape expected below
+                return new_states, tuple(o[None] for o in out)
 
         all_positions = []
         all_extras    = {k: [] for k in extra_keys}
@@ -691,7 +720,7 @@ class BlackjaxSampler:
         try:
             for _ in range(n_chunks_run):
                 sample_key, subkey = jax.random.split(sample_key)
-                chunk_keys = jax.random.split(subkey, chunk_size)
+                chunk_keys = jax.random.split(subkey, _chunk)
                 states, chunk_out = run_chunk(states, chunk_keys)
                 positions_chunk = chunk_out[0]
                 positions_chunk.block_until_ready()
@@ -699,7 +728,7 @@ class BlackjaxSampler:
                 for idx, k in enumerate(extra_keys):
                     all_extras[k].append(np.array(chunk_out[idx + 1]))
                 if pbar is not None:
-                    pbar.update(chunk_size)
+                    pbar.update(_chunk)
         finally:
             if pbar is not None:
                 pbar.close()
@@ -744,6 +773,7 @@ def gpu_mcmc(
     seed       = 0,
     progress   = True,
     chunk_size = 100,
+    normalize  = False,
 ):
     """
     GPU-accelerated Bayesian MCMC for a refnx Objective.
@@ -788,10 +818,242 @@ def gpu_mcmc(
     >>> results.trace_plot()
     >>> results.to_refnx_objective(objective)
     """
-    s = BlackjaxSampler(objective, sampler=sampler, n_chains=n_chains, seed=seed)
+    s = BlackjaxSampler(objective, sampler=sampler, n_chains=n_chains, seed=seed,
+                        normalize=normalize)
     return s.sample(
         n_samples=n_samples,
         n_warmup=n_warmup,
         progress=progress,
         chunk_size=chunk_size,
     )
+
+
+# ---------------------------------------------------------------------------
+# Convergence-targeted sampler
+# ---------------------------------------------------------------------------
+
+def gpu_mcmc_converge(
+    objective,
+    sampler          = 'nuts',
+    n_chains         = 4,
+    n_warmup         = 500,
+    samples_per_chunk= 200,
+    min_samples      = 500,
+    max_samples      = 5000,
+    rhat_threshold   = 1.05,
+    ess_min          = 200,
+    seed             = 0,
+    progress         = True,
+    chunk_size       = 100,
+    normalize        = False,
+):
+    """
+    Run MCMC until R-hat convergence rather than a fixed sample count.
+
+    Warmup runs once; then samples are drawn in chunks of ``samples_per_chunk``.
+    After each chunk, R-hat and ESS are evaluated for every free parameter.
+    Sampling stops when:
+
+        max(R-hat) < rhat_threshold  AND  min(ESS) >= ess_min
+        AND  total samples >= min_samples
+
+    or when ``max_samples`` is reached.
+
+    Parameters
+    ----------
+    objective         : refnx Objective at best-fit parameters (e.g., after CMA-ES)
+    sampler           : 'nuts' | 'mclmc'
+    n_chains          : parallel chains (default 4)
+    n_warmup          : warmup / adaptation steps (default 500)
+    samples_per_chunk : samples collected between convergence checks (default 200)
+    min_samples       : minimum samples before checking convergence (default 500)
+    max_samples       : hard upper limit on total samples (default 5000)
+    rhat_threshold    : convergence criterion for R-hat (default 1.05)
+    ess_min           : minimum per-parameter ESS to accept (default 200)
+    seed              : PRNG seed
+    progress          : show tqdm progress bar
+    chunk_size        : internal lax.scan chunk size for MCLMC (ignored for NUTS)
+
+    Returns
+    -------
+    MCMCSamples — same object as gpu_mcmc(), with an extra attribute
+        .converged : bool — True if R-hat threshold was met before max_samples
+    """
+    import time
+
+    s = BlackjaxSampler(objective, sampler=sampler, n_chains=n_chains, seed=seed,
+                        normalize=normalize)
+
+    # ── Warmup (once) ──────────────────────────────────────────────────────
+    if progress:
+        print(f"[{sampler.upper()}] Warmup ({n_warmup} steps)...")
+    t0 = time.perf_counter()
+    s.warmup(n_steps=n_warmup, verbose=progress)
+    if progress:
+        print(f"  warmup done in {time.perf_counter()-t0:.1f}s")
+
+    # ── Build the one-step function (mirrors BlackjaxSampler.sample logic) ──
+    sample_key = jax.random.PRNGKey(seed + 1)
+    sample_key, init_key = jax.random.split(sample_key)
+    y0 = s._adapted_state.position
+    init_positions = _make_init_positions(y0, n_chains, init_key)
+
+    if sampler == 'nuts':
+        params = s._adapted_params
+        kernel = blackjax.nuts(s.log_prob_fn, **params).step
+        init_states = jax.vmap(
+            lambda p: blackjax.nuts.init(p, s.log_prob_fn)
+        )(init_positions)
+
+        @jax.jit
+        def _one_step(states, rng_key):
+            ck = jax.random.split(rng_key, n_chains)
+            new_states, infos = jax.vmap(kernel)(ck, states)
+            return new_states, (
+                new_states.position,
+                infos.acceptance_rate,
+                infos.is_divergent,
+                infos.num_integration_steps,
+            )
+        extra_keys = ('acceptance_rate', 'is_divergent', 'num_integration_steps')
+
+    else:  # mclmc
+        from blackjax.mcmc import integrators as _int
+        params    = s._adapted_params
+        L         = params.L
+        step_size = params.step_size
+        imm       = params.inverse_mass_matrix
+
+        final_kernel = blackjax.mclmc.build_kernel(
+            s.log_prob_fn, imm, _int.isokinetic_mclachlan)
+        mclmc_init_keys = jax.random.split(init_key, n_chains)
+        init_states = jax.vmap(
+            lambda p, k: blackjax.mclmc.init(p, s.log_prob_fn, k)
+        )(init_positions, mclmc_init_keys)
+
+        @jax.jit
+        def _one_step(states, rng_key):
+            ck = jax.random.split(rng_key, n_chains)
+            new_states, infos = jax.vmap(
+                lambda k, st: final_kernel(k, st, L, step_size)
+            )(ck, states)
+            return new_states, (new_states.position, infos.energy_change)
+        extra_keys = ('energy_change',)
+
+    # For MCLMC use lax.scan over chunks; for NUTS use single-step loop (avoids
+    # scan(while_loop) XLA compilation catastrophe).
+    _use_scan = (sampler != 'nuts')
+    _chunk    = chunk_size if _use_scan else 1
+
+    if _use_scan:
+        @jax.jit
+        def _run_chunk(states, keys):
+            return jax.lax.scan(_one_step, states, keys)
+    else:
+        _one_step_jit = jax.jit(_one_step)
+
+        def _run_chunk(states, keys):
+            new_states, out = _one_step_jit(states, keys[0])
+            return new_states, tuple(o[None] for o in out)
+
+    # ── Convergence loop ───────────────────────────────────────────────────
+    all_positions = []
+    all_extras    = {k: [] for k in extra_keys}
+    states        = init_states
+    total_samples = 0
+    converged     = False
+
+    pbar = _make_pbar(max_samples, progress,
+                      desc=f'{sampler.upper()} sampling (until convergence)')
+    try:
+        while total_samples < max_samples:
+            # Draw one chunk of samples_per_chunk
+            chunk_positions = []
+            chunk_extras    = {k: [] for k in extra_keys}
+
+            steps_this_chunk = 0
+            while steps_this_chunk < samples_per_chunk:
+                sample_key, subkey = jax.random.split(sample_key)
+                batch_keys = jax.random.split(subkey, _chunk)
+                states, out = _run_chunk(states, batch_keys)
+                out[0].block_until_ready()
+                chunk_positions.append(np.array(out[0]))   # (_chunk, n_chains, n_free)
+                for idx, k in enumerate(extra_keys):
+                    chunk_extras[k].append(np.array(out[idx + 1]))
+                steps_this_chunk += _chunk
+                if pbar is not None:
+                    pbar.update(_chunk)
+
+            all_positions.append(
+                np.concatenate(chunk_positions, axis=0)[:samples_per_chunk])
+            for k in extra_keys:
+                all_extras[k].append(
+                    np.concatenate(chunk_extras[k], axis=0)[:samples_per_chunk])
+
+            total_samples += samples_per_chunk
+
+            if total_samples < min_samples:
+                continue
+
+            # ── Check R-hat and ESS ──────────────────────────────────────
+            # positions: list of (samples_per_chunk, n_chains, n_free) → stack
+            pos_all = np.concatenate(all_positions, axis=0)  # (total, n_chains, n_free)
+            # rearrange to (n_chains, total, n_free)
+            pos_chains = pos_all.transpose(1, 0, 2)
+            bounded_chains = (
+                np.array(s._lb).reshape(1, 1, -1)
+                + jax.nn.sigmoid(jnp.array(pos_chains))
+                * (np.array(s._ub) - np.array(s._lb)).reshape(1, 1, -1)
+            )
+
+            rhats = []
+            esss  = []
+            for i in range(s.n_free):
+                chain_i = jnp.array(bounded_chains[:, :, i])  # (n_chains, total)
+                rhats.append(float(blackjax.rhat(chain_i, chain_axis=0, sample_axis=1)))
+                esss.append(float(blackjax.ess(chain_i,  chain_axis=0, sample_axis=1)))
+
+            rhat_max = max(rhats)
+            ess_min_val = min(esss)
+
+            if progress:
+                print(f"  {total_samples} samples — "
+                      f"R-hat max={rhat_max:.4f}  ESS min={ess_min_val:.0f}")
+
+            if rhat_max < rhat_threshold and ess_min_val >= ess_min:
+                converged = True
+                break
+
+    finally:
+        if pbar is not None:
+            pbar.close()
+
+    if progress:
+        status = "CONVERGED" if converged else f"MAX SAMPLES ({max_samples}) REACHED"
+        print(f"[{sampler.upper()}] {status} — {total_samples} samples")
+
+    # ── Assemble final MCMCSamples ─────────────────────────────────────────
+    pos_all    = np.concatenate(all_positions, axis=0)[:total_samples]
+    positions  = pos_all.transpose(1, 0, 2)       # (n_chains, total_samples, n_free)
+
+    extras = {}
+    for k in extra_keys:
+        arr = np.concatenate(all_extras[k], axis=0)[:total_samples]
+        extras[k] = arr.transpose(1, 0) if arr.ndim == 2 else arr
+
+    bounded = np.array(
+        s._lb.reshape(1, 1, -1)
+        + jax.nn.sigmoid(jnp.array(positions))
+        * (s._ub - s._lb).reshape(1, 1, -1)
+    )
+
+    result = MCMCSamples(
+        samples_unconstrained=positions,
+        samples_bounded=bounded,
+        param_names=s.param_names,
+        sampler_name=sampler,
+        extras=extras,
+    )
+    result.converged = converged
+    result.total_samples = total_samples
+    return result

@@ -517,8 +517,17 @@ def _build_param_map(obj, free_params):
     Returns
     -------
     param_map : list of lists
-        param_map[k] = list of ('slab', row, col) | ('scale',) | ('bkg',)
-        tuples describing all positions affected by free_params[k].
+        param_map[k] = list of entries describing all positions affected by free_params[k].
+
+        Slab entry format: ('slab', row, col, slope, intercept)
+            slab_value = intercept + slope * param_value
+        Scale/bkg entries: ('scale',) | ('bkg',)
+            (scale and bkg parameters map 1:1 — no slope/intercept needed)
+
+        The slope/intercept form correctly handles parameters whose value is NOT
+        the slab column value (e.g. material density → SLD conversion). For
+        thickness and roughness, slope=1 and intercept=0, so the formula reduces
+        to slab_value = param_value as before.
     """
     base_slabs, base_scale, base_bkg = get_slabs_scale_bkg(obj)
     param_map = []
@@ -532,7 +541,12 @@ def _build_param_map(obj, free_params):
         mappings = []
         diff = slabs2 - base_slabs
         for row, col in zip(*np.where(np.abs(diff) > 1e-10 * eps)):
-            mappings.append(('slab', int(row), int(col)))
+            # Linear model: slab_value = intercept + slope * param_value
+            # slope = d(slab_col) / d(param)  (computed via finite difference)
+            # intercept = slab_col_at_orig - slope * orig
+            slope = float((slabs2[row, col] - base_slabs[row, col]) / eps)
+            intercept = float(base_slabs[row, col] - slope * orig)
+            mappings.append(('slab', int(row), int(col), slope, intercept))
         if abs(scale2 - base_scale) > 1e-10 * eps:
             mappings.append(('scale',))
         if abs(bkg2 - base_bkg) > 1e-10 * eps:
@@ -600,14 +614,19 @@ class SweepBatchBuilder:
     fitness = builder.fitness(pop_matrix)  # (n_sweep, popsize)
     """
 
-    def __init__(self, objective, swept_param_name, sweep_values):
+    def __init__(self, objective, swept_param_name, sweep_values,
+                 normalize_by_n_q=False):
         """
         Parameters
         ----------
         objective        : refnx Objective at best-fit parameter values
         swept_param_name : name of the parameter to sweep (will be held fixed)
         sweep_values     : 1D sequence of values for the swept parameter
+        normalize_by_n_q : if True, divide chi² by n_q (number of data points)
+                           to compute a mean rather than a sum. Reduces gradient
+                           magnitude for MCMC; default False (standard GF).
         """
+        self.normalize_by_n_q = normalize_by_n_q
         self.swept_param_name = swept_param_name
         self.sweep_values = np.asarray(sweep_values, dtype=np.float64)
         self.n_sweep = len(self.sweep_values)
@@ -625,6 +644,7 @@ class SweepBatchBuilder:
 
         # Q, data, y_err are the same for all sweep points
         self.q, self.y, self.y_err = objective_data(objective)
+        self.n_q = len(self.q)
 
         # Free parameters (excluding the swept one) — same for all sweep points
         self.free_params = extract_free_params(self.objectives[0], excluded_name=swept_param_name)
@@ -702,10 +722,13 @@ class SweepBatchBuilder:
         bkg_out    = np.repeat(self.base_bkg,   popsize)
 
         # Apply free parameters via n_free NumPy array writes — no per-candidate loop
+        # Slab entries use: slab_value = intercept + slope * param_value
         for k, mappings in enumerate(self.param_map):
             for entry in mappings:
                 if entry[0] == 'slab':
-                    layers_out[:, entry[1], entry[2]] = pop_flat[:, k]
+                    slope = entry[3]
+                    intercept = entry[4]
+                    layers_out[:, entry[1], entry[2]] = intercept + slope * pop_flat[:, k]
                 elif entry[0] == 'scale':
                     scale_out[:] = pop_flat[:, k]
                 elif entry[0] == 'bkg':
@@ -761,7 +784,10 @@ class SweepBatchBuilder:
                 ((self._y_gpu - model) / self._y_err_gpu) ** 2, axis=-1
             ))
 
-        return chi2_flat.reshape(n_sweep, popsize)
+        chi2 = chi2_flat.reshape(n_sweep, popsize)
+        if self.normalize_by_n_q:
+            chi2 = chi2 / self.n_q
+        return chi2
 
 
 # ---------------------------------------------------------------------------
@@ -782,15 +808,19 @@ class ModelsBatchBuilder:
     from each energy's Q grid and used in per-candidate smeared reflectivity.
     """
 
-    def __init__(self, objectives_dict, energy_list=None, use_f32_abeles=False):
+    def __init__(self, objectives_dict, energy_list=None, use_f32_abeles=False,
+                 normalize_by_n_q=False):
         """
         Parameters
         ----------
-        objectives_dict : dict {energy: refnx Objective}
+        objectives_dict  : dict {energy: refnx Objective}
             Objectives for each energy with parameters already configured.
-        energy_list : list, optional
-            Subset of energies to use (default: all keys).
+        energy_list      : list, optional — subset of energies (default: all keys).
+        use_f32_abeles   : use float32 Abeles for ~8x GPU throughput (default False).
+        normalize_by_n_q : if True, divide each energy's chi² by its n_q to compute
+                           a mean rather than a sum. Default False (standard GF).
         """
+        self.normalize_by_n_q = normalize_by_n_q
         if energy_list is None:
             energy_list = sorted(objectives_dict.keys())
         self.energies = list(energy_list)
@@ -895,13 +925,13 @@ class ModelsBatchBuilder:
 
         # Decompose param_map into scatter index lists for JAX.
         # Python for-loop here runs at trace time only — XLA fuses the at[].set() ops.
-        self._slab_scatter = []   # [(k, row, col), ...]
+        self._slab_scatter = []   # [(k, row, col, slope, intercept), ...]
         self._scale_k = None
         self._bkg_k   = None
         for k, mappings in enumerate(self.param_map):
             for entry in mappings:
                 if entry[0] == 'slab':
-                    self._slab_scatter.append((k, entry[1], entry[2]))
+                    self._slab_scatter.append((k, entry[1], entry[2], entry[3], entry[4]))
                 elif entry[0] == 'scale':
                     self._scale_k = k
                 elif entry[0] == 'bkg':
@@ -958,10 +988,13 @@ class ModelsBatchBuilder:
         bkg_out    = np.repeat(self.base_bkg,   popsize)
 
         # Apply free parameters via n_free NumPy array writes — no per-candidate loop
+        # Slab entries use: slab_value = intercept + slope * param_value
         for k, mappings in enumerate(self.param_map):
             for entry in mappings:
                 if entry[0] == 'slab':
-                    layers_out[:, entry[1], entry[2]] = pop_flat[:, k]
+                    slope = entry[3]
+                    intercept = entry[4]
+                    layers_out[:, entry[1], entry[2]] = intercept + slope * pop_flat[:, k]
                 elif entry[0] == 'scale':
                     scale_out[:] = pop_flat[:, k]
                 elif entry[0] == 'bkg':
@@ -990,8 +1023,10 @@ class ModelsBatchBuilder:
             n_e, pop_sz, _ = pop_matrix.shape
             layers = (base_slabs_j[:, None, :, :]
                       + jnp.zeros((n_e, pop_sz, n_slab_rows, 4), jnp.float64))
-            for k, row, col in slab_scatter:
-                layers = layers.at[:, :, row, col].set(pop_matrix[:, :, k])
+            for k, row, col, slope, intercept in slab_scatter:
+                layers = layers.at[:, :, row, col].set(
+                    intercept + slope * pop_matrix[:, :, k]
+                )
             scale = base_scale_j[:, None] + jnp.zeros((n_e, pop_sz), jnp.float64)
             bkg   = base_bkg_j[:, None]   + jnp.zeros((n_e, pop_sz), jnp.float64)
             if scale_k is not None:
@@ -1028,25 +1063,29 @@ class ModelsBatchBuilder:
             )
         elif self.use_smearing:
             kernel = _fused_smeared_linear_f32_jit if self.use_f32_abeles else _fused_smeared_linear_jit
-            return kernel(
+            chi2 = kernel(
                 self._q_quad_pad_gpu, self._combo_gpu,
                 self._y_pad_gpu, self._y_err_pad_gpu, self._mask_gpu,
                 layers, scale, bkg,
             )
         elif self.use_log:
             kernel = _fused_unsmeared_log_f32_jit if self.use_f32_abeles else _fused_unsmeared_log_jit
-            return kernel(
+            chi2 = kernel(
                 self._q_pad_gpu,
                 self._y_log_pad_gpu, self._y_err_log_pad_gpu, self._mask_gpu,
                 layers, scale, bkg,
             )
         else:
             kernel = _fused_unsmeared_linear_f32_jit if self.use_f32_abeles else _fused_unsmeared_linear_jit
-            return kernel(
+            chi2 = kernel(
                 self._q_pad_gpu,
                 self._y_pad_gpu, self._y_err_pad_gpu, self._mask_gpu,
                 layers, scale, bkg,
             )
+        if self.normalize_by_n_q:
+            n_q_j = jnp.array(self.n_q_list, dtype=jnp.float64).reshape(-1, 1)
+            chi2 = chi2 / n_q_j
+        return chi2
 
     def fitness(self, pop_matrix):
         """
@@ -1106,7 +1145,11 @@ class ModelsBatchBuilder:
                 layers, scale, bkg,
             )
 
-        return np.array(chi2)  # (n_energies, popsize)
+        chi2_np = np.array(chi2)  # (n_energies, popsize)
+        if self.normalize_by_n_q:
+            n_q_arr = np.array(self.n_q_list, dtype=np.float64).reshape(-1, 1)
+            chi2_np = chi2_np / n_q_arr
+        return chi2_np
 
 
 # ---------------------------------------------------------------------------
