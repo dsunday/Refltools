@@ -41,6 +41,7 @@ from gpu_reflect import (
     get_free_param_values,
     objective_data,
     set_free_params,
+    set_global_params,
     get_slabs_scale_bkg,
     _build_param_map,
     _detect_objective_fitness_mode,
@@ -833,7 +834,7 @@ def gpu_mcmc(
 # ---------------------------------------------------------------------------
 
 def gpu_mcmc_converge(
-    objective,
+    objective        = None,
     sampler          = 'nuts',
     n_chains         = 4,
     n_warmup         = 500,
@@ -846,6 +847,7 @@ def gpu_mcmc_converge(
     progress         = True,
     chunk_size       = 100,
     normalize        = False,
+    _sampler_obj     = None,
 ):
     """
     Run MCMC until R-hat convergence rather than a fixed sample count.
@@ -881,8 +883,13 @@ def gpu_mcmc_converge(
     """
     import time
 
-    s = BlackjaxSampler(objective, sampler=sampler, n_chains=n_chains, seed=seed,
-                        normalize=normalize)
+    if _sampler_obj is not None:
+        s = _sampler_obj
+    elif objective is not None:
+        s = BlackjaxSampler(objective, sampler=sampler, n_chains=n_chains, seed=seed,
+                            normalize=normalize)
+    else:
+        raise ValueError("Either objective or _sampler_obj must be provided.")
 
     # ── Warmup (once) ──────────────────────────────────────────────────────
     if progress:
@@ -1057,3 +1064,335 @@ def gpu_mcmc_converge(
     result.converged = converged
     result.total_samples = total_samples
     return result
+
+
+# ---------------------------------------------------------------------------
+# Global log-probability function factory
+# ---------------------------------------------------------------------------
+
+def make_global_log_prob_fn(
+    per_obj_q,
+    per_obj_y,
+    per_obj_yerr,
+    per_obj_base_slabs,
+    per_obj_base_scale,
+    per_obj_base_bkg,
+    per_obj_param_maps,
+    per_obj_global_idx,
+    per_obj_smear,
+    per_obj_use_log,
+    lb_j,
+    ub_j,
+    normalize_by_n_q=False,
+    per_obj_n_q=None,
+):
+    """
+    Build a pure-JAX log-probability function for GlobalObjective MCMC.
+
+    The returned callable maps unconstrained ℝ^n_global → scalar log-probability
+    and is fully differentiable (supports jax.grad, jax.jit).
+
+    Parameters
+    ----------
+    per_obj_q, per_obj_y, per_obj_yerr     : lists of (n_q_i,) JAX float64 arrays
+    per_obj_base_slabs                      : list of (n_slab_rows_i, 4) JAX float64
+    per_obj_base_scale, per_obj_base_bkg    : lists of Python floats
+    per_obj_param_maps                      : list of static param_map lists
+    per_obj_global_idx                      : list of Python int lists — unrolled at JIT
+                                              trace time into static gather indices
+    per_obj_smear                           : list of (q_quad_j, combo_j) or None
+    per_obj_use_log                         : list of bools
+    lb_j, ub_j                              : (n_global,) JAX float64 global bounds
+    """
+    n_objectives = len(per_obj_q)
+    # Convert Python int lists to JAX arrays once — required for indexing inside
+    # jit-compiled functions (JAX ≥0.4 rejects raw Python lists as indices).
+    per_obj_idx_j = [jnp.array(idx, dtype=jnp.int32) for idx in per_obj_global_idx]
+
+    def log_prob(unconstrained):
+        # 1. Unconstrained → bounded global theta
+        s = jax.nn.sigmoid(unconstrained)
+        theta = lb_j + s * (ub_j - lb_j)
+
+        ll = jnp.float64(0.0)
+
+        # 2. Python for-loop over objectives — unrolled at JIT trace time.
+        #    theta[per_obj_idx_j[i]] is a constant-index gather (differentiable).
+        for i in range(n_objectives):
+            theta_i = theta[per_obj_idx_j[i]]
+
+            layers, scale, bkg = apply_params_jax(
+                per_obj_base_slabs[i],
+                per_obj_base_scale[i],
+                per_obj_base_bkg[i],
+                theta_i,
+                per_obj_param_maps[i],
+            )
+
+            smear_i = per_obj_smear[i]
+            if smear_i is not None:
+                model = _jabeles_smeared_pos(smear_i[0], smear_i[1], layers, scale, bkg)
+            else:
+                model = _jabeles_pos(per_obj_q[i], layers, scale, bkg)
+
+            if per_obj_use_log[i]:
+                log_m = jnp.log10(jnp.maximum(model, 1e-100))
+                log_d = jnp.log10(jnp.maximum(per_obj_y[i], 1e-100))
+                dy_log = jnp.abs(
+                    per_obj_yerr[i] / (jnp.maximum(per_obj_y[i], 1e-100) * jnp.log(10.0))
+                )
+                chi2_i = jnp.sum(((log_d - log_m) / dy_log) ** 2)
+            else:
+                chi2_i = jnp.sum(((per_obj_y[i] - model) / per_obj_yerr[i]) ** 2)
+
+            if normalize_by_n_q and per_obj_n_q is not None:
+                chi2_i = chi2_i / per_obj_n_q[i]
+
+            ll = ll - 0.5 * chi2_i
+
+        # 3. Log-Jacobian correction for logit transform
+        lj = jnp.sum(jnp.log(s * (1.0 - s) * (ub_j - lb_j)))
+
+        return ll + lj
+
+    return log_prob
+
+
+# ---------------------------------------------------------------------------
+# GlobalBlackjaxSampler — MCMC for GlobalObjective
+# ---------------------------------------------------------------------------
+
+class GlobalBlackjaxSampler(BlackjaxSampler):
+    """
+    GPU-accelerated MCMC sampler for a refnx GlobalObjective.
+
+    Inherits all sampling methods from BlackjaxSampler (warmup, sample,
+    run_until_converged); only __init__ is overridden to build the global
+    log-probability function from the per-objective components.
+
+    Parameters
+    ----------
+    global_result : dict from create_global_reflectometry_models()
+    sampler       : 'nuts' | 'mclmc'
+    n_chains      : int — parallel chains
+    seed          : int — PRNG seed
+    normalize     : bool — divide each objective's chi² by n_q
+    """
+
+    def __init__(self, global_result, sampler='nuts', n_chains=4, seed=0, normalize=False):
+        if sampler not in ('nuts', 'mclmc'):
+            raise ValueError(f"sampler must be 'nuts' or 'mclmc', got {sampler!r}")
+
+        global_obj = global_result['global_objective']
+        objectives = global_result['objectives']
+
+        self.sampler_name = sampler
+        self.n_chains     = n_chains
+        self._master_key  = jax.random.PRNGKey(seed)
+
+        # --- Global parameter info ---
+        global_params    = list(global_obj.varying_parameters())
+        self.n_free      = len(global_params)
+        self.free_params = global_params  # API compatibility with BlackjaxSampler
+        if self.n_free == 0:
+            raise ValueError("GlobalObjective has no free parameters.")
+        if sampler == 'mclmc' and self.n_free < 2:
+            raise ValueError(
+                "MCLMC requires at least 2 free parameters. "
+                "Use sampler='nuts' for single-parameter models."
+            )
+
+        self.param_names = [p.name for p in global_params]
+        bounds_np = get_bounds_array(global_params)   # (n_global, 2)
+        if not np.all(bounds_np[:, 1] > bounds_np[:, 0]):
+            raise ValueError(
+                "All parameter upper bounds must be strictly greater than lower bounds."
+            )
+        self._lb = jnp.array(bounds_np[:, 0], dtype=jnp.float64)
+        self._ub = jnp.array(bounds_np[:, 1], dtype=jnp.float64)
+
+        # --- Per-objective global index mapping ---
+        global_id_to_idx = {id(p): i for i, p in enumerate(global_params)}
+        per_obj_global_idx = [
+            [global_id_to_idx[id(p)] for p in extract_free_params(obj)]
+            for obj in objectives
+        ]
+
+        # --- Per-objective JAX arrays ---
+        per_obj_q, per_obj_y, per_obj_yerr = [], [], []
+        per_obj_base_slabs, per_obj_base_scale, per_obj_base_bkg = [], [], []
+        per_obj_param_maps, per_obj_smear, per_obj_use_log = [], [], []
+        per_obj_n_q = []
+
+        for obj in objectives:
+            local_free = extract_free_params(obj)
+            q, y, y_err = objective_data(obj)
+            base_slabs, base_scale, base_bkg = get_slabs_scale_bkg(obj)
+            param_map = _build_param_map(obj, local_free)
+            use_log, dqvals_fwhm, quad_order = _detect_objective_fitness_mode(obj)
+
+            per_obj_q.append(jnp.array(q,     dtype=jnp.float64))
+            per_obj_y.append(jnp.array(y,     dtype=jnp.float64))
+            per_obj_yerr.append(jnp.array(y_err, dtype=jnp.float64))
+            per_obj_base_slabs.append(jnp.array(base_slabs, dtype=jnp.float64))
+            per_obj_base_scale.append(float(base_scale))
+            per_obj_base_bkg.append(float(base_bkg))
+            per_obj_param_maps.append(param_map)
+            per_obj_use_log.append(use_log)
+            per_obj_n_q.append(len(q))
+
+            if dqvals_fwhm is not None:
+                q_quad, combo = compute_smear_params(q, dqvals_fwhm, quad_order)
+                per_obj_smear.append((
+                    jnp.array(q_quad, dtype=jnp.float64),
+                    jnp.array(combo,  dtype=jnp.float64),
+                ))
+            else:
+                per_obj_smear.append(None)
+
+        # --- Initial unconstrained position from current param values ---
+        theta_raw = np.array([p.value for p in global_params], dtype=np.float64)
+
+        out_of_bounds = [
+            self.param_names[i]
+            for i in range(self.n_free)
+            if theta_raw[i] < bounds_np[i, 0] or theta_raw[i] > bounds_np[i, 1]
+        ]
+        if out_of_bounds:
+            import warnings
+            warnings.warn(
+                f"Global parameters outside their bounds will be clipped: "
+                f"{out_of_bounds}. Fix values or bounds before sampling.",
+                stacklevel=2,
+            )
+        theta_init = jnp.clip(
+            jnp.array(theta_raw, dtype=jnp.float64),
+            self._lb + 1e-10 * (self._ub - self._lb),
+            self._ub - 1e-10 * (self._ub - self._lb),
+        )
+        self._y_init = _bounded_to_unconstrained(theta_init, self._lb, self._ub)
+
+        near_bound = [
+            self.param_names[i]
+            for i in range(self.n_free)
+            if abs(float(self._y_init[i])) > 5.0
+        ]
+        if near_bound:
+            import warnings
+            warnings.warn(
+                f"Global parameters {near_bound} are near their bounds (|logit| > 5). "
+                "Consider widening the bounds for better MCMC mixing.",
+                stacklevel=2,
+            )
+
+        # --- Global log-probability function ---
+        self.log_prob_fn = make_global_log_prob_fn(
+            per_obj_q, per_obj_y, per_obj_yerr,
+            per_obj_base_slabs, per_obj_base_scale, per_obj_base_bkg,
+            per_obj_param_maps, per_obj_global_idx,
+            per_obj_smear, per_obj_use_log,
+            self._lb, self._ub,
+            normalize_by_n_q=normalize,
+            per_obj_n_q=per_obj_n_q,
+        )
+
+        # Set by warmup()
+        self._adapted_params = None
+        self._adapted_state  = None
+
+
+# ---------------------------------------------------------------------------
+# Global-fit convenience entry points
+# ---------------------------------------------------------------------------
+
+def gpu_global_mcmc(
+    global_result,
+    sampler    = 'nuts',
+    n_chains   = 4,
+    n_warmup   = 1000,
+    n_samples  = 2000,
+    seed       = 0,
+    progress   = True,
+    chunk_size = 100,
+    normalize  = False,
+):
+    """
+    GPU-accelerated Bayesian MCMC for a GlobalObjective.
+
+    Samples the joint posterior of shared + per-sample free parameters using
+    BlackJAX NUTS or MCLMC.  The global_result should be at best-fit values
+    (e.g., from CMA-ES with GlobalModelsBatchBuilder) for good initialisation.
+
+    Parameters
+    ----------
+    global_result : dict from create_global_reflectometry_models()
+    sampler       : 'nuts' | 'mclmc'
+    n_chains, n_warmup, n_samples, seed, progress, chunk_size, normalize :
+        identical to gpu_mcmc()
+
+    Returns
+    -------
+    MCMCSamples
+        .param_names    global parameter names (shared first, then per-sample)
+        .samples_bounded  (n_chains, n_samples, n_global)
+        To restore the global objective: set_global_params(
+            global_result['global_objective'], result.posterior_median())
+    """
+    s = GlobalBlackjaxSampler(global_result, sampler=sampler, n_chains=n_chains,
+                               seed=seed, normalize=normalize)
+    return s.sample(
+        n_samples=n_samples,
+        n_warmup=n_warmup,
+        progress=progress,
+        chunk_size=chunk_size,
+    )
+
+
+def gpu_global_mcmc_converge(
+    global_result,
+    sampler           = 'nuts',
+    n_chains          = 4,
+    n_warmup          = 500,
+    samples_per_chunk = 200,
+    min_samples       = 500,
+    max_samples       = 5000,
+    rhat_threshold    = 1.05,
+    ess_min           = 200,
+    seed              = 0,
+    progress          = True,
+    chunk_size        = 100,
+    normalize         = False,
+):
+    """
+    Convergence-targeted MCMC for a GlobalObjective.
+
+    Mirrors gpu_mcmc_converge() but accepts a global_result dict instead of a
+    single refnx Objective.  Sampling runs until R-hat convergence or
+    max_samples is reached.
+
+    Parameters
+    ----------
+    global_result : dict from create_global_reflectometry_models()
+    [all other parameters identical to gpu_mcmc_converge()]
+
+    Returns
+    -------
+    MCMCSamples with .converged and .total_samples attributes
+    """
+    s = GlobalBlackjaxSampler(global_result, sampler=sampler, n_chains=n_chains,
+                               seed=seed, normalize=normalize)
+    return gpu_mcmc_converge(
+        _sampler_obj      = s,
+        sampler           = sampler,
+        n_chains          = n_chains,
+        n_warmup          = n_warmup,
+        samples_per_chunk = samples_per_chunk,
+        min_samples       = min_samples,
+        max_samples       = max_samples,
+        rhat_threshold    = rhat_threshold,
+        ess_min           = ess_min,
+        seed              = seed,
+        progress          = progress,
+        chunk_size        = chunk_size,
+        normalize         = normalize,
+    )

@@ -51,6 +51,7 @@ from gpu_reflect import (
     get_free_param_values,
     get_slabs_scale_bkg,
     set_free_params,
+    set_global_params,
     _build_param_map,
     _detect_objective_fitness_mode,
     compute_smear_params,
@@ -135,6 +136,17 @@ class NestedSamplingResult:
         """Set objective's free parameters to the posterior median (in-place)."""
         set_free_params(objective, self.posterior_median)
         return objective
+
+    def to_global_result(self, global_result):
+        """
+        Set a GlobalObjective's free parameters to the posterior median (in-place).
+
+        Use this instead of to_refnx_objective() when the result comes from
+        run_global_nested_sampling().  Uses varying_parameters() to avoid
+        double-setting shared parameters.
+        """
+        set_global_params(global_result['global_objective'], self.posterior_median)
+        return global_result['global_objective']
 
     def __repr__(self):
         return (
@@ -370,6 +382,254 @@ def _interpret_log_bayes_factor(log_bf):
         return f"Very strong evidence (log10 BF = {log10_bf:.2f})"
     else:
         return f"Decisive evidence (log10 BF = {log10_bf:.2f})"
+
+
+# ---------------------------------------------------------------------------
+# Global nested sampling
+# ---------------------------------------------------------------------------
+
+def _build_global_jaxns_model(global_result, use_log_space, normalize_by_n_q=False):
+    """
+    Build a JAXNS Model from a GlobalObjective.
+
+    The prior is Uniform over each global parameter's [lb, ub] bounds.
+    The log-likelihood sums individual chi-squared contributions across all
+    objectives, slicing the global theta vector for each objective via the
+    per-objective global index mapping.
+
+    Returns
+    -------
+    model : jaxns.Model
+    param_names : list[str]
+    """
+    from jaxns import Prior, Model
+    import tensorflow_probability.substrates.jax as tfp
+
+    global_obj = global_result['global_objective']
+    objectives = global_result['objectives']
+
+    global_params = list(global_obj.varying_parameters())
+    if not global_params:
+        raise ValueError("GlobalObjective has no free parameters.")
+
+    bounds = get_bounds_array(global_params)
+    lb = bounds[:, 0]
+    ub = bounds[:, 1]
+
+    if not np.all(ub > lb):
+        raise ValueError("All parameter upper bounds must exceed their lower bounds.")
+
+    param_names = [p.name for p in global_params]
+    lb_f = [float(v) for v in lb]
+    ub_f = [float(v) for v in ub]
+
+    # Per-objective global index mapping
+    global_id_to_idx = {id(p): i for i, p in enumerate(global_params)}
+    per_obj_global_idx = [
+        [global_id_to_idx[id(p)] for p in extract_free_params(obj)]
+        for obj in objectives
+    ]
+
+    # Per-objective JAX arrays
+    per_obj_q, per_obj_y, per_obj_dy = [], [], []
+    per_obj_base_slabs, per_obj_base_scale, per_obj_base_bkg = [], [], []
+    per_obj_param_maps, per_obj_smear, per_obj_n_q = [], [], []
+
+    for obj in objectives:
+        local_free = extract_free_params(obj)
+        q = obj.data.x.astype(np.float64)
+        y = obj.data.y.astype(np.float64)
+        dy = obj.data.y_err.astype(np.float64)
+        base_slabs, base_scale, base_bkg = get_slabs_scale_bkg(obj)
+        param_map = _build_param_map(obj, local_free)
+        _, dqvals_fwhm, quad_order = _detect_objective_fitness_mode(obj)
+
+        per_obj_q.append(jnp.array(q,  dtype=jnp.float64))
+        per_obj_y.append(jnp.array(y,  dtype=jnp.float64))
+        per_obj_dy.append(jnp.array(dy, dtype=jnp.float64))
+        per_obj_base_slabs.append(jnp.array(base_slabs, dtype=jnp.float64))
+        per_obj_base_scale.append(float(base_scale))
+        per_obj_base_bkg.append(float(base_bkg))
+        per_obj_param_maps.append(param_map)
+        per_obj_n_q.append(len(q))
+
+        if dqvals_fwhm is not None:
+            q_quad, combo = compute_smear_params(q, dqvals_fwhm, quad_order)
+            per_obj_smear.append((
+                jnp.array(q_quad, dtype=jnp.float64),
+                jnp.array(combo,  dtype=jnp.float64),
+            ))
+        else:
+            per_obj_smear.append(None)
+
+    n_objectives = len(objectives)
+    use_log = use_log_space
+    # Convert index lists to JAX arrays once — raw Python lists cannot be used
+    # as indices inside jit-compiled functions in JAX ≥0.4.
+    per_obj_idx_j = [jnp.array(idx, dtype=jnp.int32) for idx in per_obj_global_idx]
+
+    def prior_model():
+        params = []
+        for i, name in enumerate(param_names):
+            p = yield Prior(
+                tfp.distributions.Uniform(
+                    low=jnp.float64(lb_f[i]),
+                    high=jnp.float64(ub_f[i]),
+                ),
+                name=name,
+            )
+            params.append(p)
+        return jnp.stack(params)
+
+    def log_likelihood(theta):
+        # theta is already in bounded space (JAXNS handles the prior transform).
+        # Python for-loop unrolled at trace time; constant-index gather is differentiable.
+        ll = jnp.float64(0.0)
+
+        for i in range(n_objectives):
+            theta_i = theta[per_obj_idx_j[i]]
+            layers, scale, bkg = apply_params_jax(
+                per_obj_base_slabs[i],
+                per_obj_base_scale[i],
+                per_obj_base_bkg[i],
+                theta_i,
+                per_obj_param_maps[i],
+            )
+
+            smear_i = per_obj_smear[i]
+            if smear_i is not None:
+                model_r = _jabeles_smeared_pos(smear_i[0], smear_i[1], layers, scale, bkg)
+            else:
+                model_r = _jabeles_pos(per_obj_q[i], layers, scale, bkg)
+
+            if use_log:
+                log_m  = jnp.log10(jnp.maximum(model_r, 1e-100))
+                log_d  = jnp.log10(jnp.maximum(per_obj_y[i], 1e-100))
+                dy_log = jnp.abs(
+                    per_obj_dy[i] / (jnp.maximum(per_obj_y[i], 1e-100) * jnp.log(10.0))
+                )
+                chi2_i = jnp.sum(((log_d - log_m) / dy_log) ** 2)
+            else:
+                chi2_i = jnp.sum(((per_obj_y[i] - model_r) / per_obj_dy[i]) ** 2)
+
+            if normalize_by_n_q:
+                chi2_i = chi2_i / per_obj_n_q[i]
+
+            ll = ll - 0.5 * chi2_i
+
+        return ll
+
+    model = Model(prior_model=prior_model, log_likelihood=log_likelihood)
+    return model, param_names
+
+
+def run_global_nested_sampling(
+    global_result,
+    max_samples=100_000,
+    num_live_points=500,
+    seed=0,
+    difficult_model=False,
+    n_posterior_samples=2000,
+    use_log_space=True,
+    verbose=True,
+    normalize=False,
+):
+    """
+    Run JAXNS nested sampling on a GlobalObjective.
+
+    Computes the Bayesian evidence log Z for the global model (all samples
+    simultaneously constrained to share the same substrate / linked layers)
+    and returns posterior samples over all n_global free parameters.
+
+    Typical use: compare evidence between global models with different
+    numbers of shared layers, or between global and independent fits::
+
+        ns_global = run_global_nested_sampling(global_result, num_live_points=500)
+        ns_indep  = run_nested_sampling(obj_sample1, num_live_points=500)
+        # sum log Z across independent fits for comparison
+        log_BF = ns_global.log_Z_mean - sum_indep_log_Z
+
+    Parameters
+    ----------
+    global_result      : dict from create_global_reflectometry_models()
+    max_samples        : max likelihood evaluations (default 100_000)
+    num_live_points    : approximate live points — higher = more accurate log Z
+    seed               : PRNG seed
+    difficult_model    : if True, use more robust JAXNS settings
+    n_posterior_samples: number of equally-weighted posterior draws (default 2000)
+    use_log_space      : compute chi² in log10 reflectivity space (default True)
+    verbose            : show JAXNS progress
+    normalize          : if True, divide each objective's chi² by n_q
+
+    Returns
+    -------
+    NestedSamplingResult
+        .param_names  — global parameter names (n_global,)
+        .samples      — (n_posterior_samples, n_global) posterior draws
+        .log_Z_mean   — log marginal evidence for the global model
+        Use result.to_global_result(global_result) to restore best params.
+    """
+    from jaxns import NestedSampler
+    from jaxns.utils import resample
+
+    model, param_names = _build_global_jaxns_model(
+        global_result, use_log_space, normalize_by_n_q=normalize
+    )
+
+    ns = NestedSampler(
+        model,
+        max_samples=max_samples,
+        num_live_points=num_live_points,
+        difficult_model=difficult_model,
+        verbose=verbose,
+        devices=[jax.devices()[0]],
+    )
+
+    key = jax.random.PRNGKey(seed)
+    t0 = time.perf_counter()
+    termination_reason, state = ns(key)
+    results = ns.to_results(termination_reason, state)
+    elapsed = time.perf_counter() - t0
+
+    key2 = jax.random.PRNGKey(seed + 1)
+    param_samples_dict = resample(
+        key2,
+        results.samples,
+        results.log_dp_mean,
+        S=n_posterior_samples,
+        replace=True,
+    )
+    log_L_resampled = resample(
+        jax.random.PRNGKey(seed + 2),
+        results.log_L_samples,
+        results.log_dp_mean,
+        S=n_posterior_samples,
+        replace=True,
+    )
+
+    if isinstance(param_samples_dict, dict):
+        samples_arr = np.stack(
+            [np.asarray(param_samples_dict[name]) for name in param_names], axis=-1
+        )
+    else:
+        samples_arr = np.asarray(param_samples_dict)
+
+    log_L_arr = np.asarray(log_L_resampled)
+
+    return NestedSamplingResult(
+        log_Z_mean    = float(results.log_Z_mean),
+        log_Z_std     = float(results.log_Z_uncert),
+        ESS           = float(results.ESS),
+        H_mean        = float(results.H_mean),
+        samples       = samples_arr,
+        log_L_samples = log_L_arr,
+        posterior_mean   = np.mean(samples_arr,   axis=0),
+        posterior_std    = np.std(samples_arr,    axis=0),
+        posterior_median = np.median(samples_arr, axis=0),
+        param_names   = param_names,
+        run_seconds   = elapsed,
+        total_likelihood_evaluations = int(results.total_num_likelihood_evaluations),
+    )
 
 
 def compare_evidence(results, reference=None):

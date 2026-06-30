@@ -8,7 +8,7 @@ from datetime import datetime
 from scipy.interpolate import interp1d
 
 from refnx.dataset import ReflectDataset, Data1D
-from refnx.analysis import Transform, CurveFitter, Objective, Model, Parameter
+from refnx.analysis import Transform, CurveFitter, Objective, Model, Parameter, GlobalObjective
 from refnx.reflect import SLD, Slab, ReflectModel, MaterialSLD
 from refnx.reflect.structure import sld_profile as isld_profile
 
@@ -208,6 +208,105 @@ def create_reflectometry_model(materials_list, layer_params, layer_order=None,
 
 
 # ---------------------------------------------------------------------------
+# Global fitting helpers (private)
+# ---------------------------------------------------------------------------
+
+def _detect_approach(info):
+    """Return 'SLD' or 'density' based on a material info dict."""
+    if 'real' in info and 'imag' in info:
+        return "SLD"
+    if 'density' in info:
+        return "density"
+    raise ValueError(
+        f"Material '{info.get('name', '?')}' must have 'real'/'imag' (SLD) "
+        "or 'density' (density) keys."
+    )
+
+
+def _build_layers(materials_list, layer_params, energy=None, wavelength=None, probe='x-ray'):
+    """
+    Build material objects and Slab objects for a set of layers.
+
+    Same logic as create_reflectometry_model but returns (materials, Layer)
+    dicts without assembling a Structure or generating a model name.
+    Used by create_global_reflectometry_models.
+    """
+    if probe == 'x-ray' and energy is not None and wavelength is None:
+        wavelength = 12.398 / energy
+
+    approach = _detect_approach(materials_list[0])
+
+    materials = {}
+    density_params = {}
+
+    for info in materials_list:
+        name = info['name']
+        mode = _detect_approach(info)
+        if mode != approach:
+            raise ValueError(
+                "Mixed material approaches detected — all materials must use "
+                "either SLD (real/imag) or density (formula/density)."
+            )
+        if mode == "SLD":
+            real = info['real']
+            imag = info['imag']
+            materials[name] = SLD(
+                real + (imag if isinstance(imag, complex) else imag * 1j),
+                name=name,
+            )
+        else:
+            density = info['density']
+            dp = Parameter(density, name=f"{name}_density")
+            density_params[name] = dp
+            if 'formula' in info:
+                if wavelength is None:
+                    raise ValueError(
+                        "energy or wavelength must be supplied when using "
+                        "the density approach with X-ray probe."
+                    )
+                materials[name] = MaterialSLD(
+                    info['formula'], density=density,
+                    probe=probe, wavelength=wavelength, name=name,
+                )
+            else:
+                sld_r = info.get('sld_real', 0)
+                sld_i = info.get('sld_imag', 0)
+                materials[name] = SLD(sld_r + sld_i * 1j, name=name)
+
+    Layer = {}
+    for name, params in layer_params.items():
+        if name not in materials:
+            continue
+        thickness = params.get('thickness', 0)
+        roughness = params.get('roughness', 0)
+        Layer[name] = materials[name](thickness, roughness)
+
+        if approach == "SLD":
+            if 'sld_real_bounds' in params:
+                lo, hi, vary = params['sld_real_bounds']
+                Layer[name].sld.real.setp(vary=vary, bounds=(lo, hi))
+            if 'sld_imag_bounds' in params:
+                lo, hi, vary = params['sld_imag_bounds']
+                Layer[name].sld.imag.setp(vary=vary, bounds=(lo, hi))
+        else:
+            if 'density_bounds' in params:
+                lo, hi, vary = params['density_bounds']
+                if name in density_params and isinstance(materials[name], MaterialSLD):
+                    dp = density_params[name]
+                    dp.setp(bounds=(lo, hi), vary=vary)
+                    materials[name].density = dp
+
+        if 'thickness_bounds' in params:
+            lo, hi, vary = params['thickness_bounds']
+            Layer[name].thick.setp(bounds=(lo, hi), vary=vary)
+        if 'roughness_bounds' in params:
+            lo, hi, vary = params['roughness_bounds']
+            Layer[name].rough.setp(bounds=(lo, hi), vary=vary)
+
+    return materials, Layer
+
+
+# ---------------------------------------------------------------------------
 # Objective creation
 # ---------------------------------------------------------------------------
 
@@ -266,6 +365,254 @@ def create_model_and_objective(structure, data, model_name=None, scale=1.0,
 
     objective = Objective(model, data, transform=Transform(transform))
     return model, objective
+
+
+def create_global_reflectometry_models(
+    shared_materials, shared_params, shared_order,
+    sample_configs,
+    link_shared=True,
+    energy=None, wavelength=None, probe='x-ray',
+):
+    """
+    Create multiple reflectometry models with a common set of linked layers.
+
+    A designated group of layers (e.g. Si/SiO2 substrate, a common buffer
+    layer, or any subset of the stack) is shared across all samples when
+    link_shared=True. Parameters in shared layers are represented by the
+    *same* Python object in every structure, so they are counted once in
+    GlobalObjective and updated simultaneously during fitting.
+
+    The mechanism is general: shared layers need not be the substrate. Any
+    layers whose parameters should be equal across samples can be placed in
+    the shared group.
+
+    Args:
+        shared_materials : list of material dicts for the layers to be shared
+        shared_params    : layer_params dict for the shared layers
+        shared_order     : layer names within the shared group, top→bottom
+                           (e.g. ['SiO2', 'Si'] or ['buffer', 'SiO2', 'Si'])
+        sample_configs   : list of per-sample dicts, each containing:
+                               'name'             – sample label (str)
+                               'data'             – ReflectDataset
+                               'sample_materials' – material dicts for unique layers
+                               'sample_params'    – layer_params for unique layers
+                               'sample_order'     – unique layer names, top→bottom
+                                                    (full order = sample_order + shared_order)
+                           optional objective args (fall back to create_model_and_objective
+                           defaults when absent):
+                               scale, bkg, dq, q_offset,
+                               vary_scale, vary_bkg, vary_dq, vary_qoffset,
+                               scale_bounds, bkg_bounds, dq_bounds, qoffset_bounds,
+                               transform, model_name
+        link_shared      : if True (default), all samples share the same Slab objects
+                           for the shared layers so those parameters are linked during
+                           fitting; if False, independent copies are created per sample
+                           (a GlobalObjective is still returned for simultaneous fitting
+                           without enforcing equality)
+        energy           : X-ray energy in keV (converted to wavelength internally)
+        wavelength       : wavelength in Å (alternative to energy)
+        probe            : 'x-ray' (default) or 'neutron'
+
+    Returns:
+        dict with keys:
+            global_objective – refnx GlobalObjective wrapping all per-sample objectives
+            objectives       – list of per-sample Objective objects
+            structures       – list of per-sample Structure objects
+            models           – list of per-sample ReflectModel objects
+            sample_names     – list of sample name strings
+            shared_Layer     – dict of shared Slab objects (link_shared=True), or
+                               list of per-sample Slab dicts (link_shared=False)
+            sample_Layers    – list of per-sample unique-layer Slab dicts
+            linked           – bool (= link_shared)
+    """
+    if probe not in ('x-ray', 'neutron'):
+        raise ValueError(f"probe must be 'x-ray' or 'neutron', got {probe!r}")
+    if probe == 'x-ray' and energy is not None and wavelength is None:
+        wavelength = 12.398 / energy
+    if probe == 'neutron' and wavelength is None and energy is None:
+        raise ValueError("For neutron measurements wavelength must be provided.")
+
+    if link_shared:
+        _, shared_Layer = _build_layers(
+            shared_materials, shared_params,
+            energy=energy, wavelength=wavelength, probe=probe,
+        )
+
+    structures = []
+    models = []
+    objectives = []
+    sample_names = []
+    sample_Layers_list = []
+    shared_Layer_copies = []
+
+    for cfg in sample_configs:
+        name = cfg.get('name', f'sample_{len(sample_names) + 1}')
+        data = cfg['data']
+        sample_order = cfg['sample_order']
+
+        _, s_Layer = _build_layers(
+            cfg['sample_materials'], cfg['sample_params'],
+            energy=energy, wavelength=wavelength, probe=probe,
+        )
+
+        if link_shared:
+            active_shared = shared_Layer
+        else:
+            _, active_shared = _build_layers(
+                shared_materials, shared_params,
+                energy=energy, wavelength=wavelength, probe=probe,
+            )
+            shared_Layer_copies.append(active_shared)
+
+        # Assemble full structure: per-sample layers on top, shared layers below
+        full_order = sample_order + shared_order
+        combined = {**active_shared, **s_Layer}   # s_Layer wins on name clash
+        structure = combined[full_order[0]]
+        for lname in full_order[1:]:
+            structure = structure | combined[lname]
+
+        # Pass only args explicitly present in cfg to avoid overriding defaults
+        obj_kwargs = {'model_name': cfg.get('model_name', f"{name}_global")}
+        for key in ('scale', 'bkg', 'dq', 'q_offset', 'vary_scale', 'vary_bkg',
+                    'vary_dq', 'vary_qoffset', 'scale_bounds', 'bkg_bounds',
+                    'dq_bounds', 'qoffset_bounds', 'transform'):
+            if key in cfg:
+                obj_kwargs[key] = cfg[key]
+
+        model, obj = create_model_and_objective(
+            structure=structure, data=data, **obj_kwargs
+        )
+
+        structures.append(structure)
+        models.append(model)
+        objectives.append(obj)
+        sample_names.append(name)
+        sample_Layers_list.append(s_Layer)
+
+    global_obj = GlobalObjective(objectives)
+
+    n_global = len(global_obj.varying_parameters())
+    n_indep  = sum(len(o.varying_parameters()) for o in objectives)
+    if link_shared:
+        print(f"Global model: {len(sample_configs)} samples, "
+              f"{n_global} linked params (vs {n_indep} if independent)")
+    else:
+        print(f"Global model: {len(sample_configs)} samples, "
+              f"{n_global} independent params (link_shared=False)")
+
+    return {
+        'global_objective': global_obj,
+        'objectives':       objectives,
+        'structures':       structures,
+        'models':           models,
+        'sample_names':     sample_names,
+        'shared_Layer':     shared_Layer if link_shared else shared_Layer_copies,
+        'sample_Layers':    sample_Layers_list,
+        'linked':           link_shared,
+    }
+
+
+def print_global_fit_results(global_result, show_shared=True, show_fixed=False,
+                              show_other=False):
+    """
+    Print chi-squared summary and parameter values for a global fit result.
+
+    Args:
+        global_result : dict returned by create_global_reflectometry_models
+        show_shared   : display shared-layer parameters (default True)
+        show_fixed    : include fixed (non-varying) parameters (default False)
+        show_other    : include parameters of type 'other' (default False)
+    """
+    RED, GREEN, BLUE, RESET = '\033[91m', '\033[92m', '\033[94m', '\033[0m'
+
+    objectives   = global_result['objectives']
+    sample_names = global_result['sample_names']
+    global_obj   = global_result['global_objective']
+    linked       = global_result.get('linked', False)
+    shared_Layer = global_result.get('shared_Layer', {})
+
+    shared_names = (set(shared_Layer.keys())
+                    if linked and isinstance(shared_Layer, dict) else set())
+
+    def _is_shared(p):
+        return any(p.name.startswith(f"{ln} - ") or p.name == f"{ln}_density"
+                   for ln in shared_names)
+
+    def _fmt_param(p, indent=2):
+        ptype = get_param_type(p.name)
+        if not show_fixed and not getattr(p, 'vary', False):
+            return None
+        if not show_other and ptype == 'other':
+            return None
+        val = p.value
+        bl = bh = None
+        try:
+            b = getattr(p, 'bounds', None)
+            if b is not None:
+                bl, bh = (b.lb, b.ub) if hasattr(b, 'lb') else (b[0], b[1])
+        except Exception:
+            pass
+        near = (bl is not None and bh is not None and bh > bl and
+                (abs(val - bl) < 0.01 * (bh - bl) or
+                 abs(bh - val) < 0.01 * (bh - bl)))
+        if ptype == 'density':
+            val_s = f"{val:.4f} g/cm³"
+            bnd_s = f" (bounds: {bl:.4f}–{bh:.4f} g/cm³)" if bl is not None else ""
+        elif ptype in ('thickness', 'roughness'):
+            val_s = f"{val:.2f} Å"
+            bnd_s = f" (bounds: {bl:.2f}–{bh:.2f} Å)" if bl is not None else ""
+        else:
+            val_s = f"{val:.6g}"
+            bnd_s = f" (bounds: {bl:.6g}–{bh:.6g})" if bl is not None else ""
+        vary_s = " (varying)" if getattr(p, 'vary', False) else " (fixed)"
+        line   = f"{'':>{indent}}{p.name}: {val_s}{bnd_s}{vary_s}"
+        if near:
+            return f"{RED}{line}{RESET}"
+        if getattr(p, 'vary', False):
+            return f"{GREEN}{line}{RESET}"
+        return line
+
+    # chi-squared summary
+    per_chi  = [(n, obj.chisqr(), len(obj.data.x))
+                for n, obj in zip(sample_names, objectives)]
+    total    = sum(c for _, c, _ in per_chi)
+    print(f"Global χ² = {total:.6g}\n")
+    print(f"{BLUE}--- PER-SAMPLE χ² ---{RESET}")
+    for name, chi, nq in per_chi:
+        print(f"  {name:20s}: χ² = {chi:.4g}  (χ²/n_q = {chi/nq:.4g})")
+
+    n_global = len(global_obj.varying_parameters())
+    n_indep  = sum(len(obj.varying_parameters()) for obj in objectives)
+    print(f"\nVarying parameters: {n_global}  (would be {n_indep} if independent)")
+
+    # shared parameters
+    if show_shared and linked and shared_names:
+        seen = set()
+        rows = []
+        for p in global_obj.parameters.flattened():
+            if id(p) not in seen and _is_shared(p):
+                seen.add(id(p))
+                line = _fmt_param(p, indent=2)
+                if line is not None:
+                    rows.append(line)
+        if rows:
+            print(f"\n{BLUE}--- SHARED LAYER PARAMETERS ---{RESET}")
+            for line in rows:
+                print(line)
+
+    # per-sample parameters (skip shared ones)
+    shared_ids = {id(p) for p in global_obj.parameters.flattened() if _is_shared(p)}
+    print(f"\n{BLUE}--- PER-SAMPLE PARAMETERS ---{RESET}")
+    for name, obj in zip(sample_names, objectives):
+        print(f"\n  {GREEN}[{name}]{RESET}")
+        seen = set()
+        for p in obj.parameters.flattened():
+            if id(p) in seen or id(p) in shared_ids:
+                continue
+            seen.add(id(p))
+            line = _fmt_param(p, indent=4)
+            if line is not None:
+                print(line)
 
 
 # ---------------------------------------------------------------------------

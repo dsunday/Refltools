@@ -1417,3 +1417,182 @@ class MultiEnergySweepBatchBuilder:
         chi2_np = np.array(chi2)  # (n_total, popsize)
         chi2_np[~self.valid_mask, :] = 1e30
         return chi2_np
+
+
+# ---------------------------------------------------------------------------
+# Global-fit parameter helpers
+# ---------------------------------------------------------------------------
+
+def set_global_params(global_obj, values):
+    """
+    Set a GlobalObjective's free parameters from the global parameter vector.
+
+    Uses varying_parameters() (deduplicated by identity) so shared parameters
+    are set once — safe even when the same Parameter object appears in multiple
+    constituent objectives.
+    """
+    for p, v in zip(global_obj.varying_parameters(), values):
+        p.value = float(v)
+
+
+# ---------------------------------------------------------------------------
+# GlobalModelsBatchBuilder — CMA-ES / DE for GlobalObjective
+# ---------------------------------------------------------------------------
+
+class GlobalModelsBatchBuilder:
+    """
+    Batches reflectivity evaluation across all samples in a global fit.
+
+    Takes a global_result dict from create_global_reflectometry_models() and
+    provides a fitness function for CMA-ES / evosax DE over the global
+    parameter vector (all shared + all per-sample free parameters combined).
+
+    Shared parameters contribute to every objective's slab build; per-sample
+    parameters only affect their own objective.  The total chi-squared is the
+    sum across all objectives.
+
+    Usage
+    -----
+    builder = GlobalModelsBatchBuilder(global_result)
+    # Inside CMA-ES population loop (pop is (popsize, n_global)):
+    chi2 = builder.fitness(pop)   # (popsize,)
+    """
+
+    def __init__(self, global_result, normalize_by_n_q=False):
+        """
+        Parameters
+        ----------
+        global_result    : dict from create_global_reflectometry_models()
+        normalize_by_n_q : if True, divide each objective's chi² by its n_q
+        """
+        global_obj = global_result['global_objective']
+        objectives = global_result['objectives']
+
+        self.normalize_by_n_q = normalize_by_n_q
+        self.n_objectives = len(objectives)
+
+        # Global parameter list — deduplicated, same order as varying_parameters()
+        global_params = list(global_obj.varying_parameters())
+        self.n_global = len(global_params)
+        if self.n_global == 0:
+            raise ValueError("GlobalObjective has no free parameters.")
+
+        global_id_to_idx = {id(p): i for i, p in enumerate(global_params)}
+        self._per_obj_global_idx = [
+            [global_id_to_idx[id(p)] for p in extract_free_params(obj)]
+            for obj in objectives
+        ]
+
+        # Public attributes used by CMA-ES / sweep code
+        self.bounds      = get_bounds_array(global_params)   # (n_global, 2)
+        self.param_names = [p.name for p in global_params]
+        self.n_free      = self.n_global   # alias for uniform CMA-ES interface
+
+        # Per-objective pre-computed arrays
+        self._per_obj = []
+        for obj in objectives:
+            local_free = extract_free_params(obj)
+            q, y, y_err = objective_data(obj)
+            base_slabs, base_scale, base_bkg = get_slabs_scale_bkg(obj)
+            param_map = _build_param_map(obj, local_free)
+            use_log, dqvals_fwhm, quad_order = _detect_objective_fitness_mode(obj)
+
+            n_q = len(q)
+
+            if dqvals_fwhm is not None:
+                q_quad, combo = compute_smear_params(q, dqvals_fwhm, quad_order)
+                smear = (
+                    jnp.array(q_quad,  dtype=jnp.float64),
+                    jnp.array(combo,   dtype=jnp.float64),
+                )
+            else:
+                smear = None
+
+            if use_log:
+                y_log     = np.log10(np.maximum(y, 1e-100))
+                y_err_log = np.abs(y_err / (np.maximum(y, 1e-100) * np.log(10.0)))
+                y_j     = jnp.array(y_log,     dtype=jnp.float64)
+                y_err_j = jnp.array(y_err_log, dtype=jnp.float64)
+            else:
+                y_j     = jnp.array(y,     dtype=jnp.float64)
+                y_err_j = jnp.array(y_err, dtype=jnp.float64)
+
+            self._per_obj.append({
+                'param_map':   param_map,
+                'n_slab_rows': base_slabs.shape[0],
+                'base_slabs':  base_slabs.copy(),
+                'base_scale':  float(base_scale),
+                'base_bkg':    float(base_bkg),
+                'use_log':     use_log,
+                'smear':       smear,
+                'q_j':         jnp.array(q, dtype=jnp.float64),
+                'y_j':         y_j,
+                'y_err_j':     y_err_j,
+                'n_q':         n_q,
+            })
+
+    def _build_batch_one(self, local_pop, info):
+        """Build (popsize, n_slab_rows, 4) slab batch for one objective."""
+        popsize = local_pop.shape[0]
+        layers_out = np.tile(info['base_slabs'][None], (popsize, 1, 1))
+        scale_out  = np.full(popsize, info['base_scale'])
+        bkg_out    = np.full(popsize, info['base_bkg'])
+
+        for k, mappings in enumerate(info['param_map']):
+            for entry in mappings:
+                if entry[0] == 'slab':
+                    layers_out[:, entry[1], entry[2]] = (
+                        entry[4] + entry[3] * local_pop[:, k]
+                    )
+                elif entry[0] == 'scale':
+                    scale_out[:] = local_pop[:, k]
+                elif entry[0] == 'bkg':
+                    bkg_out[:] = local_pop[:, k]
+
+        return layers_out, scale_out, bkg_out
+
+    def fitness(self, pop_matrix):
+        """
+        Chi-squared summed across all objectives.
+
+        Parameters
+        ----------
+        pop_matrix : ndarray (popsize, n_global)
+
+        Returns
+        -------
+        chi2 : ndarray (popsize,)
+        """
+        popsize = pop_matrix.shape[0]
+        total_chi2 = np.zeros(popsize, dtype=np.float64)
+
+        for i, info in enumerate(self._per_obj):
+            local_pop = pop_matrix[:, self._per_obj_global_idx[i]]
+            layers_np, scale_np, bkg_np = self._build_batch_one(local_pop, info)
+
+            l_j = jnp.array(layers_np, dtype=jnp.float64)
+            s_j = jnp.array(scale_np,  dtype=jnp.float64)
+            b_j = jnp.array(bkg_np,    dtype=jnp.float64)
+
+            if info['smear'] is not None:
+                q_quad_j, combo_j = info['smear']
+                model = _batched_smeared_reflectivity_jit(q_quad_j, combo_j, l_j, s_j, b_j)
+            else:
+                model = _batched_reflectivity_jit(info['q_j'], l_j, s_j, b_j)
+
+            if info['use_log']:
+                log_model = jnp.log10(jnp.maximum(model, 1e-100))
+                chi2_i = np.array(
+                    jnp.sum(((info['y_j'] - log_model) / info['y_err_j']) ** 2, axis=-1)
+                )
+            else:
+                chi2_i = np.array(
+                    jnp.sum(((info['y_j'] - model) / info['y_err_j']) ** 2, axis=-1)
+                )
+
+            if self.normalize_by_n_q:
+                chi2_i = chi2_i / info['n_q']
+
+            total_chi2 += chi2_i
+
+        return total_chi2
