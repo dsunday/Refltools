@@ -248,7 +248,7 @@ def _build_jaxns_model(objective, use_log_space, normalize_by_n_q=False):
         return ll / y_j.shape[0] if normalize_by_n_q else ll
 
     model = Model(prior_model=prior_model, log_likelihood=log_likelihood)
-    return model, param_names
+    return model, param_names, param_names   # single-objective: display names == prior names
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +298,8 @@ def run_nested_sampling(
     from jaxns import NestedSampler
     from jaxns.utils import resample
 
-    model, param_names = _build_jaxns_model(objective, use_log_space,
-                                            normalize_by_n_q=normalize)
+    model, param_names, prior_names = _build_jaxns_model(objective, use_log_space,
+                                                         normalize_by_n_q=normalize)
 
     # Restrict to a single GPU. JAXNS's sharded executor requires all devices
     # to be of identical hardware type; mixed-GPU systems (e.g. A6000 + RTX 8000)
@@ -336,10 +336,11 @@ def run_nested_sampling(
         replace=True,
     )
 
-    # Stack named samples into a matrix (n_posterior_samples, n_free)
+    # Stack named samples into a matrix (n_posterior_samples, n_free).
+    # Use prior_names (unique JAXNS keys) for dict lookup; param_names for display.
     if isinstance(param_samples_dict, dict):
         samples_arr = np.stack(
-            [np.asarray(param_samples_dict[name]) for name in param_names], axis=-1
+            [np.asarray(param_samples_dict[name]) for name in prior_names], axis=-1
         )
     else:
         samples_arr = np.asarray(param_samples_dict)
@@ -419,9 +420,21 @@ def _build_global_jaxns_model(global_result, use_log_space, normalize_by_n_q=Fal
     if not np.all(ub > lb):
         raise ValueError("All parameter upper bounds must exceed their lower bounds.")
 
-    param_names = [p.name for p in global_params]
+    param_names = [p.name for p in global_params]   # display labels (may contain duplicates)
     lb_f = [float(v) for v in lb]
     ub_f = [float(v) for v in ub]
+
+    # JAXNS requires unique prior names.  Deduplicate by appending _1, _2, …
+    # to the second and subsequent occurrences of any repeated name.
+    _seen: dict = {}
+    prior_names: list = []
+    for name in param_names:
+        if name in _seen:
+            _seen[name] += 1
+            prior_names.append(f"{name}_{_seen[name]}")
+        else:
+            _seen[name] = 0
+            prior_names.append(name)
 
     # Per-objective global index mapping
     global_id_to_idx = {id(p): i for i, p in enumerate(global_params)}
@@ -470,13 +483,13 @@ def _build_global_jaxns_model(global_result, use_log_space, normalize_by_n_q=Fal
 
     def prior_model():
         params = []
-        for i, name in enumerate(param_names):
+        for i, pname in enumerate(prior_names):   # unique names required by JAXNS
             p = yield Prior(
                 tfp.distributions.Uniform(
                     low=jnp.float64(lb_f[i]),
                     high=jnp.float64(ub_f[i]),
                 ),
-                name=name,
+                name=pname,
             )
             params.append(p)
         return jnp.stack(params)
@@ -520,7 +533,7 @@ def _build_global_jaxns_model(global_result, use_log_space, normalize_by_n_q=Fal
         return ll
 
     model = Model(prior_model=prior_model, log_likelihood=log_likelihood)
-    return model, param_names
+    return model, param_names, prior_names
 
 
 def run_global_nested_sampling(
@@ -572,7 +585,7 @@ def run_global_nested_sampling(
     from jaxns import NestedSampler
     from jaxns.utils import resample
 
-    model, param_names = _build_global_jaxns_model(
+    model, param_names, prior_names = _build_global_jaxns_model(
         global_result, use_log_space, normalize_by_n_q=normalize
     )
 
@@ -609,7 +622,7 @@ def run_global_nested_sampling(
 
     if isinstance(param_samples_dict, dict):
         samples_arr = np.stack(
-            [np.asarray(param_samples_dict[name]) for name in param_names], axis=-1
+            [np.asarray(param_samples_dict[name]) for name in prior_names], axis=-1
         )
     else:
         samples_arr = np.asarray(param_samples_dict)
