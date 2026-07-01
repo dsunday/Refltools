@@ -47,7 +47,7 @@ from parameter_sweep import (setup_parameter_sweep, run_parameter_sweep,
 # Data loading
 # ---------------------------------------------------------------------------
 
-def import_batch_reflectivity(folder_path, file_type='smoothed'):
+def import_batch_reflectivity(folder_path, file_type='smoothed', q_max=None):
     """
     Load a batch of reflectivity .dat files from a folder.
 
@@ -56,6 +56,8 @@ def import_batch_reflectivity(folder_path, file_type='smoothed'):
         file_type   : 'raw'      → *raw.dat
                       'smoothed' → *smoothed.dat  (default)
                       'all'      → all .dat files
+        q_max       : if given, mask out points with Q > q_max in every
+                       loaded dataset (default None → no truncation)
 
     Returns:
         (data_dict, energy_list)
@@ -72,13 +74,20 @@ def import_batch_reflectivity(folder_path, file_type='smoothed'):
     folder_path = Path(folder_path)
     data_dict   = {}
     failed      = []
+    n_total_points  = 0
+    n_masked_points = 0
 
     for fp in folder_path.glob('*.dat'):
         m = re.match(pattern, fp.name)
         if m:
             try:
                 energy = float(m.group(1))
-                data_dict[energy] = ReflectDataset(str(fp))
+                ds = ReflectDataset(str(fp))
+                if q_max is not None:
+                    n_total_points += ds.x.size
+                    ds.mask = ds.x <= q_max
+                    n_masked_points += ds.x.size
+                data_dict[energy] = ds
                 print(f"Loaded {fp.name}  ({energy} eV)")
             except Exception as exc:
                 failed.append((fp.name, str(exc)))
@@ -92,6 +101,8 @@ def import_batch_reflectivity(folder_path, file_type='smoothed'):
     print(f"\nLoaded {len(data_dict)} datasets  "
           f"({min(energy_list) if energy_list else 'N/A'} – "
           f"{max(energy_list) if energy_list else 'N/A'} eV)")
+    if q_max is not None:
+        print(f"Truncated to Q <= {q_max}: kept {n_masked_points}/{n_total_points} points")
     return data_dict, energy_list
 
 

@@ -615,6 +615,208 @@ def print_global_fit_results(global_result, show_shared=True, show_fixed=False,
                 print(line)
 
 
+def create_energy_linked_reflectometry_models(
+    data_dict, energy_list, material_sld_arrays,
+    base_layer_params, layer_order, linked_layers,
+    constant_materials=None, sld_offset_bounds=None, sample_name='Sample',
+    scale=1.0, bkg=None, scale_bounds=(0.1, 10), bkg_bounds=(0.01, 10),
+    dq_bounds=(1.0, 2.0), vary_scale=True, vary_bkg=True,
+    vary_dq=False, dq=1.6, verbose=True,
+):
+    """
+    Build a GlobalObjective across multiple energies where specified layers'
+    thickness/roughness are linked (same Parameter object, hence same value)
+    across all energies, while every other parameter (SLD real/imag, all
+    other layers' thickness/roughness, scale, bkg) remains independent
+    per energy.
+
+    This is the per-energy analog of create_global_reflectometry_models():
+    that function shares whole layers (SLD included) across different
+    samples; this one shares only individual thickness/roughness Parameter
+    objects for named layers across energies, because SLD must stay
+    energy-dependent (that's the entire point of the per-energy SLD
+    interpolation in generate_materials_from_sld_arrays).
+
+    Args:
+        data_dict           : {energy: ReflectDataset}
+        energy_list         : energies to include in this global fit
+        material_sld_arrays : {name: ndarray [Energy, Real_SLD, Imag_SLD]}
+        base_layer_params   : layer_params template (same shape as used by
+                              generate_batch_models)
+        layer_order         : layer names top→bottom
+        linked_layers       : {layer_name: [param_names]} where param_names
+                              is a subset of {'thickness', 'roughness'}.
+                              e.g. {'MOXB': ['thickness', 'roughness']}
+        constant_materials  : passed through to generate_materials_from_sld_arrays
+        sld_offset_bounds   : passed through to generate_layer_params_with_flexible_bounds
+        sample_name         : label prefix for model names
+        scale/bkg/dq/*_bounds/vary_* : passed through to create_model_and_objective,
+                              independently per energy (each energy gets its
+                              own scale/bkg Parameter object)
+        verbose             : print progress
+
+    Returns:
+        dict with keys:
+            global_objective – refnx GlobalObjective over all energies
+            objectives       – list of per-energy Objective (order = energy_list)
+            structures       – list of per-energy Structure
+            models           – list of per-energy ReflectModel
+            sample_names     – list of str(energy)
+            energy_list      – energies actually included (those with data)
+            linked_layers    – the linked_layers config, for bookkeeping
+            shared_params    – {(layer, param): Parameter} the shared objects
+            linked           – True
+    """
+    # Deferred import — batch.py imports from this module, so importing it
+    # at module load time would create a circular import.
+    from batch import (generate_materials_from_sld_arrays,
+                       generate_layer_params_with_flexible_bounds)
+
+    valid_param_keys = {'thickness', 'roughness'}
+    for lname, pnames in linked_layers.items():
+        if lname not in base_layer_params:
+            raise ValueError(f"linked_layers references unknown layer '{lname}'")
+        for pname in pnames:
+            if pname not in valid_param_keys:
+                raise ValueError(
+                    f"linked_layers['{lname}'] contains '{pname}'; only "
+                    f"{valid_param_keys} may be linked (SLD must stay per-energy)."
+                )
+
+    energy_materials = generate_materials_from_sld_arrays(
+        energy_list, material_sld_arrays, constant_materials)
+    energy_layer_params = generate_layer_params_with_flexible_bounds(
+        energy_materials, base_layer_params, sld_offset_bounds)
+
+    # One shared Parameter per (layer, param), seeded from base_layer_params.
+    shared_params = {}
+    for lname, pnames in linked_layers.items():
+        for pname in pnames:
+            init_val = base_layer_params[lname].get(pname, 0)
+            bounds_key = f"{pname}_bounds"
+            lo, hi, vary = base_layer_params[lname].get(
+                bounds_key, (init_val, init_val, False))
+            short = {'thickness': 'thick', 'roughness': 'rough'}[pname]
+            shared_params[(lname, pname)] = Parameter(
+                init_val, name=f"{lname} - {short}",
+                bounds=(lo, hi), vary=vary,
+            )
+
+    # Re-inject the shared Parameter objects into each energy's (already
+    # deep-copied) layer_params dict, overwriting the plain floats produced
+    # by generate_layer_params_with_flexible_bounds. create_reflectometry_model
+    # passes these straight through to Slab() unchanged (possibly_create_parameter
+    # returns Parameter objects as-is), so the same object ends up in every
+    # energy's Structure.
+    for energy in energy_list:
+        if energy not in energy_layer_params:
+            continue
+        lp = energy_layer_params[energy]
+        for (lname, pname), shared_p in shared_params.items():
+            lp[lname][pname] = shared_p
+
+    objectives, structures, models, sample_names, included_energies = [], [], [], [], []
+    for energy in energy_list:
+        if energy not in data_dict:
+            if verbose:
+                print(f"  Skipping {energy} eV — no data.")
+            continue
+        try:
+            _, _, structure, model_name = create_reflectometry_model(
+                materials_list=energy_materials[energy],
+                layer_params=energy_layer_params[energy],
+                layer_order=layer_order,
+                sample_name=sample_name,
+                energy=energy,
+            )
+            model, objective = create_model_and_objective(
+                structure=structure, data=data_dict[energy], model_name=model_name,
+                scale=scale, bkg=bkg, dq=dq,
+                vary_scale=vary_scale, vary_bkg=vary_bkg, vary_dq=vary_dq,
+                scale_bounds=scale_bounds, bkg_bounds=bkg_bounds, dq_bounds=dq_bounds,
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"  Error at {energy} eV: {exc} — skipping.")
+            continue
+        structures.append(structure)
+        models.append(model)
+        objectives.append(objective)
+        sample_names.append(str(energy))
+        included_energies.append(energy)
+        if verbose:
+            print(f"  {energy} eV -> {model_name}")
+
+    global_obj = GlobalObjective(objectives)
+
+    n_global = len(global_obj.varying_parameters())
+    n_indep = sum(len(o.varying_parameters()) for o in objectives)
+    if verbose:
+        print(f"\nEnergy-linked global model: {len(objectives)} energies, "
+              f"linked layers={list(linked_layers.keys())}, "
+              f"{n_global} global free params (vs {n_indep} if fully independent)")
+
+    return {
+        'global_objective': global_obj,
+        'objectives':       objectives,
+        'structures':       structures,
+        'models':           models,
+        'sample_names':     sample_names,
+        'energy_list':      included_energies,
+        'linked_layers':    linked_layers,
+        'shared_params':    shared_params,
+        'linked':           True,
+    }
+
+
+def save_global_fit_summary(path, global_result, best_values=None):
+    """
+    Save a per-energy summary of an energy-linked global fit: for each
+    energy, all free per-energy parameters (SLD real/imag, non-linked
+    layers' thickness/roughness, scale, bkg) plus chi2, and the shared
+    linked-layer value(s) pulled out once.
+
+    Unlike h5io.save_batch_to_h5 (which assumes independent per-energy
+    objectives), this does not duplicate the shared value across energies —
+    it is recorded a single time, since it is one Parameter object.
+
+    Args:
+        path           : output .npz path
+        global_result  : dict returned by create_energy_linked_reflectometry_models
+        best_values    : optional flat array of values to apply via
+                         set_global_params before recording (e.g. CMA-ES best)
+    """
+    global_obj = global_result['global_objective']
+    objectives = global_result['objectives']
+    energy_list = global_result['energy_list']
+    shared_params = global_result['shared_params']
+
+    if best_values is not None:
+        from gpu_reflect import set_global_params
+        set_global_params(global_obj, best_values)
+
+    shared_names = np.array([f'{ln}_{pn}' for (ln, pn) in shared_params], dtype=object)
+    shared_values = np.array([p.value for p in shared_params.values()])
+
+    rows = []
+    for energy, obj in zip(energy_list, objectives):
+        row = {'energy': energy, 'chi2': obj.chisqr(),
+               'chi2_per_nq': obj.chisqr() / len(obj.data.x)}
+        for p in obj.parameters.flattened():
+            if getattr(p, 'vary', False):
+                row[p.name] = p.value
+        rows.append(row)
+
+    np.savez_compressed(
+        path,
+        energies=np.array(energy_list),
+        shared_names=shared_names,
+        shared_values=shared_values,
+        per_energy_table=np.array(rows, dtype=object),
+    )
+    print(f"  Saved global fit summary -> {path}")
+
+
 # ---------------------------------------------------------------------------
 # Fitting
 # ---------------------------------------------------------------------------
