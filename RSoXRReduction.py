@@ -1327,12 +1327,13 @@ class RSoXRProcessor:
         
         return results
     
-    def auto_group_scans(self, data_directory=".", position_tolerance=0.4, 
-                        energy_tolerance=0.2, auto_trim=False, save_table=True, 
-                        output_dir=None, sort_by_energy=True):
+    def auto_group_scans(self, data_directory=".", position_tolerance=0.4,
+                        energy_tolerance=0.2, auto_trim=False, save_table=True,
+                        output_dir=None, sort_by_energy=True,
+                        filter_dummy_scans=True, dummy_scan_max_angle=1.0):
         """
         Enhanced auto-grouping that assigns unique scan numbers to each file
-        
+
         Parameters:
         -----------
         data_directory : str
@@ -1349,7 +1350,13 @@ class RSoXRProcessor:
             Directory to save the output table (will be created if it doesn't exist)
         sort_by_energy : bool
             Whether to sort the groups by energy
-            
+        filter_dummy_scans : bool
+            Whether to exclude filler/dummy scans (e.g. block start/end scans that only
+            sweep a tiny angle range near 0) based on their data-derived angle range
+        dummy_scan_max_angle : float
+            A file is treated as a dummy scan (and excluded) if its max angle is at or
+            below this value, e.g. a scan spanning 0.00-0.99°
+
         Returns:
         --------
         groups : list of dicts
@@ -1358,10 +1365,11 @@ class RSoXRProcessor:
         # Reset scan registry and numbering
         self.scan_registry = {}
         self.next_scan_number = 1
-        
+
         # Call existing auto_group_scans logic (simplified here)
-        groups = self._perform_auto_grouping(data_directory, position_tolerance, 
-                                           energy_tolerance, auto_trim, sort_by_energy)
+        groups = self._perform_auto_grouping(data_directory, position_tolerance,
+                                           energy_tolerance, auto_trim, sort_by_energy,
+                                           filter_dummy_scans, dummy_scan_max_angle)
         
         # Assign unique scan numbers to each file across all groups
         for group_idx, group in enumerate(groups):
@@ -1755,8 +1763,9 @@ class RSoXRProcessor:
                 matching_scans.append(scan_num)
         return matching_scans
 
-    def _perform_auto_grouping(self, data_directory, position_tolerance, 
-                              energy_tolerance, auto_trim, sort_by_energy):
+    def _perform_auto_grouping(self, data_directory, position_tolerance,
+                              energy_tolerance, auto_trim, sort_by_energy,
+                              filter_dummy_scans=True, dummy_scan_max_angle=1.0):
         """
         Perform the actual auto-grouping logic based on position, energy, and detector type
         This contains the core implementation from the original auto_group_scans method
@@ -1815,7 +1824,12 @@ class RSoXRProcessor:
             
             # Get angle range from the data file
             min_angle, max_angle = self.get_angle_range(filename)
-            
+
+            # Skip filler/dummy scans that only sweep a tiny angle range near 0
+            if filter_dummy_scans and max_angle is not None and max_angle <= dummy_scan_max_angle:
+                print(f"Skipping {os.path.basename(filename)} - dummy scan (angle range {min_angle:.2f}-{max_angle:.2f}°)")
+                continue
+
             if energy is not None and detector is not None and x is not None and y is not None:
                 file_metadata.append({
                     'filename': filename,
