@@ -5,6 +5,7 @@ from matplotlib import rc, gridspec
 import os
 import json
 import re
+import pickle
 from typing import Dict, Tuple, Optional, Union, List
 import matplotlib.colors as mcolors
 import pandas as pd
@@ -2360,5 +2361,57 @@ def generate_fitted_params_from_results(results,
             "width": edge_width,
             "decay": edge_decay
         }
-    
+
     return fitted_peak_params_new, fitted_edge_params_new
+
+
+# ---------------------------------------------------------------------------
+# Peak-fit result persistence
+# ---------------------------------------------------------------------------
+
+def save_peak_fit_results(results, path, baseline=0.0):
+    """
+    Pickle the full dict returned by fit_nexafs_spectrum to disk, so fitted
+    peak/edge parameters, uncertainties, and the fitted spectrum survive a
+    kernel restart instead of only living in notebook memory.
+
+    Parameters
+    ----------
+    results : dict
+        Return value of fit_nexafs_spectrum (keys include 'fitted_peak_params',
+        'fitted_edge_params', 'fit_result', 'fitted_spectrum', 'residuals',
+        'r_squared', 'rmse', 'experimental_energy', 'experimental_intensity',
+        'fit_energy_range').
+    path : str
+        Destination .pkl path (parent directory must already exist).
+    baseline : float
+        The fixed baseline value passed to fit_nexafs_spectrum for this fit
+        (not itself part of its return dict, but needed by print_fit_results/
+        plot_simulated_nexafs_spectrum to re-render the fit later).
+
+    Returns
+    -------
+    str : the path written to.
+    """
+    payload = dict(results)
+    payload['file_type'] = 'nexafs_peak_fit_results'
+    payload['baseline'] = baseline
+    with open(path, 'wb') as fh:
+        pickle.dump(payload, fh)
+    return path
+
+
+def load_peak_fit_results(path):
+    """
+    Load a peak-fit results dict saved by save_peak_fit_results.
+
+    Returns
+    -------
+    dict : matching the structure returned by fit_nexafs_spectrum.
+    """
+    with open(path, 'rb') as fh:
+        payload = pickle.load(fh)
+    if payload.get('file_type') != 'nexafs_peak_fit_results':
+        print(f"Warning: {path} does not look like a save_peak_fit_results file.")
+    payload.pop('file_type', None)
+    return payload

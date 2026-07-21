@@ -1842,10 +1842,10 @@ class NEXAFSDatabase:
 
 def plot_sld_four_panel(sld_data_dict, metadata_dict, spectrum_data_dict=None,
                         energy_range=(280, 300), marker_color_file=None, figsize=(14, 10),
-                        save_path=None, full_range_only=False):
+                        save_path=None, full_range_only=False, uncertainty_data_dict=None):
     """
     Create a four-panel plot showing SLD data from reflectivity fits and optionally NEXAFS spectrum data.
-    
+
     Parameters:
     -----------
     sld_data_dict : dict
@@ -1874,7 +1874,18 @@ def plot_sld_four_panel(sld_data_dict, metadata_dict, spectrum_data_dict=None,
     full_range_only : bool, optional
         If True, only plot the full energy range panels (one column, two rows).
         If False, plot all four panels (two columns, two rows). Default: False
-    
+    uncertainty_data_dict : dict, optional
+        Dictionary mapping scan names (a subset of sld_data_dict's keys is fine)
+        to per-energy uncertainty bounds, shaded as a band in that scan's
+        assigned color on both the full-range and truncated real/imaginary
+        panels. Each value is a dict with keys:
+            'energy'      : ndarray, shape (n,)
+            'real_lower'  : ndarray, shape (n,) -- e.g. 2.5th percentile
+            'real_upper'  : ndarray, shape (n,) -- e.g. 97.5th percentile
+            'imag_lower'  : ndarray, shape (n,)
+            'imag_upper'  : ndarray, shape (n,)
+        Scans without an entry are plotted without a band. Default: None
+
     Returns:
     --------
     fig : matplotlib.figure.Figure
@@ -2019,7 +2030,28 @@ def plot_sld_four_panel(sld_data_dict, metadata_dict, spectrum_data_dict=None,
         energy_truncated = energy[mask_truncated]
         sld_real_truncated = sld_real[mask_truncated]
         sld_imag_truncated = sld_imag[mask_truncated]
-        
+
+        # Shade uncertainty band, if supplied for this scan
+        if uncertainty_data_dict and scan_name in uncertainty_data_dict:
+            unc = uncertainty_data_dict[scan_name]
+            unc_energy = unc['energy']
+            unc_mask_truncated = (unc_energy >= energy_range[0]) & (unc_energy <= energy_range[1])
+
+            ax_top_left.fill_between(unc_energy, unc['real_lower'], unc['real_upper'],
+                                    color=color, alpha=0.2, linewidth=0, zorder=0)
+            ax_bottom_left.fill_between(unc_energy, unc['imag_lower'], unc['imag_upper'],
+                                       color=color, alpha=0.2, linewidth=0, zorder=0)
+            if ax_top_right is not None:
+                ax_top_right.fill_between(unc_energy[unc_mask_truncated],
+                                         unc['real_lower'][unc_mask_truncated],
+                                         unc['real_upper'][unc_mask_truncated],
+                                         color=color, alpha=0.2, linewidth=0, zorder=0)
+            if ax_bottom_right is not None:
+                ax_bottom_right.fill_between(unc_energy[unc_mask_truncated],
+                                            unc['imag_lower'][unc_mask_truncated],
+                                            unc['imag_upper'][unc_mask_truncated],
+                                            color=color, alpha=0.2, linewidth=0, zorder=0)
+
         # Plot real component - full range
         ax_top_left.plot(energy, sld_real, label=label, markersize=6, linewidth=1.5, 
                         alpha=0.8, **marker_style)

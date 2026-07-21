@@ -2893,7 +2893,8 @@ def get_h5_info(filepath, sample_name=None):
     return info
 
 
-def print_parameters(filepath, sample_name, energy, model_name=None, run_index=-1, tol_eV=0.5):
+def print_parameters(filepath, sample_name, energy, model_name=None, run_index=-1,
+                      tol_eV=0.5, criteria=None):
     """
     Print fitted parameters stored in an HDF5 results file.
 
@@ -2903,8 +2904,16 @@ def print_parameters(filepath, sample_name, energy, model_name=None, run_index=-
     sample_name : str   – top-level sample group
     energy      : float – energy in eV to look up (matched to nearest key within tol_eV)
     model_name  : str or None – if None, print all models at that energy
-    run_index   : int   – which run to display; -1 means the last run (default)
+    run_index   : int   – which run to display; -1 means the last run (default).
+                          Ignored if `criteria` is given.
     tol_eV      : float – how close the energy key must be (default 0.5 eV)
+    criteria    : 'best' | 'last' | int | None
+                          Run-selection override, same convention as
+                          `load_h5_objectives`/`extract_sld_from_h5`:
+                          'best' picks the run with the lowest chi_sq_final,
+                          'last' the highest run index, an int an explicit
+                          run index. Default None keeps the legacy
+                          `run_index`-based selection.
     """
     with h5py.File(filepath, 'r') as f:
         if sample_name not in f:
@@ -2938,7 +2947,23 @@ def print_parameters(filepath, sample_name, energy, model_name=None, run_index=-
             if not run_keys:
                 print(f"  Model '{mkey}': no runs found.")
                 continue
-            rkey = run_keys[run_index]
+            if criteria is not None:
+                if criteria == 'best':
+                    rkey = min(
+                        run_keys,
+                        key=lambda k: mgrp[k].attrs.get('chi_sq_final', np.inf))
+                elif criteria == 'last':
+                    rkey = run_keys[-1]
+                elif isinstance(criteria, int):
+                    rkey = f'run_{criteria}'
+                    if rkey not in mgrp:
+                        print(f"  Model '{mkey}': run_{criteria} not found.")
+                        continue
+                else:
+                    raise ValueError(
+                        f"criteria must be 'best', 'last', or int — got {criteria!r}")
+            else:
+                rkey = run_keys[run_index]
             rgrp = mgrp[rkey]
 
             chi_i = rgrp.attrs.get('chi_sq_initial', np.nan)
