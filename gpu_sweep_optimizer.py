@@ -898,3 +898,129 @@ def gpu_fit_models_cmaes(
         "generations_run":   generations_run,
         "converged":         converged,
     }
+
+
+def _jittered_objectives_copy(objectives_dict, rng):
+    """
+    Deep-copy objectives_dict with every free parameter resampled uniformly
+    across its own [lb, ub] bounds. Used to give CMA-ES restarts a genuinely
+    different starting position (rather than always the objective's current
+    value) — mirrors how the DE path's _uniform_init_population already
+    explores the whole bounds box.
+    """
+    jittered = {}
+    for energy, obj in objectives_dict.items():
+        obj_copy = copy.deepcopy(obj)
+        free_params = extract_free_params(obj_copy)
+        bounds = get_bounds_array(free_params)  # (n_free, 2)
+        new_vals = rng.uniform(bounds[:, 0], bounds[:, 1])
+        set_free_params(obj_copy, new_vals)
+        jittered[energy] = obj_copy
+    return jittered
+
+
+def gpu_fit_models_cmaes_multistart(
+    objectives_dict,
+    energy_list=None,
+    n_restarts=1,
+    popsize=20,
+    n_generations=500,
+    seed=0,
+    verbose=False,
+    tol=1e-4,
+    patience=5,
+    check_every=10,
+    normalize=False,
+):
+    """
+    Multi-restart wrapper around gpu_fit_models_cmaes: run n_restarts
+    independent CMA-ES fits per energy and keep the best.
+
+    Restart 0 uses gpu_fit_models_cmaes's default deterministic start (each
+    objective's current parameter values, clipped to bounds) — identical to
+    calling gpu_fit_models_cmaes directly, so n_restarts=1 (the default) is
+    bit-identical to today's single-start behavior. Restarts 1..n_restarts-1
+    start from a fresh uniform-random draw across each free parameter's full
+    bounds range (see _jittered_objectives_copy), giving CMA-ES a genuinely
+    different starting basin each time instead of always searching around
+    the same fixed point.
+
+    gpu_fit_models_cmaes is side-effect free w.r.t. its input objectives (it
+    deep-copies before writing fitted values), so calling it repeatedly here
+    with different starting objectives is safe.
+
+    Parameters
+    ----------
+    objectives_dict, energy_list, popsize, n_generations, verbose, tol,
+    patience, check_every, normalize : see gpu_fit_models_cmaes
+    n_restarts : number of independent starts per energy (default 1 — opt-in
+                 only; existing callers that don't pass this see no change)
+    seed        : base random seed. Restart k uses seed + k * 1000 for CMA-ES
+                  sampling, plus an independent RNG stream for jittering the
+                  starting point.
+
+    Returns
+    -------
+    Same dict as gpu_fit_models_cmaes, plus:
+      'restart_chisqr_history' : {energy: [chi_restart0, chi_restart1, ...]}
+      'winning_restart'        : {energy: int} — which restart's result was kept
+    """
+    if energy_list is None:
+        energy_list = sorted(objectives_dict.keys())
+
+    rng = np.random.default_rng(seed)
+
+    best_result = None
+    best_chisqr_running = {}
+    restart_chisqr_history = {e: [] for e in energy_list}
+    winning_restart = {e: 0 for e in energy_list}
+    total_elapsed = 0.0
+
+    for k in range(n_restarts):
+        start_objectives = (
+            objectives_dict if k == 0
+            else _jittered_objectives_copy(objectives_dict, rng)
+        )
+        result = gpu_fit_models_cmaes(
+            start_objectives,
+            energy_list=energy_list,
+            popsize=popsize,
+            n_generations=n_generations,
+            seed=seed + k * 1000,
+            verbose=verbose,
+            tol=tol,
+            patience=patience,
+            check_every=check_every,
+            normalize=normalize,
+        )
+        total_elapsed += result["elapsed_sec"]
+
+        if best_result is None:
+            best_result = result
+            for e in energy_list:
+                best_chisqr_running[e] = result["best_chisqr"][e]
+                restart_chisqr_history[e].append(result["best_chisqr"][e])
+            continue
+
+        for e in energy_list:
+            chi = result["best_chisqr"][e]
+            restart_chisqr_history[e].append(chi)
+            if chi < best_chisqr_running[e]:
+                best_chisqr_running[e] = chi
+                best_result["fitted_objectives"][e] = result["fitted_objectives"][e]
+                winning_restart[e] = k
+
+        if verbose:
+            print(f"  [restart {k+1}/{n_restarts}] mean best χ² so far: "
+                  f"{np.mean(list(best_chisqr_running.values())):.4g}")
+
+    return {
+        "fitted_objectives":      best_result["fitted_objectives"],
+        "best_chisqr":            best_chisqr_running,
+        "energies":               list(energy_list),
+        "elapsed_sec":            total_elapsed,
+        "generations_run":        best_result["generations_run"],
+        "converged":              best_result["converged"],
+        "restart_chisqr_history": restart_chisqr_history,
+        "winning_restart":        winning_restart,
+    }

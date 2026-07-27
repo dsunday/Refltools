@@ -455,6 +455,21 @@ def generate_layer_params_with_flexible_bounds(energy_materials, base_layer_para
                     params['sld_imag_bounds'] = (max(0.0, imag_sld * 0.999),
                                                   imag_sld * 1.001, False)
 
+            for bound_kind in ('sld_real_bounds', 'sld_imag_bounds'):
+                lo, hi, vary = params[bound_kind]
+                if vary and not (hi > lo):
+                    raise ValueError(
+                        f"generate_layer_params_with_flexible_bounds: "
+                        f"'{mat_name}' {bound_kind} at {energy} eV has "
+                        f"vary=True but lb={lo} >= ub={hi} (zero-width or "
+                        f"inverted bounds). This usually means "
+                        f"sld_offset_bounds['{mat_name}'] has an equal "
+                        f"lo/hi offset — e.g. (2, 2, True) instead of "
+                        f"(-2, 2, True) — which pins the parameter's value "
+                        f"while still flagging it as varying. Fix the "
+                        f"offset (or explicit bounds) so hi > lo."
+                    )
+
         energy_layer_params[energy] = lp
 
     return energy_layer_params
@@ -1472,6 +1487,7 @@ def batch_fit_selected_models_cmaes(
     h5_filepath=None,
     run_index=None,
     normalize=False,
+    n_restarts=1,
 ):
     """
     Fit reflectometry models for all energies simultaneously using Sep-CMA-ES.
@@ -1501,14 +1517,28 @@ def batch_fit_selected_models_cmaes(
     model_name      : HDF5 model label (default 'Model1')
     h5_filepath     : save fitted objectives here after completion
     run_index       : explicit HDF5 run index (default: auto-increment)
+    n_restarts      : number of independent CMA-ES starts per energy, keeping
+                      whichever scores lowest chi² (default 1 — today's
+                      single deterministic-start behavior, unchanged). Use
+                      n_restarts>1 for energies/models prone to landing in a
+                      poor local optimum from the default starting point;
+                      restarts beyond the first sample a fresh starting point
+                      uniformly across each free parameter's bounds. Cost
+                      scales ~linearly with n_restarts (sequential GPU calls).
 
     Returns
     -------
     Same dict format as batch_fit_selected_models_gpu, with two extra keys:
       'generations_run' – actual generations completed
       'converged'       – True if early stopping fired
+    When n_restarts>1, two more keys are present:
+      'restart_chisqr_history' – {energy: [chi_restart0, chi_restart1, ...]}
+      'winning_restart'        – {energy: int}
     """
-    from gpu_sweep_optimizer import gpu_fit_models_cmaes
+    if n_restarts > 1:
+        from gpu_sweep_optimizer import gpu_fit_models_cmaes_multistart as gpu_fit_models_cmaes
+    else:
+        from gpu_sweep_optimizer import gpu_fit_models_cmaes
 
     if energy_list is None:
         energy_list = sorted(objectives_dict.keys())
@@ -1540,6 +1570,7 @@ def batch_fit_selected_models_cmaes(
         patience=patience,
         check_every=check_every,
         normalize=normalize,
+        **({'n_restarts': n_restarts} if n_restarts > 1 else {}),
     )
 
     fitted_objectives = gpu_result["fitted_objectives"]
@@ -1593,6 +1624,9 @@ def batch_fit_selected_models_cmaes(
         "generations_run":     gpu_result["generations_run"],
         "converged":           gpu_result["converged"],
     }
+    if "restart_chisqr_history" in gpu_result:
+        ret["restart_chisqr_history"] = gpu_result["restart_chisqr_history"]
+        ret["winning_restart"] = gpu_result["winning_restart"]
 
     if h5_filepath is not None and sample_name is not None:
         save_batch_to_h5(

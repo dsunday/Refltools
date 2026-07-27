@@ -46,7 +46,9 @@ Depends on NEXAFS.py:  EnergytoWavelength, imag_SLD_to_beta
 """
 
 import itertools
+import multiprocessing
 import os
+import sys
 import tempfile
 import warnings
 import numpy as np
@@ -56,6 +58,20 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from scipy.optimize import minimize_scalar
 from scipy.interpolate import interp1d
 from scipy.signal import hilbert as scipy_hilbert
+
+# Workers use the 'spawn' start method rather than the platform default
+# ('fork' on Linux): forking a process that has GPU-runtime background
+# threads (e.g. JAX/XLA, already initialised in notebooks that also run
+# BlackJAX/JAXNS uncertainty sections) can deadlock the child. 'spawn'
+# starts a fresh interpreter instead, so the worker init restores this
+# module's import path there.
+_SPAWN_CTX = multiprocessing.get_context('spawn')
+
+
+def _spawn_worker_init(parent_sys_path):
+    for p in parent_sys_path:
+        if p not in sys.path:
+            sys.path.append(p)
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +693,10 @@ def _dispatch(worker_fn, worker_args, n_workers, verbose, n_combos):
     else:
         effective_workers = min(n_workers or os.cpu_count(), n_combos)
         completed = 0
-        with ProcessPoolExecutor(max_workers=effective_workers) as pool:
+        with ProcessPoolExecutor(
+            max_workers=effective_workers, mp_context=_SPAWN_CTX,
+            initializer=_spawn_worker_init, initargs=(sys.path,)
+        ) as pool:
             futures = {pool.submit(worker_fn, args): args[0] for args in worker_args}
             for future in as_completed(futures):
                 record = future.result()

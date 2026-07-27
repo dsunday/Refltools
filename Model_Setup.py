@@ -2136,7 +2136,10 @@ def save_material_sld(objectives_dict, material_name, filename, save_dir=None,
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
-    header = f'{material_name} SLD data\nEnergy_eV,Real_SLD,Imag_SLD' if include_header else ''
+    # Single header line only -- matches h5io.extract_sld_from_h5's CSV format
+    # and what load_material_sld_array (skiprows=1) actually expects. A second
+    # title line here previously broke that round-trip (see load_material_sld_array).
+    header = 'Energy_eV,Real_SLD,Imag_SLD' if include_header else ''
     np.savetxt(path, arr, delimiter=',', header=header, comments='')
     print(f'Saved {material_name} SLD ({len(arr)} energies) → {path}')
 
