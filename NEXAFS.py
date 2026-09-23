@@ -1842,7 +1842,8 @@ class NEXAFSDatabase:
 
 def plot_sld_four_panel(sld_data_dict, metadata_dict, spectrum_data_dict=None,
                         energy_range=(280, 300), marker_color_file=None, figsize=(14, 10),
-                        save_path=None, full_range_only=False, uncertainty_data_dict=None):
+                        save_path=None, full_range_only=False, uncertainty_data_dict=None,
+                        show_titles=True, label_fontsize=None):
     """
     Create a four-panel plot showing SLD data from reflectivity fits and optionally NEXAFS spectrum data.
 
@@ -1885,6 +1886,12 @@ def plot_sld_four_panel(sld_data_dict, metadata_dict, spectrum_data_dict=None,
             'imag_lower'  : ndarray, shape (n,)
             'imag_upper'  : ndarray, shape (n,)
         Scans without an entry are plotted without a band. Default: None
+    show_titles : bool, optional
+        If False, suppress all panel titles (axis labels/legend/grid unaffected).
+        Default: True
+    label_fontsize : int or float, optional
+        Font size for the x/y axis labels ('Energy (eV)', 'Real/Imaginary SLD ...').
+        If None, uses matplotlib's default. Default: None
 
     Returns:
     --------
@@ -2017,8 +2024,8 @@ def plot_sld_four_panel(sld_data_dict, metadata_dict, spectrum_data_dict=None,
             # Default to closed markers for UV and other processes
             marker_style = {'marker': marker, 'color': color}
         
-        # Create label
-        label = f"{material} - {process} - {sample}"
+        # Create label (metadata['label'] overrides the default "material - process - sample" text)
+        label = metadata.get('label') or f"{material} - {process} - {sample}"
         
         # Extract energy, real, and imaginary components
         energy = sld_array[:, 0]
@@ -2106,33 +2113,37 @@ def plot_sld_four_panel(sld_data_dict, metadata_dict, spectrum_data_dict=None,
     
     # Formatting
     # Top - Full range, real
-    ax_top_left.set_xlabel('Energy (eV)')
-    ax_top_left.set_ylabel('Real SLD (10$^{-6}$ Å$^{-2}$)')
-    ax_top_left.set_title('Real SLD - Full Energy Range')
+    ax_top_left.set_xlabel('Energy (eV)', fontsize=label_fontsize)
+    ax_top_left.set_ylabel('Real SLD (10$^{-6}$ Å$^{-2}$)', fontsize=label_fontsize)
+    if show_titles:
+        ax_top_left.set_title('Real SLD - Full Energy Range')
     ax_top_left.grid(True, alpha=0.3)
     ax_top_left.legend(fontsize=8, loc='best')
     
     # Bottom - Full range, imag
-    ax_bottom_left.set_xlabel('Energy (eV)')
-    ax_bottom_left.set_ylabel('Imaginary SLD (10$^{-6}$ Å$^{-2}$)')
-    ax_bottom_left.set_title('Imaginary SLD - Full Energy Range')
+    ax_bottom_left.set_xlabel('Energy (eV)', fontsize=label_fontsize)
+    ax_bottom_left.set_ylabel('Imaginary SLD (10$^{-6}$ Å$^{-2}$)', fontsize=label_fontsize)
+    if show_titles:
+        ax_bottom_left.set_title('Imaginary SLD - Full Energy Range')
     ax_bottom_left.grid(True, alpha=0.3)
     ax_bottom_left.legend(fontsize=8, loc='best')
     
     # Top right - Truncated range, real (only if right panel exists)
     if ax_top_right is not None:
-        ax_top_right.set_xlabel('Energy (eV)')
-        ax_top_right.set_ylabel('Real SLD (10$^{-6}$ Å$^{-2}$)')
-        ax_top_right.set_title(f'Real SLD - {energy_range[0]}-{energy_range[1]} eV')
+        ax_top_right.set_xlabel('Energy (eV)', fontsize=label_fontsize)
+        ax_top_right.set_ylabel('Real SLD (10$^{-6}$ Å$^{-2}$)', fontsize=label_fontsize)
+        if show_titles:
+            ax_top_right.set_title(f'Real SLD - {energy_range[0]}-{energy_range[1]} eV')
         ax_top_right.grid(True, alpha=0.3)
         ax_top_right.legend(fontsize=8, loc='best')
         ax_top_right.set_xlim(energy_range)
     
     # Bottom right - Truncated range, imag (only if right panel exists)
     if ax_bottom_right is not None:
-        ax_bottom_right.set_xlabel('Energy (eV)')
-        ax_bottom_right.set_ylabel('Imaginary SLD (10$^{-6}$ Å$^{-2}$)')
-        ax_bottom_right.set_title(f'Imaginary SLD - {energy_range[0]}-{energy_range[1]} eV')
+        ax_bottom_right.set_xlabel('Energy (eV)', fontsize=label_fontsize)
+        ax_bottom_right.set_ylabel('Imaginary SLD (10$^{-6}$ Å$^{-2}$)', fontsize=label_fontsize)
+        if show_titles:
+            ax_bottom_right.set_title(f'Imaginary SLD - {energy_range[0]}-{energy_range[1]} eV')
         ax_bottom_right.grid(True, alpha=0.3)
         ax_bottom_right.legend(fontsize=8, loc='best')
         ax_bottom_right.set_xlim(energy_range)

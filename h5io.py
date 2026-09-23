@@ -2242,6 +2242,83 @@ def plot_stacked_reflectivity_h5(
     return fig, ax
 
 
+def _build_gf_panel_and_selector(sample_name, model_names, energies, chi_arrs, gf_w,
+                                  title_suffix=''):
+    """
+    Shared chi-sq-vs-energy GF panel + tagged energy ``SelectMultiple``.
+
+    Used by both ``plot_reflectivity_comparison`` and
+    ``plot_sld_profile_comparison`` so the two widgets stay visually
+    consistent. Open marker = best (lowest chi_sq) model at that energy.
+
+    Parameters
+    ----------
+    chi_arrs : dict {model_name: np.ndarray of chi_sq per energy (NaN allowed)}
+
+    Returns
+    -------
+    gf_out, selector, selector_box : ipywidgets.Output, SelectMultiple, VBox
+    """
+    import ipywidgets as widgets
+    import plotly.graph_objects as go
+    import plotly.colors as pc
+
+    colors = pc.qualitative.Plotly
+    marker_symbols = ['circle', 'square', 'diamond', 'triangle-up',
+                       'triangle-down', 'star', 'cross', 'x']
+
+    def _best_mask(mname):
+        # True at energies where `mname` has the lowest chi_sq among all models
+        mask = []
+        for i in range(len(energies)):
+            vals = {m: chi_arrs[m][i] for m in model_names if not np.isnan(chi_arrs[m][i])}
+            mask.append(bool(vals) and min(vals, key=vals.get) == mname)
+        return mask
+
+    gf_fig = go.Figure()
+    for i, mname in enumerate(model_names):
+        base_sym = marker_symbols[i % len(marker_symbols)]
+        best = _best_mask(mname)
+        syms = [f'{base_sym}-open' if is_best else base_sym for is_best in best]
+        gf_fig.add_trace(go.Scatter(
+            x=energies, y=chi_arrs[mname].tolist(),
+            mode='lines+markers', name=mname,
+            marker=dict(symbol=syms, color=colors[i % len(colors)], size=10),
+            line=dict(color=colors[i % len(colors)]),
+        ))
+    gf_fig.update_layout(
+        width=gf_w, height=280,
+        title_text=(f'{sample_name}  —  {" vs ".join(model_names)}'
+                    f'{title_suffix}  |  open marker = best fit'),
+        xaxis_title='Energy (eV)',
+        yaxis_title='χ²',
+        margin=dict(t=50, b=40),
+    )
+
+    gf_out = widgets.Output()
+    with gf_out:
+        gf_fig.show()
+
+    # ---- Energy selector ----------------------------------------------------
+    selector_options = []
+    for e_idx, e in enumerate(energies):
+        chis = {m: chi_arrs[m][e_idx] for m in model_names if not np.isnan(chi_arrs[m][e_idx])}
+        tag = f'  [{min(chis, key=chis.get)}✓]' if chis else ''
+        selector_options.append((f'{e:.2f} eV{tag}', e))
+
+    selector = widgets.SelectMultiple(
+        options=selector_options,
+        rows=min(18, len(energies)),
+        layout=widgets.Layout(width='210px'),
+    )
+    selector_box = widgets.VBox([
+        widgets.Label('Select energies  (Ctrl/Shift for multi):'),
+        selector,
+    ])
+
+    return gf_out, selector, selector_box
+
+
 def plot_reflectivity_comparison(
     filepath,
     sample_name,
@@ -2254,26 +2331,28 @@ def plot_reflectivity_comparison(
     ylim=None,
 ):
     """
-    Interactive two-panel widget comparing two model fits across energies.
+    Interactive two-panel widget comparing an arbitrary number of model fits
+    across energies.
 
     Returns an ``ipywidgets.VBox`` containing:
 
-    * **GF panel** — chi_sq vs energy for both models (full plotly zoom/pan).
-      Open marker = better fit at that energy, same convention as
-      ``plot_material_comparison``.
+    * **GF panel** — chi_sq vs energy for every model (full plotly zoom/pan).
+      Open marker = best fit at that energy (lowest chi_sq among all models
+      compared), same convention as ``plot_material_comparison``.
     * **Energy selector** — ``SelectMultiple`` list.  Each entry is annotated
-      with which model fits better at that energy.  Ctrl/Cmd-click or
+      with which model fits best at that energy.  Ctrl/Cmd-click or
       Shift-click to select multiple energies.
     * **Reflectivity panel** — updates automatically when the selection
-      changes, showing exp data (black dots), Model A (solid line), and
-      Model B (dashed line).  Each selected energy gets its own colour.
+      changes, showing exp data (black dots) and one line per model (solid,
+      dashed, dotted, ... in call order).  Each selected energy gets its own
+      colour.
 
     Parameters
     ----------
     filepath : str or Path
     sample_name : str
     model_names : list of str
-        Exactly two model labels to compare.
+        One or more model labels to compare.
     criteria : 'best' | 'last' | int
         Run selection per energy.  Default ``'best'``.
     energy_list : list of float, optional
@@ -2301,11 +2380,10 @@ def plot_reflectivity_comparison(
 
     if isinstance(model_names, str):
         model_names = [model_names]
-    if len(model_names) != 2:
+    if len(model_names) < 1:
         raise ValueError(
-            f"plot_reflectivity_comparison requires exactly 2 model names, "
+            f"plot_reflectivity_comparison requires at least 1 model name, "
             f"got {len(model_names)}: {model_names!r}")
-    mname_A, mname_B = model_names
 
     filepath = str(_Path(filepath).expanduser())
 
@@ -2331,11 +2409,9 @@ def plot_reflectivity_comparison(
             energy_val = float(ekey)
             energy_grp = sample_grp[ekey]
             entry = {'q': None, 'R_exp': None, 'dR': None,
-                     'R_A': None, 'R_B': None,
-                     'chi_A': np.nan, 'chi_B': np.nan}
+                     'R': {}, 'chi': {}}
 
-            for mname, r_key, chi_key in [(mname_A, 'R_A', 'chi_A'),
-                                           (mname_B, 'R_B', 'chi_B')]:
+            for mname in model_names:
                 if mname not in energy_grp:
                     continue
                 model_grp = energy_grp[mname]
@@ -2383,8 +2459,8 @@ def plot_reflectivity_comparison(
                         pg['final_vary'][:],
                         q, R, dR,
                         transform=rg.attrs.get('transform', 'logY'))
-                    entry[r_key]   = obj.model(q)
-                    entry[chi_key] = float(rg.attrs.get('chi_sq_final', np.nan))
+                    entry['R'][mname]   = obj.model(q)
+                    entry['chi'][mname] = float(rg.attrs.get('chi_sq_final', np.nan))
                 except Exception as exc:
                     print(f"  Warning: could not reconstruct "
                           f"{energy_val} eV / {mname}: {exc}")
@@ -2400,68 +2476,17 @@ def plot_reflectivity_comparison(
     # persistent colour per energy index so colours stay stable across selections
     e_colors = {e: colors[i % len(colors)] for i, e in enumerate(energies)}
 
+    dash_styles = ['solid', 'dash', 'dot', 'dashdot', 'longdash', 'longdashdot']
+
     refl_w, refl_h = figsize if figsize else (700, 480)
     gf_w = refl_w + 220  # GF spans the full widget width
 
-    # ---- GF figure (always visible, full plotly interactivity) --------------
-    chi_A_arr = np.array([panel_data[e]['chi_A'] for e in energies])
-    chi_B_arr = np.array([panel_data[e]['chi_B'] for e in energies])
-
-    def _sym(base, chi_self, chi_other):
-        if np.isnan(chi_self) or np.isnan(chi_other):
-            return base
-        return f'{base}-open' if chi_self <= chi_other else base
-
-    syms_A = [_sym('circle', chi_A_arr[i], chi_B_arr[i]) for i in range(len(energies))]
-    syms_B = [_sym('square', chi_B_arr[i], chi_A_arr[i]) for i in range(len(energies))]
-
-    gf_fig = go.Figure()
-    gf_fig.add_trace(go.Scatter(
-        x=energies, y=chi_A_arr.tolist(),
-        mode='lines+markers', name=mname_A,
-        marker=dict(symbol=syms_A, color=colors[0], size=10),
-        line=dict(color=colors[0]),
-    ))
-    gf_fig.add_trace(go.Scatter(
-        x=energies, y=chi_B_arr.tolist(),
-        mode='lines+markers', name=mname_B,
-        marker=dict(symbol=syms_B, color=colors[1], size=10),
-        line=dict(color=colors[1]),
-    ))
-    gf_fig.update_layout(
-        width=gf_w, height=280,
-        title_text=(f'{sample_name}  —  {mname_A} vs {mname_B}'
-                    '  |  open marker = better fit'),
-        xaxis_title='Energy (eV)',
-        yaxis_title='χ²',
-        margin=dict(t=50, b=40),
-    )
-
-    gf_out = widgets.Output()
-    with gf_out:
-        gf_fig.show()
-
-    # ---- Energy selector ----------------------------------------------------
-    selector_options = []
-    for e in energies:
-        cA, cB = panel_data[e]['chi_A'], panel_data[e]['chi_B']
-        if np.isnan(cA) and np.isnan(cB):
-            tag = ''
-        elif np.isnan(cB) or cA <= cB:
-            tag = f'  [{mname_A}✓]'
-        else:
-            tag = f'  [{mname_B}✓]'
-        selector_options.append((f'{e:.2f} eV{tag}', e))
-
-    selector = widgets.SelectMultiple(
-        options=selector_options,
-        rows=min(18, len(energies)),
-        layout=widgets.Layout(width='210px'),
-    )
-    selector_box = widgets.VBox([
-        widgets.Label('Select energies  (Ctrl/Shift for multi):'),
-        selector,
-    ])
+    chi_arrs = {
+        mname: np.array([panel_data[e]['chi'].get(mname, np.nan) for e in energies])
+        for mname in model_names
+    }
+    gf_out, selector, selector_box = _build_gf_panel_and_selector(
+        sample_name, model_names, energies, chi_arrs, gf_w)
 
     # ---- Reflectivity output ------------------------------------------------
     refl_out = widgets.Output(
@@ -2493,19 +2518,18 @@ def plot_reflectivity_comparison(
                 fig.add_trace(go.Scatter(
                     x=q.tolist(), y=R_exp.tolist(), **exp_kw))
 
-            R_A = entry['R_A']
-            if R_A is not None:
+            for i, mname in enumerate(model_names):
+                R_model = entry['R'].get(mname)
+                if R_model is None:
+                    continue
+                dash = dash_styles[i % len(dash_styles)]
+                line_kw = dict(color=e_color, width=2)
+                if dash != 'solid':
+                    line_kw['dash'] = dash
                 fig.add_trace(go.Scatter(
-                    x=q.tolist(), y=R_A.tolist(), mode='lines',
-                    line=dict(color=e_color, width=2),
-                    name=f'{e_label} {mname_A}', legendgroup=e_label))
-
-            R_B = entry['R_B']
-            if R_B is not None:
-                fig.add_trace(go.Scatter(
-                    x=q.tolist(), y=R_B.tolist(), mode='lines',
-                    line=dict(color=e_color, width=2, dash='dash'),
-                    name=f'{e_label} {mname_B}', legendgroup=e_label))
+                    x=q.tolist(), y=R_model.tolist(), mode='lines',
+                    line=line_kw,
+                    name=f'{e_label} {mname}', legendgroup=e_label))
 
         fig.update_yaxes(type='log', title_text='R')
         fig.update_xaxes(title_text='q (Å⁻¹)')
@@ -2530,6 +2554,243 @@ def plot_reflectivity_comparison(
     return widgets.VBox([
         gf_out,
         widgets.HBox([selector_box, refl_out]),
+    ])
+
+
+def plot_sld_profile_comparison(
+    filepath,
+    sample_name,
+    model_names,
+    criteria='best',
+    energy_list=None,
+    energy_range=None,
+    figsize=None,
+    xlim=None,
+    ylim=None,
+):
+    """
+    Interactive widget comparing fitted SLD depth profiles across models and
+    energies. Parallel to ``plot_reflectivity_comparison`` (same H5 lookup,
+    same GF panel / energy selector, same per-model line-style convention),
+    but shows the fitted structure (SLD vs depth) instead of reflectivity vs
+    q. There is no measured profile to overlay -- unlike reflectivity, this
+    is a pure fit-vs-fit comparison.
+
+    Returns an ``ipywidgets.VBox`` containing:
+
+    * **GF panel** — chi_sq vs energy for every model (see
+      ``plot_reflectivity_comparison``). Open marker = best fit.
+    * **Energy selector** — ``SelectMultiple`` list, tagged with the
+      best-fitting model at that energy.
+    * **Profile panel** — updates automatically when the selection changes:
+      two stacked plots (Real SLD on top, Imag SLD below), one line per
+      model (solid, dashed, dotted, ... in call order), one colour per
+      selected energy.
+
+    Parameters
+    ----------
+    filepath : str or Path
+    sample_name : str
+    model_names : list of str
+        One or more model labels to compare.
+    criteria : 'best' | 'last' | int
+        Run selection per energy. Default ``'best'``.
+    energy_list : list of float, optional
+        Explicit energies to include. Takes precedence over *energy_range*.
+    energy_range : (emin, emax), optional
+        Inclusive energy interval. Ignored when *energy_list* is provided.
+    figsize : (width, height), optional
+        Profile panel size in pixels. Defaults to ``(700, 560)``.
+        The GF panel always spans the full width (``width + 220`` px).
+    xlim : (zmin, zmax), optional
+        Depth-axis limits (Å), applied to both SLD panels.
+    ylim : (ymin, ymax), optional
+        SLD-axis limits (10⁻⁶ Å⁻²), applied to both SLD panels.
+
+    Returns
+    -------
+    widget : ipywidgets.VBox
+        Display with the variable name alone on the last line of a Jupyter
+        cell, or call ``IPython.display.display(widget)``.
+    """
+    import ipywidgets as widgets
+    import plotly.graph_objects as go
+    import plotly.colors as pc
+    from plotly.subplots import make_subplots
+    from pathlib import Path as _Path
+    from Model_Setup import get_sld_profile
+
+    if isinstance(model_names, str):
+        model_names = [model_names]
+    if len(model_names) < 1:
+        raise ValueError(
+            f"plot_sld_profile_comparison requires at least 1 model name, "
+            f"got {len(model_names)}: {model_names!r}")
+
+    filepath = str(_Path(filepath).expanduser())
+
+    # ---- collect data from HDF5 (file closed before any plotting) ----------
+    panel_data = {}
+
+    with h5py.File(filepath, 'r') as f:
+        if sample_name not in f:
+            raise KeyError(f"Sample '{sample_name}' not found in {filepath}.")
+        sample_grp = f[sample_name]
+
+        all_keys = sorted([k for k in sample_grp.keys() if _is_energy_key(k)], key=float)
+        if energy_list is not None:
+            wanted = {str(float(e)) for e in energy_list}
+            energy_keys = [k for k in all_keys if k in wanted]
+        elif energy_range is not None:
+            emin, emax = float(energy_range[0]), float(energy_range[1])
+            energy_keys = [k for k in all_keys if emin <= float(k) <= emax]
+        else:
+            energy_keys = all_keys
+
+        for ekey in energy_keys:
+            energy_val = float(ekey)
+            energy_grp = sample_grp[ekey]
+            entry = {'z_real': {}, 'sld_real': {}, 'z_imag': {}, 'sld_imag': {}, 'chi': {}}
+
+            for mname in model_names:
+                if mname not in energy_grp:
+                    continue
+                model_grp = energy_grp[mname]
+
+                run_keys = sorted(
+                    [k for k in model_grp.keys() if k.startswith('run_')],
+                    key=lambda k: int(k.split('_')[1]))
+                if not run_keys:
+                    continue
+
+                if criteria == 'best':
+                    rkey = min(
+                        run_keys,
+                        key=lambda k: model_grp[k].attrs.get('chi_sq_final', np.inf))
+                elif criteria == 'last':
+                    rkey = run_keys[-1]
+                elif isinstance(criteria, int):
+                    rkey = f'run_{criteria}'
+                    if rkey not in model_grp:
+                        continue
+                else:
+                    raise ValueError(
+                        f"criteria must be 'best', 'last', or int — got {criteria!r}")
+
+                rg = model_grp[rkey]
+                pg = rg['parameters']
+                dg = rg['data']
+                q  = dg['q'][:]
+                R  = dg['R'][:]
+                dR = dg['dR'][:] if 'dR' in dg else None
+
+                try:
+                    obj, structure = _reconstruct_objective(
+                        _decode_strings(rg['layer_names'][:]),
+                        rg['structure_slabs_final'][:],
+                        _decode_strings(pg['names'][:]),
+                        pg['final_values'][:],
+                        pg['final_lb'][:],
+                        pg['final_ub'][:],
+                        pg['final_vary'][:],
+                        q, R, dR,
+                        transform=rg.attrs.get('transform', 'logY'))
+                    z_real, sld_real, z_imag, sld_imag = get_sld_profile(structure)
+                    entry['z_real'][mname]   = z_real
+                    entry['sld_real'][mname] = sld_real
+                    entry['z_imag'][mname]   = z_imag
+                    entry['sld_imag'][mname] = sld_imag
+                    entry['chi'][mname]      = float(rg.attrs.get('chi_sq_final', np.nan))
+                except Exception as exc:
+                    print(f"  Warning: could not reconstruct "
+                          f"{energy_val} eV / {mname}: {exc}")
+
+            if entry['chi']:
+                panel_data[energy_val] = entry
+
+    if not panel_data:
+        raise ValueError("No data found for the specified energies / models.")
+
+    energies = sorted(panel_data.keys())
+    colors   = pc.qualitative.Plotly
+    # persistent colour per energy index so colours stay stable across selections
+    e_colors = {e: colors[i % len(colors)] for i, e in enumerate(energies)}
+
+    dash_styles = ['solid', 'dash', 'dot', 'dashdot', 'longdash', 'longdashdot']
+
+    prof_w, prof_h = figsize if figsize else (700, 560)
+    gf_w = prof_w + 220  # GF spans the full widget width
+
+    chi_arrs = {
+        mname: np.array([panel_data[e]['chi'].get(mname, np.nan) for e in energies])
+        for mname in model_names
+    }
+    gf_out, selector, selector_box = _build_gf_panel_and_selector(
+        sample_name, model_names, energies, chi_arrs, gf_w)
+
+    # ---- Profile output -------------------------------------------------
+    prof_out = widgets.Output(
+        layout=widgets.Layout(width=f'{prof_w + 20}px'))
+
+    def _make_profile_fig(selected):
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=['Real SLD', 'Imag SLD'],
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+        )
+        for energy in sorted(selected):
+            entry   = panel_data[energy]
+            e_color = e_colors[energy]
+            e_label = f'{energy:.2f} eV'
+
+            for i, mname in enumerate(model_names):
+                z_real = entry['z_real'].get(mname)
+                if z_real is None:
+                    continue
+                dash = dash_styles[i % len(dash_styles)]
+                line_kw = dict(color=e_color, width=2)
+                if dash != 'solid':
+                    line_kw['dash'] = dash
+
+                fig.add_trace(go.Scatter(
+                    x=z_real.tolist(), y=entry['sld_real'][mname].tolist(),
+                    mode='lines', line=line_kw,
+                    name=f'{e_label} {mname}', legendgroup=e_label,
+                    legendgrouptitle_text=e_label, showlegend=True,
+                ), row=1, col=1)
+
+                z_imag = entry['z_imag'][mname]
+                fig.add_trace(go.Scatter(
+                    x=z_imag.tolist(), y=entry['sld_imag'][mname].tolist(),
+                    mode='lines', line=line_kw,
+                    name=f'{e_label} {mname}', legendgroup=e_label,
+                    showlegend=False,
+                ), row=2, col=1)
+
+        fig.update_yaxes(title_text='Real SLD (10⁻⁶ Å⁻²)', row=1, col=1)
+        fig.update_yaxes(title_text='Imag SLD (10⁻⁶ Å⁻²)', row=2, col=1)
+        fig.update_xaxes(title_text='z (Å)', row=2, col=1)
+        fig.update_layout(width=prof_w, height=prof_h,
+                          legend=dict(groupclick='toggleitem'),
+                          margin=dict(t=40))
+        if xlim is not None:
+            fig.update_xaxes(range=list(xlim))
+        if ylim is not None:
+            fig.update_yaxes(range=list(ylim))
+        return fig
+
+    def _on_select(change):
+        with prof_out:
+            prof_out.clear_output(wait=True)
+            if selector.value:
+                _make_profile_fig(selector.value).show()
+
+    selector.observe(_on_select, names='value')
+
+    return widgets.VBox([
+        gf_out,
+        widgets.HBox([selector_box, prof_out]),
     ])
 
 

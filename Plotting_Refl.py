@@ -389,16 +389,35 @@ def save_jaxns(path, result):
         run_seconds      = np.array([result.run_seconds]))
 
 
+def _jaxns_summary(samples, param_names):
+    """Mirrors NestedSamplingResult.summary() in gpu_nested_sampler.py, computed from reloaded samples."""
+    rows = []
+    for i, name in enumerate(param_names):
+        col = samples[:, i]
+        rows.append({
+            'param':  name,
+            'mean':   float(np.mean(col)),
+            'std':    float(np.std(col)),
+            '2.5%':   float(np.percentile(col, 2.5)),
+            'median': float(np.median(col)),
+            '97.5%':  float(np.percentile(col, 97.5)),
+        })
+    return pd.DataFrame(rows).set_index('param')
+
+
 def load_jaxns(path):
     """Reload a JAXNS result saved by save_jaxns."""
     d = np.load(path, allow_pickle=True)
+    samples = d['samples']
+    param_names = list(d['param_names'])
     return SimpleNamespace(
-        samples=d['samples'], log_L_samples=d['log_L_samples'],
+        samples=samples, log_L_samples=d['log_L_samples'],
         log_Z_mean=float(d['log_Z_mean'][0]), log_Z_std=float(d['log_Z_std'][0]),
         ESS=float(d['ESS'][0]), H_mean=float(d['H_mean'][0]),
         posterior_mean=d['posterior_mean'], posterior_std=d['posterior_std'],
-        posterior_median=d['posterior_median'], param_names=list(d['param_names']),
-        run_seconds=float(d['run_seconds'][0]))
+        posterior_median=d['posterior_median'], param_names=param_names,
+        run_seconds=float(d['run_seconds'][0]),
+        summary=lambda: _jaxns_summary(samples, param_names))
 
 
 # ---------------------------------------------------------------------------
