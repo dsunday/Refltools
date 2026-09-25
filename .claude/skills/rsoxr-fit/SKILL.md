@@ -62,6 +62,8 @@ Any older notebook h5 can be read by plot/fits/nuts/jaxns commands via
 | "thickness of SOC vs energy" | `plot param -p P --param "SOC - thick" --models ...` |
 | "depth profiles" | `plot profiles -p P --models ... [--energies ...] [--ref SOG SOC]` |
 | "save/export Model3's SOG SLD (to seed the next sample)" | `export-sld -p P --model Model3 --layer SOG [--register-as SOG_B9M3]` |
+| "fit the stoichiometry / density of SOG (from Model3's fit / a CSV)" | Register a search: `p.add_stoich(name=, source=, atoms=[...], counts=[...], density_range=(lo, hi), merge_points=, energy_mask=)` — source = material name \| `"Model3:SOG"` (fitted layer SLD) \| CSV path; counts entries int (fixed) \| `[lo, hi]` \| `[lo, hi, step]`. Fragment search: `mode="fragments", fragments=["SiO2", "CH3"], counts=[...]`. State the candidate count (`p.get_stoich(n).n_candidates()`, ~40 s per 1600 on 40 workers), then `stoich run NAME [NAME2] -p P [--workers N] --detach`; `stoich list` / `stoich show NAME`. Fix one count (or use a fixed fragment) — formulas differing by an overall factor have identical cost. Best density is refined within ±`refine_density` (default 0.1). |
+| "stoichiometry plots" | `plot stoich-results --name N` (top-N bars + KK real/imag), `stoich-density` (RMSE vs ρ), `stoich-counts [--baseline C=40 ...]` (RMSE vs each count/multiplier, others at best), `stoich-overlay --name N [--sim FORMULA:RHO ...]` or `--source S --sim ...` (simulate without fitting). Results in `<project>/stoich/<name>/` (results.csv, best.json, best_kk_sld.csv = KK-consistent SLD of the best formula, registrable as a material). |
 | "run JAXNS / NUTS on Model3 at 285–290" | confirm (time!), `run jaxns\|nuts -p P --model Model3 --erange 285 290 --gpu N --detach` |
 | "uncertainty results / evidence" | `unc -p P --models ...`; plots `uncertainty`, `posterior`, `evidence`, `corner` |
 
@@ -136,7 +138,7 @@ only the starting table is shared otherwise — say so.
 ## Not implemented yet (milestone M6)
 
 Global-fit JAXNS/NUTS (M6 step 2 — `run jaxns` on a linked model is not yet
-global), linking SLD across energies, stoichiometric fitting (`kk_stoichiometry_fit.py`),
+global), linking SLD across energies, multi-edge stoichiometry (independent/stitched KK across edges),
 Kramers–Kronig-constrained fitting, intensity-vs-energy scans. Say so and offer
 to do it with the underlying Refltools functions directly.
 

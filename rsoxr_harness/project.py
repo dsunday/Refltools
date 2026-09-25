@@ -340,6 +340,58 @@ class FitProject:
                         overwrite=overwrite, seed_from=parent, seed_criteria=criteria)
         return r, report
 
+    # ------------------------------------------------------------------
+    # KK stoichiometry searches
+    # ------------------------------------------------------------------
+    def stoich_dir(self, name):
+        return os.path.join(self.path, "stoich", name)
+
+    @property
+    def stoich_names(self):
+        return list(self.cfg.get("stoich", {}))
+
+    def add_stoich(self, spec=None, overwrite=False, **kw):
+        """
+        Register a stoichiometry search (StoichSpec or its fields).  The SLD
+        source is checked now; the search runs as a CPU job
+        (`run stoich --name N`).
+        """
+        from . import stoich as S
+        spec = spec if isinstance(spec, S.StoichSpec) else S.StoichSpec(**(spec or kw))
+        cur = self.cfg.setdefault("stoich", {})
+        if spec.name in cur and not overwrite:
+            if cur[spec.name] == spec.to_json():
+                return spec
+            raise ProjectError(f"stoich '{spec.name}' exists (overwrite=True to replace)")
+        sld, _ = S.resolve_source(self, spec.source, spec.criteria)     # fail early
+        mp = spec.merge_points or [sld[0, 0], sld[-1, 0]]
+        if len(S._restrict(sld, mp)) < 5:
+            raise ProjectError(f"stoich '{spec.name}': fewer than 5 SLD points inside "
+                               f"merge_points {mp}")
+        cur[spec.name] = spec.to_json()
+        self.save()
+        return spec
+
+    def get_stoich(self, name):
+        from . import stoich as S
+        try:
+            return S.StoichSpec.from_json(self.cfg["stoich"][name])
+        except KeyError:
+            raise ProjectError(f"no stoich '{name}'; known: {self.stoich_names}") from None
+
+    def stoich_table(self):
+        from . import stoich as S
+        rows = [("name", "mode", "source", "candidates", "best", "ρ", "RMSE")]
+        for n in self.stoich_names:
+            sp = self.get_stoich(n)
+            best = ("-", "-", "-")
+            if os.path.exists(os.path.join(self.stoich_dir(n), "best.json")):
+                b = S.final_best(S.load_result(self.stoich_dir(n))[0])
+                best = (b["formula"], f"{b['density']:.4f}", f"{b['rmse']:.4f}")
+            rows.append((n, sp.mode, sp.source, str(sp.n_candidates()), *best))
+        w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+        return "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(r)) for r in rows)
+
     def edit_model(self, name, ops):
         """Apply ops to an existing model in place (only while it has no fits)."""
         if self.has_fits(name):

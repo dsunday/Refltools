@@ -25,6 +25,8 @@ def run_job(project_path, job_id):
             outputs = _run_fit(project, job)
         elif job["kind"] in ("nuts", "jaxns"):
             outputs = _run_sampling(project, job)
+        elif job["kind"] == "stoich":
+            outputs = _run_stoich(project, job)
         else:
             raise ValueError(f"unknown job kind '{job['kind']}'")
     except BaseException as exc:          # includes KeyboardInterrupt / SIGTERM
@@ -106,8 +108,8 @@ def _run_fit(project, job):
 def global_cmaes(builder, x0, popsize, n_generations, seed=0, tol=1e-4,
                  patience=5, check_every=10, n_restarts=1, verbose=True):
     """
-    Sep-CMA-ES over a GlobalModelsBatchBuilder's parameter vector (same loop
-    as the LAMS7 global notebooks).  Restart 0 starts at x0; later restarts
+    Sep-CMA-ES over a global fitness's parameter vector (FastGlobalFitness;
+    same loop as the LAMS7 global notebooks).  Restart 0 starts at x0; later restarts
     start uniformly inside the bounds.  Returns (best_x, best_chi2, info).
     """
     import jax
@@ -165,7 +167,8 @@ def _run_global_fit(project, job, recipe):
     """One energy-linked CMA-ES fit; saved per energy under one run index."""
     import h5py
     import numpy as np
-    from gpu_reflect import GlobalModelsBatchBuilder, set_global_params
+    from gpu_reflect import set_global_params
+    from .gpu_global import FastGlobalFitness
     from h5io import save_batch_to_h5
 
     p = job["params"]
@@ -182,7 +185,7 @@ def _run_global_fit(project, job, recipe):
     originals = {e: copy.deepcopy(o) for e, o in zip(elist, objs)}
     chi0 = {e: float(o.chisqr()) for e, o in zip(elist, objs)}
     x0 = np.array([q.value for q in gobj.varying_parameters()])
-    builder = GlobalModelsBatchBuilder(g, normalize_by_n_q=p.get("normalize", False))
+    builder = FastGlobalFitness(g, normalize_by_n_q=p.get("normalize", False))
     c_start = float(builder.fitness(x0[None, :])[0])
 
     t0 = time.time()
@@ -354,4 +357,29 @@ def _run_sampling(project, job):
         print(f"[harness] {method} {model} {e:g} eV done in {elapsed:.0f}s: "
               + ", ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
                           for k, v in stats.items()), flush=True)
+    return outputs
+
+
+# ---------------------------------------------------------------------------
+# KK stoichiometry search (CPU, process pool)
+# ---------------------------------------------------------------------------
+
+def _run_stoich(project, job):
+    from . import stoich as S
+    outputs = {}
+    for name in job["models"]:
+        spec = project.get_stoich(name)
+        if job["params"].get("n_workers"):
+            spec.n_workers = job["params"]["n_workers"]
+        sld, prov = S.resolve_source(project, spec.source, spec.criteria)
+        print(f"\n[harness] stoich {spec.describe()}", flush=True)
+        print(f"[harness] source: {prov}", flush=True)
+        summ = S.run_search(spec, sld, project.stoich_dir(name), prov, verbose=True)
+        b = S.final_best(summ)
+        outputs[name] = {"best": b, "n_candidates": summ["n_candidates"],
+                         "search_sec": summ["search_sec"]}
+        J.update_job(project, job["id"], outputs=outputs)
+        print(f"[harness] stoich {name}: best {b['formula']}  ρ={b['density']:.4f} g/cm³  "
+              f"RMSE={b['rmse']:.5f}  ({summ['n_candidates']} candidates, "
+              f"{summ['search_sec']:.0f}s)", flush=True)
     return outputs

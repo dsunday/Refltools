@@ -555,6 +555,68 @@ def test_global_build_and_fit():
     assert np.isclose(bs["checks"]["chi2_total"], tot, rtol=1e-6)
 
 
+def _stoich_table(path, formula="C8H8", density=1.05):
+    """KK-self-consistent [E, Re, Im] table for a known formula/density."""
+    from Model_Setup import generate_sld_array_from_material
+    from rsoxr_harness.stoich import kk_sld
+    E = np.arange(270.0, 331.0, 1.0)
+    base = generate_sld_array_from_material(formula, density, E)
+    tab = kk_sld(base, formula, density, [270.0, 330.0])
+    tab = tab[np.isin(np.round(tab[:, 0], 6), np.round(E, 6))]
+    np.savetxt(path, tab, delimiter=",", header="Energy_eV,Real_SLD,Imag_SLD", comments="")
+    return tab
+
+
+def test_stoich_spec():
+    from rsoxr_harness.stoich import StoichSpec
+    sp = StoichSpec(name="a", source="x.csv", atoms=["C", "H"], counts=[8, [4, 12, 2]],
+                    density_range=(0.8, 1.5))
+    assert sp.n_candidates() == 5 and sp.counts == [8, [4, 12, 2]]
+    assert StoichSpec.from_json(json.loads(json.dumps(sp.to_json()))).to_json() == sp.to_json()
+    fr = StoichSpec(name="f", source="x.csv", mode="fragments", fragments=["C8H8", "CH2"],
+                    counts=[1, [0, 3]], density_range=(0.8, 1.5))
+    assert fr.n_candidates() == 4
+    _raises(ValueError, StoichSpec, name="b", source="x", atoms=["C"], counts=[1, 2])
+    _raises(ValueError, StoichSpec, name="b", source="x", atoms=["C"], counts=[[5, 2]])
+    _raises(ValueError, StoichSpec, name="b", source="x", mode="fragments", counts=[1])
+    _raises(ValueError, StoichSpec, name="b", source="x", atoms=["C"], counts=[1],
+            density_range=(2, 1))
+
+
+def test_stoich_search_job_and_plots():
+    from rsoxr_harness.__main__ import main
+    from rsoxr_harness import plots as P, stoich as S
+    p = synthetic()
+    csv = os.path.join(p.path, "ps_true.csv")
+    tab = _stoich_table(csv)
+    p.add_stoich(name="ps_atoms", source=csv, atoms=["C", "H"], counts=[8, [4, 12, 2]],
+                 density_range=(0.8, 1.5), n_workers=4, overwrite=True)
+    p.add_stoich(name="ps_frag", source=csv, mode="fragments", fragments=["C8H8", "CH2"],
+                 counts=[1, [0, 3]], density_range=(0.8, 1.5), n_workers=4, overwrite=True)
+    assert main(["stoich", "run", "ps_atoms", "ps_frag", "-p", p.path]) == 0
+    sa = S.load_result(p.stoich_dir("ps_atoms"))[0]
+    b = S.final_best(sa)
+    assert b["formula"] == "C8H8" and abs(b["density"] - 1.05) < 2e-3 and b["rmse"] < 1e-3, b
+    assert sa["best"]["counts"] == {"C": 8, "H": 8}
+    sf = S.final_best(S.load_result(p.stoich_dir("ps_frag"))[0])
+    assert sf["formula"] in ("C8H8", "H8C8") and abs(sf["density"] - 1.05) < 2e-3, sf
+    assert "C8H8" in p.stoich_table()
+    assert main(["stoich", "show", "ps_atoms", "-p", p.path]) == 0
+    # simulation without fitting reproduces the table
+    assert S.rmse_for(tab, "C8H8", 1.05, [270, 330]) < 1e-3
+    assert S.rmse_for(tab, "C8H12", 1.05, [270, 330]) > 10 * S.rmse_for(tab, "C8H8", 1.05, [270, 330])
+    for path in (P.plot_stoich_results(p, "ps_atoms"),
+                 P.plot_stoich_density(p, "ps_atoms"),
+                 P.plot_stoich_counts(p, "ps_atoms"),
+                 P.plot_stoich_counts(p, "ps_frag"),
+                 P.plot_stoich_overlay(p, "ps_atoms", formulas=[("C8H10", 1.0)]),
+                 P.plot_stoich_overlay(p, source=csv, formulas=[("C8H8", 1.05)])):
+        _png_ok(path)
+    assert main(["plot", "stoich-overlay", "-p", p.path, "--name", "ps_atoms",
+                 "--sim", "C8H12:1.1"]) == 0
+    _raises(ProjectError, p.get_stoich, "nope")
+
+
 def _png_ok(path):
     assert os.path.exists(path) and os.path.getsize(path) > 5000, path
     with open(path, "rb") as fh:

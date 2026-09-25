@@ -662,3 +662,129 @@ def plot_materials(project, names=None, erange=None, mark_energies=True,
     return _save(project, fig, "materials", names,
                  dict(names=names, erange=[lo, hi], model=model,
                       sources={n: project.cfg["materials"][n] for n in names}), out)
+
+
+# ---------------------------------------------------------------------------
+# KK stoichiometry (wraps kk_stoichiometry_fit)
+# ---------------------------------------------------------------------------
+
+def _stoich(project, name):
+    from . import stoich as S
+    d = project.stoich_dir(name)
+    if not os.path.exists(os.path.join(d, "best.json")):
+        raise KeyError(f"stoich '{name}' has no results yet (run it first)")
+    return S.load_result(d)
+
+
+def plot_stoich_results(project, name, top_n=10, out=None):
+    """Top-N candidates: RMSE bars + KK(imag→real) real/imag vs the fitted SLD."""
+    import kk_stoichiometry_fit as K
+    summary, sp, df, sld = _stoich(project, name)
+    top = min(top_n, len(df))
+    with _quiet():
+        fig, axes = K.plot_stoichiometry_fit_results(
+            df, sld, summary["best"], merge_points=summary["merge_points"],
+            energy_mask=summary["energy_mask"], top_n=top, figsize=(20, 5))
+    fig.suptitle(f"{project.sample_name}: stoich '{name}' ({sp['mode']}) on "
+                 f"{sp['source']}", y=1.02)
+    return _save(project, fig, "stoich-results", [name], dict(name=name, top_n=top), out)
+
+
+def plot_stoich_density(project, name, formula=None, n_points=60, out=None):
+    """RMSE vs density for the best (or a given) formula."""
+    import kk_stoichiometry_fit as K
+    from . import stoich as S
+    summary, sp, df, sld = _stoich(project, name)
+    b = S.final_best(summary)
+    formula = formula or b["formula"]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    with _quiet():
+        d, r = K.scan_density_cost_surface(
+            sld, formula=formula, density_range=tuple(sp["density_range"]),
+            merge_points=summary["merge_points"], energy_mask=summary["energy_mask"],
+            n_points=n_points, ax=ax)
+    fig.tight_layout()
+    return _save(project, fig, "stoich-density", [name],
+                 dict(name=name, formula=formula), out)
+
+
+def plot_stoich_counts(project, name, baseline=None, out=None):
+    """
+    RMSE vs each atom count / fragment multiplier (others held at the best
+    result, or at `baseline` {name: count}), density re-optimised per point.
+    """
+    import kk_stoichiometry_fit as K
+    summary, sp, df, sld = _stoich(project, name)
+    names = sp["atoms"] if sp["mode"] == "atoms" else sp["fragments"]
+    base = dict(summary["best"]["counts"])
+    base.update(baseline or {})
+    fixed = [int(base[n]) for n in names]
+    # single-value ranges ([1, 1]) are fixed: no panel
+    ranges = [c if isinstance(c, int) else (int(c[0]) if c[0] == c[1] else tuple(c))
+              for c in sp["counts"]]
+    kw = dict(fixed_counts=fixed, count_ranges=ranges,
+              density_range=tuple(sp["density_range"]),
+              merge_points=summary["merge_points"], energy_mask=summary["energy_mask"])
+    with _quiet():
+        if sp["mode"] == "atoms":
+            res, fig, axes = K.scan_all_atom_count_surfaces(sld, atoms=names, **kw)
+        else:
+            res, fig, axes = K.scan_all_fragment_count_surfaces(sld, fragments=names, **kw)
+    for ax, (n, (c, r, _)) in zip(axes, res.items()):
+        ax.axvline(base[n], color="0.4", ls=":", lw=1)
+    fig.suptitle(f"stoich '{name}': cost vs count (others fixed at "
+                 + ", ".join(f"{n}={base[n]}" for n in names) + ")", y=1.02)
+    return _save(project, fig, "stoich-counts", [name],
+                 dict(name=name, baseline=base), out)
+
+
+def plot_stoich_overlay(project, name=None, formulas=None, source=None,
+                        merge_points=None, energy_mask=None, out=None):
+    """
+    KK-derived real/imag SLD of one or more formula/density pairs vs the
+    fitted SLD.  name=<stoich run> uses its data and (by default) its best
+    result; formulas=[(formula, density), ...] adds/simulates others (no
+    fitting).  Without a run, pass source= (material, Model:Layer or CSV).
+    """
+    from . import stoich as S
+    if name is not None:
+        summary, sp, df, sld = _stoich(project, name)
+        mp = merge_points or summary["merge_points"]
+        mask = energy_mask or summary["energy_mask"]
+        b = S.final_best(summary)
+        pairs = [(b["formula"], b["density"])] + list(formulas or [])
+        title = f"stoich '{name}' on {sp['source']}"
+    else:
+        if source is None or not formulas:
+            raise ValueError("overlay needs name= or source= + formulas=")
+        sld, _ = S.resolve_source(project, source)
+        mp = merge_points or [float(sld[:, 0].min()), float(sld[:, 0].max())]
+        sld = S._restrict(sld, mp)
+        mask = energy_mask
+        pairs = list(formulas)
+        title = f"KK simulation vs {source}"
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    for ax, col in zip(axes, (1, 2)):
+        ax.plot(sld[:, 0], sld[:, col], "o", mfc="none", mec="k", mew=1.3, ms=6,
+                label="fitted SLD", zorder=5)
+    for i, (f, rho) in enumerate(pairs):
+        kk = S.kk_sld(sld, f, float(rho), mp)
+        rm = S.rmse_for(sld, f, float(rho), mp, mask)
+        for ax, col in zip(axes, (1, 2)):
+            ax.plot(kk[:, 0], kk[:, col], color=colors[i % len(colors)],
+                    lw=2.2 if i == 0 else 1.4,
+                    label=f"{f}  ρ={float(rho):.3f}  RMSE={rm:.4f}")
+    for ax, comp in zip(axes, ("Real", "Imag")):
+        if mask:
+            ax.axvspan(*mask, alpha=0.07, color="grey")
+        ax.set_xlabel("Energy (eV)")
+        ax.set_ylabel(f"{comp} SLD (10⁻⁶ Å⁻²)")
+        ax.set_title(f"{comp} SLD — KK vs fit")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+    fig.suptitle(f"{project.sample_name}: {title}", y=1.0)
+    fig.tight_layout()
+    return _save(project, fig, "stoich-overlay", [name or "sim"],
+                 dict(name=name, source=source,
+                      formulas=[[f, float(r)] for f, r in pairs]), out)

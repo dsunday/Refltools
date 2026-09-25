@@ -171,6 +171,53 @@ def cmd_run(a):
     return 0 if job["status"] == "done" else 1
 
 
+def cmd_stoich(a):
+    from . import jobs as J
+    from . import stoich as S
+    p = _proj(a)
+    if a.action == "list":
+        print(p.stoich_table() if p.stoich_names else "(no stoich searches)")
+        return 0
+    if not a.name:
+        raise SystemExit(f"stoich {a.action} needs a NAME")
+    if a.action == "show":
+        for n in a.name:
+            sp = p.get_stoich(n)
+            print(sp.describe())
+            d = p.stoich_dir(n)
+            if os.path.exists(os.path.join(d, "best.json")):
+                summ, _, df, _ = S.load_result(d)
+                b = summ["best"]
+                print(f"  source: {summ['provenance']}")
+                print(f"  search best: {b['formula']}  ρ={b['density']:.4f}  RMSE={b['rmse']:.5f}")
+                if summ.get("refined"):
+                    r = summ["refined"]
+                    print(f"  refined ρ:   {r['density']:.5f} in {r['density_window']}  "
+                          f"RMSE={r['rmse']:.5f}")
+                print(df.head(a.top).to_string(index=False, float_format="{:.4f}".format))
+            else:
+                print("  (not run yet)")
+            print()
+        return 0
+    # run
+    for n in a.name:
+        p.get_stoich(n)
+    params = {"n_workers": a.workers}
+    job = J.new_job(p, "stoich", list(a.name), [], params, "cpu")
+    print(f"job {job['id']}: stoich {' '.join(a.name)}  ("
+          + ", ".join(f"{n}: {p.get_stoich(n).n_candidates()} candidates" for n in a.name)
+          + ")")
+    print(f"log: {job['log']}")
+    proc = J.launch(p, job, detach=a.detach)
+    if a.detach:
+        print(f"launched pid {proc.pid}; check with: python -m rsoxr_harness "
+              f"status -p {p.path}")
+        return 0
+    job = J.read_job(p, job["id"])
+    print(f"\njob {job['id']}: {job['status']}")
+    return 0 if job["status"] == "done" else 1
+
+
 def cmd_unc(a):
     import pandas as pd
     from . import analysis as A
@@ -256,6 +303,25 @@ def cmd_plot(a):
     elif k == "profiles":
         path = P.plot_sld_profiles(p, a.models, references=a.ref or (),
                                    profile_xlim=a.xlim, **sel, **common)
+    elif k.startswith("stoich-"):
+        sims = []
+        for x in a.sim or []:
+            f_, r_ = x.rsplit(":", 1)
+            sims.append((f_, float(r_)))
+        if k == "stoich-overlay":
+            path = P.plot_stoich_overlay(p, a.name, formulas=sims, source=a.source,
+                                         energy_mask=a.erange, out=a.out)
+        elif not a.name:
+            raise SystemExit(f"plot {k} needs --name")
+        elif k == "stoich-results":
+            path = P.plot_stoich_results(p, a.name, top_n=a.top, out=a.out)
+        elif k == "stoich-density":
+            path = P.plot_stoich_density(p, a.name, formula=a.formula, out=a.out)
+        else:
+            base = None
+            if a.baseline:
+                base = {kv.split("=")[0]: int(kv.split("=")[1]) for kv in a.baseline}
+            path = P.plot_stoich_counts(p, a.name, baseline=base, out=a.out)
     elif k == "materials":
         path = P.plot_materials(p, a.names, erange=a.erange,
                                 model=a.models[0] if a.models else None, out=a.out)
@@ -371,6 +437,13 @@ def main(argv=None):
     s.add_argument("--detach", action="store_true",
                    help="return immediately (otherwise stream the log and wait)")
 
+    s = add("stoich", cmd_stoich, "KK stoichiometry searches: list | show | run")
+    s.add_argument("action", choices=["list", "show", "run"])
+    s.add_argument("name", nargs="*")
+    s.add_argument("--workers", type=int, help="process-pool size (default: all CPUs)")
+    s.add_argument("--top", type=int, default=10)
+    s.add_argument("--detach", action="store_true")
+
     s = add("unc", cmd_unc, "summarise cached NUTS/JAXNS results")
     s.add_argument("--models", "--model", nargs="+", required=True)
     s.add_argument("--h5")
@@ -395,7 +468,17 @@ def main(argv=None):
     s = add("plot", cmd_plot, "make a figure (PNG path is printed)")
     s.add_argument("what", choices=["chi2", "chi2-energy", "sld-energy", "param",
                                     "refl", "profiles", "uncertainty", "posterior",
-                                    "evidence", "corner", "materials"])
+                                    "evidence", "corner", "materials",
+                                    "stoich-results", "stoich-density", "stoich-counts",
+                                    "stoich-overlay"])
+    s.add_argument("--name", help="stoich search name")
+    s.add_argument("--formula", help="stoich-density: formula (default: best)")
+    s.add_argument("--sim", nargs="+", metavar="FORMULA:RHO",
+                   help="stoich-overlay: extra/simulated formula:density pairs")
+    s.add_argument("--source", help="stoich-overlay without a run: material, Model:Layer or CSV")
+    s.add_argument("--baseline", nargs="+", metavar="NAME=COUNT",
+                   help="stoich-counts: hold these counts instead of the best")
+    s.add_argument("--top", type=int, default=10)
     s.add_argument("--method", default="jaxns", choices=["jaxns", "nuts"])
     s.add_argument("--names", nargs="+", help="materials to plot (plot materials)")
     s.add_argument("--models", "--model", nargs="+")
