@@ -89,37 +89,6 @@ def _mse(predicted, observed):
     return np.mean((predicted[mask] - observed[mask]) ** 2)
 
 
-def _mask_windows(energy_mask):
-    """
-    energy_mask → list of (lo, hi) windows, or None.  Accepts one window
-    (lo, hi) or several [(lo1, hi1), (lo2, hi2), ...] (their union), e.g.
-    pre- and post-edge only: [(270, 284), (310, 330)].
-    """
-    if energy_mask is None:
-        return None
-    em = list(energy_mask)
-    if em and np.ndim(em[0]) == 0:
-        return [(float(em[0]), float(em[1]))]
-    return [(float(lo), float(hi)) for lo, hi in em]
-
-
-def _energy_mask_bool(energies, energy_mask):
-    """Boolean array: energies inside any window of energy_mask (all if None)."""
-    energies = np.asarray(energies)
-    wins = _mask_windows(energy_mask)
-    if wins is None:
-        return np.ones(len(energies), dtype=bool)
-    m = np.zeros(len(energies), dtype=bool)
-    for lo, hi in wins:
-        m |= (energies >= lo) & (energies <= hi)
-    return m
-
-
-def _mask_label(energy_mask):
-    wins = _mask_windows(energy_mask)
-    return "all" if wins is None else " ∪ ".join(f"{lo:g}–{hi:g}" for lo, hi in wins)
-
-
 def _interp_onto(source_E, source_vals, target_E):
     """Linear interpolation with NaN outside source range."""
     if (target_E.min() < source_E.min() or target_E.max() > source_E.max()):
@@ -653,10 +622,11 @@ def _prepare_fit_data(sld_3col, energy_mask):
     imag_sld_all = sld_sorted[:, 2]
 
     if energy_mask is not None:
-        mask = _energy_mask_bool(energies_all, energy_mask)
+        e_lo, e_hi = energy_mask
+        mask = (energies_all >= e_lo) & (energies_all <= e_hi)
         if mask.sum() == 0:
             raise ValueError(
-                f"energy_mask {_mask_label(energy_mask)} eV excludes all data points. "
+                f"energy_mask ({e_lo}, {e_hi}) excludes all data points. "
                 f"Data range: {energies_all.min():.1f}–{energies_all.max():.1f} eV")
         energies_fit = energies_all[mask]
         real_sld_fit = real_sld_all[mask]
@@ -793,7 +763,7 @@ def fit_stoichiometry_density(
         print(f"  Density range              : {density_range[0]:.2f}–{density_range[1]:.2f} g/cm³")
         print(f"  Cost function              : 0.5·MSE(real) + 0.5·MSE(imag)  [imag→real KK]")
         print(f"  Residual energy points     : {len(energies_fit)}"
-              + (f"  [{_mask_label(energy_mask)} eV]" if energy_mask else ""))
+              + (f"  [{energies_fit.min():.1f}–{energies_fit.max():.1f} eV]" if energy_mask else ""))
         print(f"  Workers                    : {min(n_cpu, n_combos)}\n")
 
     worker_args = [
@@ -879,7 +849,7 @@ def fit_stoichiometry_density_bidirectional(
         print(f"    MSE_fwd: imag_fit → KK(kkcalc) → real_kk  vs  real_fit")
         print(f"    MSE_rev: real_fit → KK⁻¹(Hilbert) → imag_kk  vs  imag_fit")
         print(f"  Residual energy points     : {len(energies_fit)}"
-              + (f"  [{_mask_label(energy_mask)} eV]" if energy_mask else ""))
+              + (f"  [{energies_fit.min():.1f}–{energies_fit.max():.1f} eV]" if energy_mask else ""))
         print(f"  Workers                    : {min(n_cpu, n_combos)}\n")
 
     worker_args = [
@@ -977,9 +947,7 @@ def plot_stoichiometry_fit_results(
 
     if energy_mask is not None:
         for ax in (ax_real, ax_imag):
-            for _k, (_lo, _hi) in enumerate(_mask_windows(energy_mask)):
-                ax.axvspan(_lo, _hi, alpha=0.07, color='grey',
-                           label='Fit region' if _k == 0 else None)
+            ax.axvspan(*energy_mask, alpha=0.07, color='grey', label='Fit region')
 
     for ax, title in [(ax_real, 'Real SLD — KK(imag→real) vs fit'),
                       (ax_imag, 'Imag SLD — KK(imag→real) vs fit')]:
@@ -1107,9 +1075,7 @@ def plot_stoichiometry_fit_results_bidirectional(
     # Shade energy mask
     if energy_mask is not None:
         for ax in (ax_fwd_real, ax_fwd_imag, ax_rev_imag, ax_rev_real):
-            for _k, (_lo, _hi) in enumerate(_mask_windows(energy_mask)):
-                ax.axvspan(_lo, _hi, alpha=0.07, color='grey',
-                           label='Fit region' if _k == 0 else None)
+            ax.axvspan(*energy_mask, alpha=0.07, color='grey', label='Fit region')
 
     titles = [
         (ax_fwd_real, 'Forward KK: real (predicted) vs real (fit)'),
@@ -1341,7 +1307,7 @@ def fit_stoichiometry_density_fragments(
         print(f"  Density range   : {density_range[0]:.2f}–{density_range[1]:.2f} g/cm³")
         print(f"  Cost function   : 0.5·MSE(real) + 0.5·MSE(imag)  [imag→real KK]")
         print(f"  Residual points : {len(energies_fit)}"
-              + (f"  [{_mask_label(energy_mask)} eV]"
+              + (f"  [{energies_fit.min():.1f}–{energies_fit.max():.1f} eV]"
                  if energy_mask else ""))
         print(f"  Workers         : {min(n_cpu, n_combos)}\n")
 
@@ -1421,7 +1387,7 @@ def fit_stoichiometry_density_fragments_bidirectional(
         print(f"  Density range   : {density_range[0]:.2f}–{density_range[1]:.2f} g/cm³")
         print(f"  Cost function   : 0.5·MSE_fwd + 0.5·MSE_rev")
         print(f"  Residual points : {len(energies_fit)}"
-              + (f"  [{_mask_label(energy_mask)} eV]"
+              + (f"  [{energies_fit.min():.1f}–{energies_fit.max():.1f} eV]"
                  if energy_mask else ""))
         print(f"  Workers         : {min(n_cpu, n_combos)}\n")
 
@@ -1962,7 +1928,8 @@ def _prepare_multi_edge_data(edge_specs, kk_kwargs):
         imag_sld_all = sld_sorted[:, 2]
 
         if energy_mask is not None:
-            mask = _energy_mask_bool(energies_all, energy_mask)
+            e_lo, e_hi = energy_mask
+            mask = (energies_all >= e_lo) & (energies_all <= e_hi)
             if mask.sum() == 0:
                 raise ValueError(
                     f"energy_mask {energy_mask} for '{label}' excludes all points. "
@@ -2025,7 +1992,11 @@ def _stitch_sld_arrays(edge_specs):
         all_mp_hi.append(merge_points[1])
 
         energies = sld_3col[:, 0]
-        mask = _energy_mask_bool(energies, energy_mask)
+        if energy_mask is not None:
+            e_lo, e_hi = energy_mask
+            mask = (energies >= e_lo) & (energies <= e_hi)
+        else:
+            mask = np.ones(len(energies), dtype=bool)
 
         all_fit_E.append(sld_3col[mask, 0])
         all_fit_re.append(sld_3col[mask, 1])
@@ -2171,7 +2142,7 @@ def _multi_edge_verbose_header(mode_label, edge_specs, n_combos,
         mp  = spec['merge_points']
         em  = spec.get('energy_mask', None)
         print(f"  {lbl:20s}: merge=[{mp[0]:.0f},{mp[1]:.0f}] eV"
-              + (f"  mask={_mask_label(em)} eV" if em else ""))
+              + (f"  mask=({em[0]:.0f},{em[1]:.0f}) eV" if em else ""))
     print(f"  Stoichiometry combinations : {n_combos}")
     print(f"  Density range              : {density_range[0]:.2f}-{density_range[1]:.2f} g/cm3")
     n_cpu = os.cpu_count() if n_workers is None else n_workers
@@ -2308,7 +2279,7 @@ def fit_stoichiometry_density_multi_edge_stitched(
     for spec in edge_specs:
         em = spec.get('energy_mask', None)
         if em is not None:
-            per_edge_masks.append(_energy_mask_bool(fit_E, em))
+            per_edge_masks.append((fit_E >= em[0]) & (fit_E <= em[1]))
         else:
             mp = spec['merge_points']
             per_edge_masks.append((fit_E >= mp[0]) & (fit_E <= mp[1]))
@@ -2410,7 +2381,7 @@ def fit_stoichiometry_density_fragments_multi_edge_stitched(
     for spec in edge_specs:
         em = spec.get('energy_mask', None)
         if em is not None:
-            per_edge_masks.append(_energy_mask_bool(fit_E, em))
+            per_edge_masks.append((fit_E >= em[0]) & (fit_E <= em[1]))
         else:
             mp = spec['merge_points']
             per_edge_masks.append((fit_E >= mp[0]) & (fit_E <= mp[1]))

@@ -583,6 +583,86 @@ def test_stoich_spec():
             density_range=(2, 1))
 
 
+def test_stoich_split_energy_mask():
+    import kk_stoichiometry_fit as K
+    from rsoxr_harness.stoich import StoichSpec, rmse_for
+    E = np.array([270, 280, 284, 286, 290, 300, 310, 320, 330.0])
+    m = K._energy_mask_bool(E, [(270, 284), (310, 330)])
+    assert m.tolist() == [True, True, True, False, False, False, True, True, True]
+    assert K._energy_mask_bool(E, (284, 300)).sum() == 4 and K._energy_mask_bool(E, None).all()
+    assert K._mask_label([(270, 284), (310, 330)]) == "270–284 ∪ 310–330"
+    sp = StoichSpec(name="m", source="x", atoms=["C", "H"], counts=[8, [4, 8]],
+                    energy_mask=[[270, 284], [310, 330]])
+    assert sp.energy_mask == [[270.0, 284.0], [310.0, 330.0]] and "∪" in sp.describe()
+    assert StoichSpec(name="m", source="x", atoms=["C"], counts=[1],
+                      energy_mask=(270, 284)).energy_mask == [270.0, 284.0]
+    _raises(ValueError, StoichSpec, name="m", source="x", atoms=["C"], counts=[1],
+            energy_mask=[[284, 270]])
+    # a table that is only KK-consistent outside 284–310: the split mask ignores the bad middle
+    d = tempfile.mkdtemp()
+    tab = _stoich_table(os.path.join(d, "t.csv"))
+    bad = tab.copy()
+    mid = (bad[:, 0] > 284) & (bad[:, 0] < 310)
+    bad[mid, 1] += 3.0
+    full = rmse_for(bad, "C8H8", 1.05, [270, 330])
+    split = rmse_for(bad, "C8H8", 1.05, [270, 330], [(270, 284), (310, 330)])
+    assert full > 1.0 and split < 0.05, (full, split)
+
+
+def test_stoich_chi2_intervals():
+    from rsoxr_harness.__main__ import main
+    from rsoxr_harness import plots as P, stoich as S
+    p = synthetic()
+    d = tempfile.mkdtemp()
+    tab = _stoich_table(os.path.join(d, "t.csv"))
+    noisy = tab.copy()
+    rng = np.random.default_rng(1)
+    sig = 0.05
+    noisy[:, 1] += rng.normal(0, sig, size=len(tab))   # real only: imag feeds the KK input
+    csv = os.path.join(p.path, "ps_sigma.csv")
+    np.savetxt(csv, np.column_stack([noisy, np.full((len(tab), 2), sig)]), delimiter=",",
+               header="Energy_eV,Real_SLD,Imag_SLD,Real_std,Imag_std", comments="")
+    p.add_stoich(name="ps_sig", source=csv, atoms=["C", "H"], counts=[8, [4, 12]],
+                 density_range=(0.8, 1.5), n_workers=4, overwrite=True)
+    assert main(["stoich", "run", "ps_sig", "-p", p.path]) == 0
+    assert main(["stoich", "chi2", "ps_sig", "-p", p.path, "--workers", "4"]) == 0
+    import pandas as pd
+    df = pd.read_csv(os.path.join(p.stoich_dir("ps_sig"), "chi2.csv"))
+    with open(os.path.join(p.stoich_dir("ps_sig"), "chi2.json")) as fh:
+        info = json.load(fh)
+    assert info["best_formula"] == "C8H8" and abs(info["best_density"] - 1.05) < 0.01
+    assert info["nu"] == info["n_points"] - 2
+    assert 0.25 < info["birge_s2"] < 1.0, info      # ≈ ½: only the real half carries noise
+    df, info, grid = S.load_chi2(p.stoich_dir("ps_sig"))
+    iv, _, els = S.chi2_intervals(df, info, grid=grid)
+    lo, best, hi, n = iv[1.0]["density"]
+    assert lo < best < hi and n >= 1 and hi - lo < 0.01, iv[1.0]["density"]
+    lo4, _, hi4, _ = iv[4.0]["density"]
+    assert lo4 <= lo and hi4 >= hi and lo4 <= 1.05 <= hi4, iv[4.0]["density"]
+    assert iv[4.0]["w_C"][3] >= iv[1.0]["w_C"][3]
+    _png_ok(P.plot_stoich_chi2(p, "ps_sig"))
+    _png_ok(P.plot_stoich_chi2_rows([(p, "ps_sig", "A"), (p, "ps_sig", "B")]))
+    # a source without σ columns is refused
+    _raises(ValueError, S.load_sigma, os.path.join(d, "t.csv"), tab[:, 0])
+
+
+def test_stoich_cpu_cap():
+    from rsoxr_harness import stoich as S
+    cap = S.cpu_cap()
+    assert cap == max(1, (os.cpu_count() or 2) // 2)
+    assert S.resolve_workers(None) == cap and S.resolve_workers(10 ** 6) == cap
+    assert S.resolve_workers(3, in_use=cap) == 1 and S.resolve_workers(None, in_use=cap - 2) == 2
+    old = S._REGISTRY
+    S._REGISTRY = os.path.join(tempfile.mkdtemp(), "reg.json")
+    try:
+        n = S.reserve_workers(None)
+        assert n == cap and S.cpus_in_use() == cap
+        S.release_workers()
+        assert S.cpus_in_use() == 0
+    finally:
+        S._REGISTRY = old
+
+
 def test_stoich_search_job_and_plots():
     from rsoxr_harness.__main__ import main
     from rsoxr_harness import plots as P, stoich as S
@@ -614,6 +694,10 @@ def test_stoich_search_job_and_plots():
         _png_ok(path)
     assert main(["plot", "stoich-overlay", "-p", p.path, "--name", "ps_atoms",
                  "--sim", "C8H12:1.1"]) == 0
+    acc, df, best, els = P.stoich_accepted(p, "ps_atoms", tol_pct=5)
+    assert list(acc.formula) == ["C8H8"] and els == ["C", "H"]
+    assert np.isclose(acc.w_C[0] + acc.w_H[0], 1.0)
+    _png_ok(P.plot_stoich_accept(p, "ps_atoms", tol_pct=500))
     _raises(ProjectError, p.get_stoich, "nope")
 
 

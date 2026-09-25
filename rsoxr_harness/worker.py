@@ -369,12 +369,16 @@ def _run_stoich(project, job):
     outputs = {}
     for name in job["models"]:
         spec = project.get_stoich(name)
-        if job["params"].get("n_workers"):
-            spec.n_workers = job["params"]["n_workers"]
+        spec.n_workers = S.reserve_workers(job["params"].get("n_workers") or spec.n_workers)
+        print(f"[harness] using {spec.n_workers} worker processes (cap {S.cpu_cap()} = 50% "
+              f"of {os.cpu_count()} CPUs, shared by all stoich searches)", flush=True)
         sld, prov = S.resolve_source(project, spec.source, spec.criteria)
         print(f"\n[harness] stoich {spec.describe()}", flush=True)
         print(f"[harness] source: {prov}", flush=True)
-        summ = S.run_search(spec, sld, project.stoich_dir(name), prov, verbose=True)
+        try:
+            summ = S.run_search(spec, sld, project.stoich_dir(name), prov, verbose=True)
+        finally:
+            S.release_workers()
         b = S.final_best(summ)
         outputs[name] = {"best": b, "n_candidates": summ["n_candidates"],
                          "search_sec": summ["search_sec"]}

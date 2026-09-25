@@ -777,7 +777,9 @@ def plot_stoich_overlay(project, name=None, formulas=None, source=None,
                     label=f"{f}  ρ={float(rho):.3f}  RMSE={rm:.4f}")
     for ax, comp in zip(axes, ("Real", "Imag")):
         if mask:
-            ax.axvspan(*mask, alpha=0.07, color="grey")
+            from kk_stoichiometry_fit import _mask_windows
+            for lo, hi in _mask_windows(mask):
+                ax.axvspan(lo, hi, alpha=0.07, color="grey")
         ax.set_xlabel("Energy (eV)")
         ax.set_ylabel(f"{comp} SLD (10⁻⁶ Å⁻²)")
         ax.set_title(f"{comp} SLD — KK vs fit")
@@ -788,3 +790,189 @@ def plot_stoich_overlay(project, name=None, formulas=None, source=None,
     return _save(project, fig, "stoich-overlay", [name or "sim"],
                  dict(name=name, source=source,
                       formulas=[[f, float(r)] for f, r in pairs]), out)
+
+
+def stoich_accepted(project, name, tol_pct=5.0):
+    """Candidates with RMSE ≤ (1 + tol_pct/100)·best, with atom counts, atom and
+    mass fractions per element (parsed from the formula)."""
+    import pandas as pd
+    from kk_stoichiometry_fit import _parse_formula
+    from periodictable import elements
+    summary, sp, df, sld = _stoich(project, name)
+    best = float(df.rmse.min())
+    acc = df[df.rmse <= best * (1 + tol_pct / 100.0)].copy()
+    comp = [_parse_formula(f) for f in acc.formula]
+    els = sorted({e for c in comp for e in c}, key=lambda e: ("CONHSi".find(e) % 99, e))
+    for e in els:
+        acc[f"N_{e}"] = [c.get(e, 0) for c in comp]
+    tot = sum(acc[f"N_{e}"] for e in els)
+    mass = sum(acc[f"N_{e}"] * elements.symbol(e).mass for e in els)
+    for e in els:
+        acc[f"x_{e}"] = acc[f"N_{e}"] / tot
+        acc[f"w_{e}"] = acc[f"N_{e}"] * elements.symbol(e).mass / mass
+    return acc.reset_index(drop=True), df, best, els
+
+
+def plot_stoich_accept(project, name, tol_pct=5.0, out=None):
+    """
+    Uncertainty from an RMSE acceptance cut: every candidate within tol_pct %
+    of the best.  (1) RMSE vs density, accepted highlighted; (2) mass fraction
+    of each element across the accepted set; (3) ratio scatter
+    (el0:el1 vs el2:el0 for ≥3 elements) coloured by RMSE.
+    """
+    acc, df, best, els = stoich_accepted(project, name, tol_pct)
+    cut = best * (1 + tol_pct / 100.0)
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
+    ax = axes[0]
+    ax.scatter(df.density, df.rmse, s=6, c="0.75", label="all candidates")
+    ax.scatter(acc.density, acc.rmse, s=14, c="C3", label=f"within +{tol_pct:g}% ({len(acc)})")
+    ax.axhline(cut, color="C3", ls="--", lw=1)
+    ax.set_ylim(best * 0.97, min(df.rmse.max(), best * 2.0))
+    ax.set_xlabel("density (g/cm³)")
+    ax.set_ylabel("RMSE (10⁻⁶ Å⁻²)")
+    ax.set_title(f"ρ = {acc.density.min():.3f}–{acc.density.max():.3f} "
+                 f"(median {acc.density.median():.3f})")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    ax = axes[1]
+    data = [acc[f"w_{e}"].values for e in els]
+    ax.boxplot(data, whis=(0, 100), widths=0.5)
+    for i, d in enumerate(data, 1):
+        ax.scatter(np.random.default_rng(i).normal(i, 0.05, len(d)), d, s=8, alpha=0.5, c="C0")
+    ax.set_xticks(range(1, len(els) + 1), els)
+    ax.set_ylabel("mass fraction")
+    ax.set_title("mass fractions of accepted candidates (min–max whiskers)")
+    ax.grid(alpha=0.3)
+    ax = axes[2]
+    if len(els) >= 3:
+        a, b, c = els[0], els[1], els[2]
+        xr = acc[f"N_{a}"] / acc[f"N_{b}"].replace(0, np.nan)
+        yr = acc[f"N_{c}"] / acc[f"N_{a}"].replace(0, np.nan)
+        sc = ax.scatter(xr, yr, c=acc.rmse, cmap="viridis_r", s=30, edgecolor="k", lw=0.3)
+        fig.colorbar(sc, ax=ax, label="RMSE")
+        b0 = acc.iloc[0]
+        ax.plot(b0[f"N_{a}"] / b0[f"N_{b}"], b0[f"N_{c}"] / b0[f"N_{a}"], "*", ms=16,
+                mfc="C3", mec="k", label=f"best {b0.formula}")
+        ax.set_xlabel(f"{a}:{b}")
+        ax.set_ylabel(f"{c}:{a}")
+        ax.set_title(f"{a}:{b} {xr.min():.2f}–{xr.max():.2f}   {c}:{a} {yr.min():.2f}–{yr.max():.2f}")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+    else:
+        ax.axis("off")
+    fig.suptitle(f"{project.sample_name}: stoich '{name}' — candidates within +{tol_pct:g}% "
+                 f"of best RMSE {best:.4f}", y=1.02)
+    fig.tight_layout()
+    return _save(project, fig, "stoich-accept", [name], dict(name=name, tol_pct=tol_pct), out)
+
+
+def _stoich_chi2_row(fig, axes, project, name, label=None):
+    """Draw the three σ-weighted Δχ² panels of one stoich run on `axes`."""
+    from . import stoich as S
+    d = project.stoich_dir(name)
+    if not os.path.exists(os.path.join(d, "chi2.csv")):
+        raise KeyError(f"stoich '{name}' has no σ-weighted χ² yet (run `stoich chi2 {name}`)")
+    df, info, grid = S.load_chi2(d)
+    s2 = info["birge_s2"]
+    iv_raw, dfc, els = S.chi2_intervals(df, info, scaled=False, grid=grid)
+    iv_sc, _, _ = S.chi2_intervals(df, info, scaled=True, grid=grid)
+    pre = f"{label}: " if label else ""
+    ax = axes[0]
+    z = dfc.dchi2 / s2
+    env = (np.min(grid["chi2"], axis=0) - info["chi2_best"]) / s2
+    ax.plot(grid["rho"], env, color="k", lw=1.5, label="profile Δχ²/s²(ρ)")
+    ax.scatter(dfc.density_w, z, s=6, c="0.7", label="formula optima")
+    for lv, c in ((4, "C1"), (1, "C3")):          # 68 % drawn on top
+        m = z <= lv
+        ax.scatter(dfc.density_w[m], z[m], s=16 if lv == 4 else 26, c=c, zorder=3 if lv == 1 else 2,
+                   label=f"Δχ²/s² ≤ {lv:g} ({m.sum()} formulas)")
+        ax.axhline(lv, color=c, ls="--", lw=1)
+        lo, _, hi, _ = (iv_sc[float(lv)]["density"])
+        ax.axvspan(lo, hi, color=c, alpha=0.08)
+    ax.set_yscale("symlog", linthresh=1)
+    ax.set_ylim(-0.1, 50)
+    lo, _, hi, _ = iv_sc[1.0]["density"]
+    ax.set_xlim(max(grid["rho"][0], lo - 0.1), min(grid["rho"][-1], hi + 0.1))
+    ax.set_xlabel("density (g/cm³)")
+    ax.set_ylabel("Δχ² / s²")
+    ax.set_title(f"{pre}χ²_best={info['chi2_best']:.1f}, ν={info['nu']}, s²={s2:.2f}; "
+                 f"ρ₆₈={lo:.3f}–{hi:.3f}")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    ax = axes[1]
+    x = np.arange(len(els))
+    for k, (iv, lv, off, col, lab) in enumerate((
+            (iv_raw, 1.0, -0.21, "C0", "raw σ 68%"), (iv_raw, 4.0, -0.07, "C9", "raw σ 95%"),
+            (iv_sc, 1.0, 0.07, "C3", "scaled 68%"), (iv_sc, 4.0, 0.21, "C1", "scaled 95%"))):
+        lo = [iv[lv][f"w_{e}"][0] for e in els]
+        be = [iv[lv][f"w_{e}"][1] for e in els]
+        hi = [iv[lv][f"w_{e}"][2] for e in els]
+        ax.errorbar(x + off, be, yerr=[np.subtract(be, lo), np.subtract(hi, be)],
+                    fmt="o", color=col, capsize=4, label=lab)
+    ax.set_xticks(x, els)
+    ax.set_ylabel("mass fraction")
+    ax.set_title(f"{pre}profile intervals — best {dfc.formula.iloc[0]} "
+                 f"ρ={dfc.density_w.iloc[0]:.3f}")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    ax = axes[2]
+    if len(els) >= 3:
+        a, b, c = els[0], els[1], els[2]
+        xr, yr = dfc[f"N_{a}"] / dfc[f"N_{b}"].replace(0, np.nan), dfc[f"N_{c}"] / dfc[f"N_{a}"]
+        m95 = z <= 4
+        sc = ax.scatter(xr[m95], yr[m95], c=z[m95], cmap="viridis_r", vmin=0, vmax=4,
+                        s=30, edgecolor="k", lw=0.3)
+        fig.colorbar(sc, ax=ax, label="Δχ² / s²")
+        ax.plot(xr.iloc[0], yr.iloc[0], "*", ms=16, mfc="C3", mec="k", zorder=5,
+                label=f"best {dfc.formula.iloc[0]}")
+        ax.set_xlabel(f"{a}:{b}")
+        ax.set_ylabel(f"{c}:{a}")
+        ax.set_title(f"{pre}95 % (scaled) set")
+        ax.legend(fontsize=8, loc="lower right")
+        ax.grid(alpha=0.3)
+    else:
+        ax.axis("off")
+    return info
+
+
+def plot_stoich_chi2(project, name, out=None):
+    """
+    σ-weighted Δχ² view of a stoich run (after `stoich chi2`): (1) Δχ²/s² vs
+    profiled density; (2) mass-fraction profile intervals (68 %/95 %, raw and
+    Birge-scaled); (3) element-ratio scatter of the 95 % (scaled) set.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    info = _stoich_chi2_row(fig, axes, project, name)
+    fig.suptitle(f"{project.sample_name}: stoich '{name}' — σ-weighted Δχ² profile "
+                 f"({info['n_points']} residual values)", y=1.02)
+    fig.tight_layout()
+    return _save(project, fig, "stoich-chi2", [name], dict(name=name), out)
+
+
+def plot_stoich_chi2_rows(rows, out=None, title=None):
+    """
+    Several stoich runs (possibly from different projects) stacked as rows of
+    the stoich-chi2 layout, with each column's axes limits shared across rows.
+    rows: [(project, name, label), ...]; saved in the first project's figures.
+    """
+    n = len(rows)
+    fig, axes = plt.subplots(n, 3, figsize=(18, 5 * n), squeeze=False)
+    for ax_row, (proj, name, label) in zip(axes, rows):
+        _stoich_chi2_row(fig, ax_row, proj, name, label)
+    for col in range(3):
+        col_axes = [axes[r][col] for r in range(n) if axes[r][col].axison]
+        if not col_axes:
+            continue
+        xs = [a.get_xlim() for a in col_axes]
+        ys = [a.get_ylim() for a in col_axes]
+        for a in col_axes:
+            if col != 1:                              # element positions already match
+                a.set_xlim(min(x[0] for x in xs), max(x[1] for x in xs))
+            if col != 0:                              # panel 0 keeps its fixed Δχ² scale
+                a.set_ylim(min(y[0] for y in ys), max(y[1] for y in ys))
+    fig.suptitle(title or "σ-weighted Δχ² profiles: " +
+                 "  |  ".join(f"{lab} ({p.sample_name} '{nm}')" for p, nm, lab in rows), y=1.0)
+    fig.tight_layout()
+    p0 = rows[0][0]
+    return _save(p0, fig, "stoich-chi2-rows", [nm for _, nm, _ in rows],
+                 dict(rows=[[p.path, nm, lab] for p, nm, lab in rows]), out)

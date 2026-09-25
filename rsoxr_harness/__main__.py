@@ -199,10 +199,33 @@ def cmd_stoich(a):
                 print("  (not run yet)")
             print()
         return 0
+    if a.action == "chi2":
+        for n in a.name:
+            df, info = S.chi2_scan(p, n, workers=a.workers)
+            print(f"\n{n}: χ²_best = {info['chi2_best']:.2f} ({info['best_formula']}, "
+                  f"ρ={info['best_density']:.4f}); points {info['n_points']}, ν = {info['nu']}, "
+                  f"s² = χ²/ν = {info['birge_s2']:.2f}  ({info['seconds']:.0f}s)")
+            grid = S.load_chi2(p.stoich_dir(n))[2]
+            for scaled in (False, True):
+                iv, _, els = S.chi2_intervals(df, info, scaled=scaled, grid=grid)
+                print(f"  {'Birge-scaled' if scaled else 'raw σ'} profile intervals:")
+                for lv in (1.0, 4.0):
+                    parts = [f"{k}: {v[0]:.3f}–{v[2]:.3f}" for k, v in iv[lv].items()]
+                    n_c = next(iter(iv[lv].values()))[3]
+                    print(f"    Δχ²≤{lv:g} ({n_c} formulas)  " + " | ".join(parts))
+        return 0
     # run
     for n in a.name:
         p.get_stoich(n)
-    params = {"n_workers": a.workers}
+    # 50 % CPU budget shared by all running stoich searches on this machine
+    # (the worker re-checks and reserves atomically when it starts)
+    in_use = S.cpus_in_use()                  # machine-wide, any project
+    req = a.workers or max(p.get_stoich(n).n_workers or 0 for n in a.name) or None
+    workers = S.resolve_workers(req, in_use)
+    if req is not None and workers < req:
+        print(f"note: {req} workers requested; capped at {workers} "
+              f"(50% of {os.cpu_count()} CPUs, {in_use} in use by other stoich jobs)")
+    params = {"n_workers": workers}
     job = J.new_job(p, "stoich", list(a.name), [], params, "cpu")
     print(f"job {job['id']}: stoich {' '.join(a.name)}  ("
           + ", ".join(f"{n}: {p.get_stoich(n).n_candidates()} candidates" for n in a.name)
@@ -315,6 +338,10 @@ def cmd_plot(a):
             raise SystemExit(f"plot {k} needs --name")
         elif k == "stoich-results":
             path = P.plot_stoich_results(p, a.name, top_n=a.top, out=a.out)
+        elif k == "stoich-chi2":
+            path = P.plot_stoich_chi2(p, a.name, out=a.out)
+        elif k == "stoich-accept":
+            path = P.plot_stoich_accept(p, a.name, tol_pct=a.tol_pct, out=a.out)
         elif k == "stoich-density":
             path = P.plot_stoich_density(p, a.name, formula=a.formula, out=a.out)
         else:
@@ -437,11 +464,15 @@ def main(argv=None):
     s.add_argument("--detach", action="store_true",
                    help="return immediately (otherwise stream the log and wait)")
 
-    s = add("stoich", cmd_stoich, "KK stoichiometry searches: list | show | run")
-    s.add_argument("action", choices=["list", "show", "run"])
+    s = add("stoich", cmd_stoich, "KK stoichiometry searches: list | show | run | chi2")
+    s.add_argument("action", choices=["list", "show", "run", "chi2"])
     s.add_argument("name", nargs="*")
-    s.add_argument("--workers", type=int, help="process-pool size (default: all CPUs)")
+    s.add_argument("--workers", type=int,
+                   help="process-pool size (default and maximum: 50%% of CPUs, "
+                        "shared with other running stoich jobs)")
     s.add_argument("--top", type=int, default=10)
+    s.add_argument("--tol-pct", type=float, default=5.0,
+                   help="stoich-accept: RMSE acceptance cut, %% above the best")
     s.add_argument("--detach", action="store_true")
 
     s = add("unc", cmd_unc, "summarise cached NUTS/JAXNS results")
@@ -470,6 +501,7 @@ def main(argv=None):
                                     "refl", "profiles", "uncertainty", "posterior",
                                     "evidence", "corner", "materials",
                                     "stoich-results", "stoich-density", "stoich-counts",
+                                    "stoich-accept", "stoich-chi2",
                                     "stoich-overlay"])
     s.add_argument("--name", help="stoich search name")
     s.add_argument("--formula", help="stoich-density: formula (default: best)")
@@ -479,6 +511,8 @@ def main(argv=None):
     s.add_argument("--baseline", nargs="+", metavar="NAME=COUNT",
                    help="stoich-counts: hold these counts instead of the best")
     s.add_argument("--top", type=int, default=10)
+    s.add_argument("--tol-pct", type=float, default=5.0,
+                   help="stoich-accept: RMSE acceptance cut, %% above the best")
     s.add_argument("--method", default="jaxns", choices=["jaxns", "nuts"])
     s.add_argument("--names", nargs="+", help="materials to plot (plot materials)")
     s.add_argument("--models", "--model", nargs="+")
