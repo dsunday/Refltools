@@ -53,6 +53,10 @@ def _run_fit(project, job):
     outputs = {}
     for model in job["models"]:
         recipe = project.get_model(model)
+        if recipe.is_linked:
+            outputs[model] = _run_global_fit(project, job, recipe)
+            J.update_job(project, job["id"], outputs=outputs)
+            continue
         print(f"\n[harness] {model}: building objectives at {len(energies)} "
               f"energies", flush=True)
         built = project.build_objectives(recipe, energies)
@@ -97,6 +101,157 @@ def _run_fit(project, job):
               f"in {elapsed:.0f}s; mean chi2/N = "
               f"{outputs[model]['chi2_reduced_mean']:.4g}", flush=True)
     return outputs
+
+
+def global_cmaes(builder, x0, popsize, n_generations, seed=0, tol=1e-4,
+                 patience=5, check_every=10, n_restarts=1, verbose=True):
+    """
+    Sep-CMA-ES over a GlobalModelsBatchBuilder's parameter vector (same loop
+    as the LAMS7 global notebooks).  Restart 0 starts at x0; later restarts
+    start uniformly inside the bounds.  Returns (best_x, best_chi2, info).
+    """
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from evosax.algorithms import Sep_CMA_ES
+    lb, ub = builder.bounds[:, 0], builder.bounds[:, 1]
+    lb_j, ub_j = jnp.array(lb), jnp.array(ub)
+    rng = np.random.default_rng(seed)
+    best = (None, np.inf)
+    history = []
+    gens_total = 0
+    for k in range(n_restarts):
+        start = np.clip(x0, lb, ub) if k == 0 else rng.uniform(lb, ub)
+        strategy = Sep_CMA_ES(population_size=popsize,
+                              solution=np.zeros(builder.n_global, dtype=np.float64))
+        params = strategy.default_params
+        key = jax.random.PRNGKey(seed + k)
+        key, ik = jax.random.split(key)
+        state = strategy.init(ik, jnp.array(start), params)
+        prev, bad, converged, gen = np.inf, 0, False, 0
+        for gen in range(n_generations):
+            key, gk = jax.random.split(key)
+            pop, state = strategy.ask(gk, state, params)
+            pop = jnp.clip(pop, lb_j, ub_j)
+            chi = jnp.array(builder.fitness(np.array(pop, dtype=np.float64)),
+                            dtype=jnp.float64)
+            state, _ = strategy.tell(gk, pop, chi, state, params)
+            if (gen + 1) % check_every == 0:
+                b = float(state.best_fitness)
+                if verbose and (gen + 1) % (check_every * 10) == 0:
+                    print(f"  restart {k} gen {gen + 1:5d}  best χ²={b:.6g}", flush=True)
+                if np.isfinite(prev) and (prev - b) / max(prev, 1e-12) < tol:
+                    bad += 1
+                    if bad >= patience:
+                        converged = True
+                        break
+                else:
+                    bad = 0
+                prev = b
+        x = np.clip(np.array(state.best_solution), lb, ub)
+        c = float(builder.fitness(x[None, :])[0])
+        history.append(c)
+        gens_total += gen + 1
+        if verbose:
+            print(f"  restart {k}: χ²={c:.6g} after {gen + 1} generations"
+                  f"{' (converged)' if converged else ''}", flush=True)
+        if c < best[1]:
+            best = (x, c)
+    return best[0], best[1], {"restart_chi2": history, "generations_run": gens_total,
+                              "converged": converged}
+
+
+def _run_global_fit(project, job, recipe):
+    """One energy-linked CMA-ES fit; saved per energy under one run index."""
+    import h5py
+    import numpy as np
+    from gpu_reflect import GlobalModelsBatchBuilder, set_global_params
+    from h5io import save_batch_to_h5
+
+    p = job["params"]
+    model = recipe.name
+    g = project.build_global(recipe)
+    elist, objs, gobj = g["energy_list"], g["objectives"], g["global_objective"]
+    ck = g["checks"]
+    print(f"\n[harness] {model}: GLOBAL fit over {ck['n_energies']} energies; "
+          f"{ck['n_global']} free parameters ({ck['n_shared']} shared: "
+          + ", ".join(f"{l} {pn}" for l, pn in g["shared_params"]) + ")", flush=True)
+    print(f"[harness] checks OK: parameter count {ck['n_global']} = "
+          f"{ck['n_independent']} - ({ck['n_energies']}-1)x{ck['n_shared']}; "
+          f"shared identity; χ² additivity", flush=True)
+    originals = {e: copy.deepcopy(o) for e, o in zip(elist, objs)}
+    chi0 = {e: float(o.chisqr()) for e, o in zip(elist, objs)}
+    x0 = np.array([q.value for q in gobj.varying_parameters()])
+    builder = GlobalModelsBatchBuilder(g, normalize_by_n_q=p.get("normalize", False))
+    c_start = float(builder.fitness(x0[None, :])[0])
+
+    t0 = time.time()
+    x, c, info = global_cmaes(builder, x0, p["popsize"], p["n_generations"],
+                              seed=p.get("seed", 0), tol=p["tol"],
+                              patience=p["patience"], n_restarts=p.get("n_restarts", 1))
+    kept_start = False
+    if c > c_start:                         # never return worse than the start
+        x, c, kept_start = x0, c_start, True
+        print("[harness] CMA-ES ended above its start point; keeping the start", flush=True)
+    elapsed = time.time() - t0
+    set_global_params(gobj, x)
+    chi = {e: float(o.chisqr()) for e, o in zip(elist, objs)}
+    total = float(sum(chi.values()))
+
+    res = {"fitted_objectives": dict(zip(elist, objs)),
+           "individual_results": {e: {"objective": o, "chisqr": chi[e],
+                                      "initial_chi_squared": chi0[e]}
+                                  for e, o in zip(elist, objs)},
+           "original_objectives": originals,
+           "original_structures": {e: o.model.structure for e, o in originals.items()},
+           "fitted_energies": list(elist), "non_fitted_energies": [],
+           "summary_stats": {"algorithm": "Sep-CMA-ES (global, energy-linked)",
+                             "final_chi_squared_total": total,
+                             "initial_chi_squared_total": sum(chi0.values())},
+           "elapsed_sec": elapsed, "generations_run": info["generations_run"],
+           "converged": info["converged"]}
+    with J.h5_lock(project.h5_path):
+        idx = 0
+        if os.path.exists(project.h5_path):
+            with h5py.File(project.h5_path, "r") as f:
+                for e in elist:
+                    path = f"{project.sample_name}/{float(e)}/{model}"
+                    if path in f:
+                        idx = max([idx] + [int(k.split("_")[1]) + 1 for k in f[path]
+                                           if k.startswith("run_")])
+        save_batch_to_h5(res, project.sample_name, model, project.h5_path,
+                         energy_list=elist, run_index=idx)
+        runs = _tag_runs(project, model, elist, recipe, job)
+        shared = {f"{l} - {'thick' if pn == 'thickness' else 'rough'}": float(sp.value)
+                  for (l, pn), sp in g["shared_params"].items()}
+        with h5py.File(project.h5_path, "a") as f:
+            for e in elist:
+                rg = f[f"{project.sample_name}/{float(e)}/{model}/run_{idx}"]
+                rg.attrs["global_chi2_total"] = total
+                rg.attrs["global_n_params"] = ck["n_global"]
+                rg.attrs["global_energies"] = json.dumps(list(elist))
+                rg.attrs["global_shared"] = json.dumps(shared)
+    assert set(runs.values()) == {idx}, runs
+    npts = {e: int(o.npoints) for e, o in zip(elist, objs)}
+    n_data = sum(npts.values())
+    out = {"runs": runs, "global": True, "run_index": idx,
+           "chi2": {str(e): chi[e] for e in elist},
+           "chi2_initial": {str(e): chi0[e] for e in elist},
+           "chi2_total": total, "chi2_total_initial": sum(chi0.values()),
+           "n_global_params": ck["n_global"], "n_data": n_data,
+           "chi2_reduced_global": total / (n_data - ck["n_global"]),
+           "chi2_reduced_mean": sum(chi[e] / npts[e] for e in elist) / len(elist),
+           "shared": shared, "restart_chi2": info["restart_chi2"],
+           "kept_start": kept_start,
+           "generations_run": info["generations_run"], "converged": info["converged"],
+           "elapsed_sec": round(elapsed, 1)}
+    print(f"[harness] {model}: global run_{idx} saved in {elapsed:.0f}s; total χ² "
+          f"{sum(chi0.values()):.6g} → {total:.6g}; χ²/(N-P) = "
+          f"{out['chi2_reduced_global']:.4g}; mean χ²/N = {out['chi2_reduced_mean']:.4g}",
+          flush=True)
+    for k, v in shared.items():
+        print(f"[harness]   shared {k} = {v:.4g}", flush=True)
+    return out
 
 
 def _tag_runs(project, model, energies, recipe, job):

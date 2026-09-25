@@ -248,6 +248,8 @@ class FitProject:
             raise ProjectError(f"parent '{recipe.parent}' is not in the project")
         if recipe.seed and not recipe.seed.get("runs"):
             recipe.seed["runs"] = self._resolve_seed(recipe.seed)
+        if recipe.links and recipe.links.get("energies") is not None:
+            recipe.links["energies"] = self._resolve_link_energies(recipe.links["energies"])
         errors, warnings = R.validate(recipe, known_materials=self.cfg["materials"])
         for o in recipe.overrides:
             if not any(abs(o["energy"] - e) < 1e-3 for e in self.energies):
@@ -267,17 +269,76 @@ class FitProject:
         return r
 
     def derive(self, parent, new_name, ops, description="", overwrite=False,
-               seed_from=None, seed_criteria="best"):
+               seed_from=None, seed_criteria="best", seed_layers=None,
+               seed_instrument=True):
         """
         Model new_name = parent + ops.  seed_from='ModelX' starts the new
-        model's varying parameters from ModelX's fitted values (per energy).
-        Returns the new recipe.
+        model's varying parameters from ModelX's fitted values (per energy);
+        seed_layers=[...] limits that to those layers (+ instrument unless
+        seed_instrument=False).  Without seed_from the parent's seed, if any,
+        is dropped.  Returns the new recipe.
         """
         r = R.derive(self.get_model(parent), new_name, ops, description)
-        if seed_from:
-            r = R.seed_from_fit(r, seed_from, seed_criteria)
+        if seed_from or not any(o.get("op") == "seed_from_fit" for o in ops):
+            r = R.seed_from_fit(r, seed_from, seed_criteria, layers=seed_layers,
+                                instrument=seed_instrument)
         self.add_model(r, overwrite=overwrite)
         return r
+
+    def widen_stuck_sld(self, parent, new_name, layer, step=1.0, tol_pct=10.0,
+                        parts=("real", "imag"), criteria="best", description="",
+                        extra_ops=(), overwrite=False):
+        """
+        new_name = parent seeded from its own fit, with `layer`'s SLD window
+        widened by `step` (1e-6 Å⁻²) on the side where the parent's fitted SLD
+        ended near a bound, per energy.  "Near" = within tol_pct % of the window
+        width (the red "near bound" dots in plot sld-energy).  Energies/parts
+        not near a bound keep the parent's window.  Returns (recipe, report)
+        with report = [(energy, part, value, lo, hi, side, new_lo, new_hi)].
+        """
+        from .analysis import param_table
+        pr = self.get_model(parent)
+        lay = pr.layer(layer)
+        if not lay.sld_offset:
+            raise ProjectError(f"{parent}: layer '{layer}' has no sld_offset to widen")
+        if not self.has_fits(parent):
+            raise ProjectError(f"'{parent}' has no fits to seed from")
+        pt = param_table(self.h5_path, self.sample_name, [parent], criteria=criteria)
+        names = {"real": f"{layer} - sld", "imag": f"{layer} - isld"}
+        ops, report = list(extra_ops), []
+        for e in sorted(pt.energy.unique()):
+            ovr = next((o for o in pr.overrides_at(e) if o["layer"] == layer), {})
+            base = ovr.get("sld_offset") or lay.sld_offset
+            new_off, changed = {}, False
+            for part in parts:
+                if part not in lay.sld_offset:
+                    continue
+                row = pt[(pt.energy == e) & (pt.param == names[part])]
+                if row.empty or not bool(row.vary.iloc[0]):
+                    continue
+                v, lb, ub = (float(row[c].iloc[0]) for c in ("value", "lb", "ub"))
+                lo, hi, vary = base[part]
+                span, tol = ub - lb, tol_pct / 100.0
+                side = None
+                if span > 0 and (ub - v) / span < tol:
+                    side, hi = "upper", hi + step
+                elif span > 0 and (v - lb) / span < tol:
+                    if part == "imag" and lb <= 0:
+                        side = "lower (at 0 clamp, not widened)"
+                    else:
+                        side, lo = "lower", lo - step
+                new_off[part] = (lo, hi, vary)
+                if side:
+                    report.append((e, part, v, lb, ub, side,
+                                   lb - (step if side == "lower" else 0),
+                                   ub + (step if side == "upper" else 0)))
+                    changed = changed or side in ("upper", "lower")
+            if changed:
+                ops.append({"op": "set_energy_override", "layer": layer, "energy": e,
+                            "sld_offset": {**base, **new_off}})
+        r = self.derive(parent, new_name, ops, description=description,
+                        overwrite=overwrite, seed_from=parent, seed_criteria=criteria)
+        return r, report
 
     def edit_model(self, name, ops):
         """Apply ops to an existing model in place (only while it has no fits)."""
@@ -291,6 +352,95 @@ class FitProject:
         r.ops = list(r.ops) + list(ops)
         self.add_model(r, overwrite=True)
         return r, R.diff(before, r)
+
+    def _resolve_link_energies(self, entries):
+        """Link energy entries (floats / {"erange": [lo, hi]}) → data energies."""
+        out = set()
+        for e in entries:
+            if isinstance(e, dict):
+                out |= set(self.select_energies(erange=e["erange"]))
+            else:
+                out |= set(self.select_energies([e]))
+        return sorted(out)
+
+    def link_energy_list(self, model):
+        """Energies of a linked model's global fit (all data energies if unset)."""
+        r = model if isinstance(model, R.ModelRecipe) else self.get_model(model)
+        en = (r.links or {}).get("energies")
+        return self.energies if en is None else self._resolve_link_energies(en)
+
+    def build_global(self, model, verbose=False, check=True):
+        """
+        Linked recipe → one refnx GlobalObjective over its link energies.
+
+        Per-energy objectives are built exactly as build_objectives does
+        (overrides, seed), then every linked thickness/roughness is replaced
+        by ONE shared Parameter (start = median of the per-energy starts,
+        bounds = the layer's bounds).  SLD, other layers, scale, bkg stay per
+        energy.  Returns the dict GlobalModelsBatchBuilder /
+        run_global_nested_sampling expect, plus 'checks'.
+        """
+        from refnx.analysis import GlobalObjective, Parameter
+        r = model if isinstance(model, R.ModelRecipe) else self.get_model(model)
+        if not r.is_linked:
+            raise ProjectError(f"{r.name} has no links; use build_objectives")
+        elist = self.link_energy_list(r)
+        built = self.build_objectives(r, elist, verbose=verbose)
+        objs = [built["objectives"][e] for e in elist]
+        n_free_indep = sum(len(o.varying_parameters()) for o in objs)
+        shared = {}
+        attr = {"thickness": "thick", "roughness": "rough"}
+        for layer, ps in r.links["params"].items():
+            for pn in ps:
+                slabs = []
+                for e, o in zip(elist, objs):
+                    hit = [c for c in o.model.structure if c.name == layer]
+                    if len(hit) != 1:
+                        raise ProjectError(f"{r.name} {e:g} eV: layer '{layer}' "
+                                           f"found {len(hit)}× in the structure")
+                    slabs.append(hit[0])
+                old = [getattr(sl, attr[pn]) for sl in slabs]
+                if not old[0].vary:
+                    continue                                   # fixed: nothing to share
+                lo, hi = float(old[0].bounds.lb), float(old[0].bounds.ub)
+                v0 = float(np.clip(np.median([p.value for p in old]), lo, hi))
+                sp = Parameter(v0, name=old[0].name, vary=True, bounds=(lo, hi))
+                for sl in slabs:
+                    setattr(sl, attr[pn], sp)
+                shared[(layer, pn)] = sp
+        gobj = GlobalObjective(objs)
+        out = {"global_objective": gobj, "objectives": objs,
+               "structures": [o.model.structure for o in objs],
+               "models": [o.model for o in objs],
+               "sample_names": [str(e) for e in elist], "energy_list": elist,
+               "shared_params": shared, "linked": True,
+               "seed_report": built["seed_report"]}
+        if check:
+            out["checks"] = self._check_global(out, n_free_indep)
+        return out
+
+    @staticmethod
+    def _check_global(g, n_free_indep):
+        """Parameter count, shared-object identity and χ² additivity."""
+        N = len(g["energy_list"])
+        n_expected = n_free_indep - (N - 1) * len(g["shared_params"])
+        n_actual = len(g["global_objective"].varying_parameters())
+        if n_actual != n_expected:
+            raise ProjectError(f"global parameter count {n_actual} != expected "
+                               f"{n_expected} (linking failed)")
+        attr = {"thickness": "thick", "roughness": "rough"}
+        for (layer, pn), sp in g["shared_params"].items():
+            for st in g["structures"]:
+                c = [x for x in st if x.name == layer][0]
+                if getattr(c, attr[pn]) is not sp:
+                    raise ProjectError(f"{layer} {pn} is not the shared parameter")
+        chi_g = float(g["global_objective"].chisqr())
+        chi_s = sum(float(o.chisqr()) for o in g["objectives"])
+        if not np.isclose(chi_g, chi_s, rtol=1e-9):
+            raise ProjectError(f"global χ² {chi_g} != Σ per-energy {chi_s}")
+        return {"n_global": n_actual, "n_independent": n_free_indep,
+                "n_shared": len(g["shared_params"]), "n_energies": N,
+                "chi2_total": chi_g}
 
     def _resolve_seed(self, seed):
         """Pin the parent's run per energy (best/last/int) at save time."""
@@ -386,17 +536,21 @@ class FitProject:
         missing = [e for e in elist if e not in objectives]
         seed_report = None
         if not missing:
+            # overrides first so seeds are clipped to the overridden bounds;
+            # re-applied after seeding so value overrides still win
+            for e in elist:
+                R.apply_overrides(r, e, objectives[e])
             if r.seed:
                 vals = self._seed_values(r.seed, elist)
                 seed_report = {"model": r.seed["model"], "seeded": {}, "clipped": {},
                                "unseeded_energies": [e for e in elist if e not in vals]}
                 for e, v in vals.items():
-                    n, clipped = R.apply_seed(v, objectives[e])
+                    n, clipped = R.apply_seed(v, objectives[e], r.seed)
                     seed_report["seeded"][e] = n
                     if clipped:
                         seed_report["clipped"][e] = clipped
             for e in elist:
-                R.apply_overrides(r, e, objectives[e])
+                R.apply_overrides(r, e, objectives[e], rebound=False)
         if missing:
             log = buf.getvalue() if buf is not None else ""
             errs = [l for l in log.splitlines() if "Error" in l]

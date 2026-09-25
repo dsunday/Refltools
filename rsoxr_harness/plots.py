@@ -168,10 +168,14 @@ def plot_chi2_vs_energy(project, models=None, metric="reduced", criteria="best",
 def plot_sld_vs_energy(project, layer, models=None, references=(),
                        components=("real", "imag"), criteria="best",
                        energies=None, erange=None, show_bounds=False,
-                       show_chi2=True, h5=None, sample=None, out=None):
+                       show_chi2=True, bounds_from=(), h5=None, sample=None,
+                       out=None):
     """
     Fitted SLD of one layer vs energy for several models, with reference SLD
     tables (project material names or CSV paths) overlaid as black lines.
+    bounds_from: project model names (fitted or not) whose SLD windows, as
+    built from their recipes, are overlaid in their own colour; energies where
+    a window differs from the first fitted model's stored bounds are marked.
     """
     from h5io import plot_parameter_vs_energy
     h5, sample = _src(project, h5, sample)
@@ -184,6 +188,16 @@ def plot_sld_vs_energy(project, layer, models=None, references=(),
     avail = A.h5_energies(h5, sample)
     elist = A.filter_energies(avail, energies, erange) if (energies or erange) else None
     refs = [(r, reference_array(project, r)) for r in references]
+    extra = {}                                  # model → {E: {pname: (lo, hi)}}
+    if bounds_from:
+        eb = elist or [e for e in project.energies if e in set(avail)]
+        for m in bounds_from:
+            with _quiet():
+                objs = project.build_objectives(m, eb)["objectives"]
+            extra[m] = {e: {q.name: (float(q.bounds.lb), float(q.bounds.ub))
+                            for q in o.parameters.flattened()
+                            if q.name.startswith(f"{layer} - ") and q.vary}
+                        for e, o in objs.items()}
 
     n = len(components) + (1 if show_chi2 else 0)
     ratios = [3] * len(components) + ([1.3] if show_chi2 else [])
@@ -196,6 +210,24 @@ def plot_sld_vs_energy(project, layer, models=None, references=(),
             plot_parameter_vs_energy(h5, sample, pname, have, criteria=criteria,
                                      energy_list=elist, show_bounds=show_bounds,
                                      ax=ax)
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        stored = pt[(pt.model == have[0]) & (pt.param == pname)].set_index("energy")
+        for i, (m, eb) in enumerate(extra.items()):
+            c = colors[(len(have) + 1 + i) % len(colors)]
+            E = sorted(e for e in eb if pname in eb[e])
+            if not E:
+                continue
+            lo_, hi_ = (np.array([eb[e][pname][k] for e in E]) for k in (0, 1))
+            ax.fill_between(E, lo_, hi_, color=c, alpha=0.12, lw=0)
+            ax.plot(E, lo_, color=c, ls="--", lw=1.4, label=f"{m} bounds")
+            ax.plot(E, hi_, color=c, ls="--", lw=1.4)
+            ch = [(e, l, h) for e, l, h in zip(E, lo_, hi_) if e in stored.index
+                  and not (np.isclose(l, stored.at[e, "lb"]) and np.isclose(h, stored.at[e, "ub"]))]
+            for j, (e, l, h) in enumerate(ch):
+                wid = h if not np.isclose(h, stored.at[e, "ub"]) else l
+                ax.plot(e, wid, marker="^" if wid == h else "v", ms=8, color=c,
+                        mec="k", mew=0.6, ls="none", zorder=5,
+                        label=f"{m} widened" if j == 0 else "_nolegend_")
         col = 1 if comp == "real" else 2
         lo, hi = ax.get_xlim()
         for i, (r, arr) in enumerate(refs):
@@ -223,6 +255,7 @@ def plot_sld_vs_energy(project, layer, models=None, references=(),
     fig.tight_layout()
     return _save(project, fig, "sldenergy", have,
                  dict(layer=layer, models=have, references=list(references),
+                      bounds_from=list(bounds_from),
                       components=list(components), criteria=criteria, h5=h5,
                       sample=sample), out, tag=layer)
 
@@ -263,8 +296,11 @@ def plot_reflectivity_grid(project, models=None, energies=None, erange=None,
     ncols = min(ncols, n)
     nrows = int(np.ceil(n / ncols))
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    fig = plt.figure(figsize=(4.2 * ncols, (4.0 if residuals else 3.0) * nrows))
-    outer = fig.add_gridspec(nrows, ncols, hspace=0.35, wspace=0.28)
+    height = (4.0 if residuals else 3.0) * nrows
+    fig = plt.figure(figsize=(4.2 * ncols, height))
+    # fixed ~0.6 in top margin; the default fraction leaves a big gap on tall grids
+    outer = fig.add_gridspec(nrows, ncols, hspace=0.35, wspace=0.28,
+                             top=1 - 0.6 / height)
     for k, e in enumerate(elist):
         cell = outer[k // ncols, k % ncols]
         if residuals:
@@ -306,7 +342,7 @@ def plot_reflectivity_grid(project, models=None, energies=None, erange=None,
             ax.set_xlabel("q (Å⁻¹)", fontsize=8)
         if k % ncols == 0:
             ax.set_ylabel("R·q⁴" if q4 else "R", fontsize=8)
-    fig.suptitle(f"{sample}: reflectivity ({criteria} fits)", y=1.0)
+    fig.suptitle(f"{sample}: reflectivity ({criteria} fits)", y=1 - 0.15 / height)
     return _save(project, fig, "refl", models,
                  dict(models=models, energies=elist, criteria=criteria, q4=q4,
                       h5=h5, sample=sample), out)

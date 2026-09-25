@@ -410,9 +410,149 @@ def test_seed_from_fit():
         {q.name: q.value for q in b2["objectives"][285.0].parameters.flattened()}["Film - thick"], lo)
     t290 = {q.name: q.value for q in b2["objectives"][290.0].parameters.flattened()}
     assert t290["Film - thick"] == lo + 5                                       # override wins
+    # layer-selective seed: only SiO2 (+ instrument) from Model1; Film from the recipe
+    r3 = p.derive("Model1", "SeedL", [
+        {"op": "set_layer", "layer": "Film", "thickness": 240, "thickness_bounds": [200, 300, True]}],
+        seed_from="Model1", seed_layers=["SiO2"], overwrite=True)
+    assert r3.seed["layers"] == ["SiO2"] and r3.seed["instrument"] is True
+    assert "fitted values of SiO2 + instrument" in p.show_model("SeedL")
+    assert r3.physics_hash() != R.seed_from_fit(r3, "Model1").physics_hash()
+    b3 = p.build_objectives("SeedL")
+    for e, o in b3["objectives"].items():
+        v = {q.name: q.value for q in o.parameters.flattened()}
+        assert v["Film - thick"] == 240
+        for n in ("SiO2 - thick", "scale", "bkg"):
+            assert np.isclose(v[n], best[(e, n)]), (e, n)
+    r4 = p.derive("Model1", "SeedL2", [], seed_from="Model1", seed_layers=["SiO2"],
+                  seed_instrument=False, overwrite=True)
+    b4 = p.build_objectives("SeedL2")
+    v = {q.name: q.value for q in b4["objectives"][285.0].parameters.flattened()}
+    assert v["scale"] == p.get_model("Model1").instrument.scale
+    # derive without seed_from drops the parent's seed
+    assert p.derive("SeedL", "NoSeed", [], overwrite=True).seed is None
+    _raises(KeyError, R.seed_from_fit, r3, "Model1", layers=["Nope"])
     # parent without fits cannot seed
     p.derive("Model1", "Unfit", [], overwrite=True)
     _raises(ProjectError, p.derive, "Model1", "SeedC", [], seed_from="Unfit")
+
+
+def test_widen_stuck_sld():
+    from rsoxr_harness.analysis import param_table
+    p = synthetic()
+    _two_fitted_models(p)
+    fit = param_table(p.h5_path, "Synth", ["Model1"])
+    fit = fit[fit.param.isin(["Film - sld", "Film - isld"])]
+    # tol 100% → every varying SLD counts as near its closer bound
+    r, rep = p.widen_stuck_sld("Model1", "Wide", "Film", step=1.0, tol_pct=100,
+                               overwrite=True)
+    assert r.seed["model"] == "Model1" and rep
+    assert "SLD bounds tab" in p.show_model("Wide")
+    b = p.build_objectives("Wide")
+    m1 = p.build_objectives("Model1")
+    for (e, part, v, lb, ub, side, nlo, nhi) in rep:
+        pname = "Film - sld" if part == "real" else "Film - isld"
+        q = {x.name: x for x in b["objectives"][e].parameters.flattened()}[pname]
+        q1 = {x.name: x for x in m1["objectives"][e].parameters.flattened()}[pname]
+        assert np.isclose(q.value, v), (e, part)                  # seeded, not reset
+        if side == "upper":
+            assert np.isclose(q.bounds.ub, q1.bounds.ub + 1) and np.isclose(q.bounds.lb, q1.bounds.lb)
+        elif side == "lower":
+            assert np.isclose(q.bounds.lb, q1.bounds.lb - 1) and np.isclose(q.bounds.ub, q1.bounds.ub)
+    from rsoxr_harness.plots import plot_sld_vs_energy
+    _png_ok(plot_sld_vs_energy(p, "Film", ["Model1"], show_bounds=True, bounds_from=["Wide"]))
+    # chained widening: seeds from a model whose fit sits outside the grandparent's
+    # window must not be clipped (overrides are applied before seeding)
+    if not p.has_fits("Wide"):
+        from rsoxr_harness.__main__ import main
+        assert main(["run", "fit", "-p", p.path, "--models", "Wide"] + _TINY) == 0
+    r2, _ = p.widen_stuck_sld("Wide", "Wide2", "Film", step=2.0, tol_pct=100, overwrite=True)
+    fw = param_table(p.h5_path, "Synth", ["Wide"])
+    bw = {(x.energy, x.param): x.value for x in fw.itertuples()}
+    b2 = p.build_objectives("Wide2")
+    assert not b2["seed_report"]["clipped"]
+    for e, o in b2["objectives"].items():
+        for q in o.parameters.flattened():
+            if q.vary:
+                assert np.isclose(q.value, bw[(e, q.name)]), (e, q.name)
+    # tol 0 → nothing widened, still seeded
+    r0, rep0 = p.widen_stuck_sld("Model1", "Wide0", "Film", tol_pct=0, overwrite=True)
+    assert not rep0 and not r0.overrides
+    # a layer without sld_offset cannot be widened
+    _raises(ProjectError, p.widen_stuck_sld, "Model1", "WideX", "SiO2")
+
+
+def test_link_recipe_ops():
+    r = base_recipe()
+    assert not r.is_linked
+    g = R.derive(r, "G", [{"op": "link", "layer": "Film", "params": ["roughness", "thickness"]}])
+    assert g.is_linked and g.links == {"params": {"Film": ["thickness", "roughness"]},
+                                       "energies": None}
+    assert ModelRecipe.from_json(json.loads(json.dumps(g.to_json()))).to_json() == g.to_json()
+    assert g.physics_hash() != r.physics_hash()
+    assert "shared across energies: Film thickness+roughness" in R.layer_table(g)
+    assert any("links" in d for d in R.diff(r, g))
+    assert R.rename_layer(g, "Film", "PTD").links["params"] == {"PTD": ["thickness", "roughness"]}
+    assert R.remove_layer(g, "Film").links is None
+    assert R.unlink(g, "Film", "roughness").links["params"] == {"Film": ["thickness"]}
+    assert R.unlink(g).links is None
+    _raises(ValueError, R.link, r, "Film", ["sld"])
+    _raises(KeyError, R.link, r, "Nope")
+    bad = R.set_energy_override(g, "Film", energy=285, thickness=240)
+    assert any("override sets its start" in e for e in R.validate(bad)[0])
+    one = R.link_energies(g, [285])
+    assert any("at least 2" in e for e in R.validate(one)[0])
+    ge = R.link_energies(g, [290], erange=(279, 286))
+    assert ge.links["energies"] == [290.0, {"erange": [279.0, 286.0]}]
+
+
+def test_global_build_and_fit():
+    import h5py
+    from rsoxr_harness.__main__ import main
+    from rsoxr_harness.analysis import param_table, _pick_run, chi2_table
+    p = synthetic()
+    _m1(p)
+    p.derive("Model1", "G1", [{"op": "link", "layer": "Film"},
+                              {"op": "link", "layer": "SiO2", "params": "thickness"},
+                              {"op": "link_energies", "erange": [279, 291]}],
+             overwrite=True)
+    assert p.get_model("G1").links["energies"] == [280.0, 285.0, 290.0]   # resolved on save
+    b = p.build_global("G1")
+    ck = b["checks"]
+    assert ck["n_shared"] == 3 and ck["n_energies"] == 3
+    assert ck["n_global"] == ck["n_independent"] - 2 * 3
+    thick = b["shared_params"][("Film", "thickness")]
+    assert all([c for c in st if c.name == "Film"][0].thick is thick for st in b["structures"])
+    # linked models fit their own energy set only
+    assert main(["run", "fit", "-p", p.path, "--models", "G1", "--energies", "285"] + _TINY) == 2
+    assert main(["run", "fit", "-p", p.path, "--models", "G1"] + _TINY) == 0
+    assert main(["run", "fit", "-p", p.path, "--models", "G1", "--seed", "3"] + _TINY) == 0
+    pt = param_table(p.h5_path, "Synth", ["G1"], criteria="last")
+    for n in ("Film - thick", "Film - rough", "SiO2 - thick"):
+        v = pt[pt.param == n].value
+        assert len(v) == 3 and np.allclose(v, v.iloc[0]), n          # one value everywhere
+    assert pt[pt.param == "Film - sld"].value.nunique() == 3            # SLD per energy
+    with h5py.File(p.h5_path, "r") as f:
+        picks, totals = set(), set()
+        for e in (280.0, 285.0, 290.0):
+            mg = f[f"Synth/{e}/G1"]
+            assert sorted(mg) == ["run_0", "run_1"]
+            r = _pick_run(mg, "best")
+            picks.add(r)
+            totals.add(float(mg[r].attrs["global_chi2_total"]))
+            assert json.loads(mg[r].attrs["global_energies"]) == [280.0, 285.0, 290.0]
+        assert len(picks) == 1 and len(totals) == 1                    # same global run
+        tot = totals.pop()
+        other = "run_1" if picks == {"run_0"} else "run_0"
+        assert tot <= float(f[f"Synth/280.0/G1/{other}"].attrs["global_chi2_total"])
+    t = chi2_table(p.h5_path, "Synth", ["G1"], reduced=False)
+    assert np.isclose(t["G1"].sum(), tot)
+    # a later model can start from the global fit
+    p.derive("G1", "G1s", [], seed_from="G1", overwrite=True)
+    bs = p.build_global("G1s")
+    best = param_table(p.h5_path, "Synth", ["G1"])
+    assert np.isclose(bs["shared_params"][("Film", "thickness")].value,
+                      best[best.param == "Film - thick"].value.iloc[0])
+    assert np.isclose(bs["checks"]["chi2_total"], tot, rtol=1e-6)
 
 
 def _png_ok(path):

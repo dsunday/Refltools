@@ -13,6 +13,11 @@ def _pick_run(model_grp, criteria):
     if not runs:
         return None
     if criteria == "best":
+        # global (energy-linked) runs are ranked by their total χ², so every
+        # energy picks the same run of the same global fit
+        if any("global_chi2_total" in model_grp[k].attrs for k in runs):
+            return min(runs, key=lambda k: (model_grp[k].attrs.get("global_chi2_total", np.inf),
+                                            int(k.split("_")[1])))
         return min(runs, key=lambda k: model_grp[k].attrs.get("chi_sq_final", np.inf))
     if criteria == "last":
         return max(runs, key=lambda k: int(k.split("_")[1]))

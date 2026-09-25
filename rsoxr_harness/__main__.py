@@ -105,11 +105,23 @@ def cmd_run(a):
     if a.h5 is None:
         for m in models:
             p.get_model(m)                  # fail early on unknown names
+        if k in ("nuts", "jaxns") and p.get_model(models[0]).is_linked:
+            print(f"error: {models[0]} is energy-linked; global {k} is not built yet "
+                  f"(M6 step 2)", file=sys.stderr)
+            return 2
     if k == "fit":
         if a.h5:
             print("error: --h5 is only for nuts/jaxns", file=sys.stderr)
             return 2
         energies = _energies(p, a)
+        linked = [m for m in models if p.get_model(m).is_linked]
+        if linked and (a.energies or a.erange):
+            print(f"error: {', '.join(linked)} {'is' if len(linked) == 1 else 'are'} "
+                  f"energy-linked and always fit their own energy set "
+                  f"(change it with the link_energies op)", file=sys.stderr)
+            return 2
+        if linked and len(linked) == len(models):
+            energies = sorted({e for m in linked for e in p.link_energy_list(m)})
     else:
         from .analysis import h5_energies, filter_energies
         h5 = a.h5 or p.h5_path
@@ -233,7 +245,7 @@ def cmd_plot(a):
         comps = {"both": ("real", "imag"), "real": ("real",), "imag": ("imag",)}[a.component]
         path = P.plot_sld_vs_energy(p, a.layer, a.models, references=a.ref or (),
                                     components=comps, show_bounds=a.bounds,
-                                    **sel, **common)
+                                    bounds_from=a.bounds_from or (), **sel, **common)
     elif k == "param":
         if not a.param:
             raise SystemExit("plot param needs --param (e.g. 'SOG - thick')")
@@ -392,6 +404,8 @@ def main(argv=None):
     s.add_argument("--ref", nargs="+", help="reference materials or CSV paths")
     s.add_argument("--component", default="both", choices=["both", "real", "imag"])
     s.add_argument("--bounds", action="store_true", help="shade parameter bounds")
+    s.add_argument("--bounds-from", nargs="+", metavar="MODEL",
+                   help="sld-energy: overlay these models' SLD windows (fitted or not)")
     s.add_argument("--metric", default="reduced", choices=["reduced", "raw"])
     s.add_argument("--log", action="store_true")
     s.add_argument("--q4", action="store_true")

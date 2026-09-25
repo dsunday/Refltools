@@ -45,6 +45,9 @@ Any older notebook h5 can be read by plot/fits/nuts/jaxns commands via
 | "build Model1: air / SOG 335 ±5 / SOC / SiO2 / Si, SOG SLD ±3" | `p.new_model("Model1", [LayerSpec(...), ...], InstrumentSpec(...), description=...)` — show `p.show_model` before saving (see protocol). |
 | "Model2 = Model1 + SOG2 layer above SOG, 15 Å (10–20)" | `p.derive("Model1", "Model2", [ops...], description=...)`; show the diff. |
 | "…starting from Model2's fit" | add `seed_from="Model2"` to `derive`. |
+| "ModelNg = ModelN with SOG thickness/roughness shared across energies (global fit)" | `p.derive("ModelN", "ModelNg", [{"op": "link", "layer": "SOG"}, ...])` (params default thickness+roughness; `"params": "thickness"` for one). Energy set is part of the model: `{"op": "link_energies", "energies": [...], "erange": [lo, hi]}` (default all data energies; resolved to data energies on save). `run fit` on a linked model = ONE global Sep-CMA-ES over its energy set (`--energies/--erange` refused); stored per energy under one run index with `global_chi2_total`; "best" = lowest global total. Report total χ², χ²/(N−P) and the shared values from the job output. Check first with `p.build_global("ModelNg")["checks"]`. Seeding from a per-energy model → shared start = median of the seeded values. |
+| "…start only SOC/SiO2 from Model2's fit" | `derive(..., seed_from="Model2", seed_layers=["SOC", "SiO2"])` (instrument too unless `seed_instrument=False`); other layers start from recipe values. Use this when adding/splitting layers — a full seed would stack new layers on an already-full thickness. `derive` without `seed_from` drops the parent's seed. |
+| "ModelNa = ModelN from its fit, widen the stuck SOG SLD bounds by 1" | `r, report = p.widen_stuck_sld("ModelN", "ModelNa", "SOG", step=1.0, tol_pct=10)` — seeds from the parent's fit; per energy, widens only the side where the fitted sld/isld ended within tol_pct % of the window (same test as the red "near bound" dots); writes bounds-only energy overrides. Print the report + `show_model`. Imag stuck at the 0 clamp is reported, not widened. |
 | "change the bounds of X in ModelN" | `p.edit_model("ModelN", [ops])` — only if unfitted; if frozen, propose deriving a new model (optionally seeded from the fit). |
 | "for 270 eV only start SOG at re=…, im=…" | op `set_energy_override` (see ops). "change 270 back" → `clear_energy_override`. |
 | "show / list the models", "full model" | `show -p P ModelN` / `models -p P`; full detail = layer table + material sources + ops + per-energy starting SLDs from `build_objectives` + `free_parameter_table`. |
@@ -55,6 +58,7 @@ Any older notebook h5 can be read by plot/fits/nuts/jaxns commands via
 | "χ² vs energy" | `plot chi2-energy` |
 | "compare reflectivity / fits" | `plot refl -p P --models ... [--energies ...\|--erange a b]` |
 | "SLD of SOG vs energy for models 2,4 vs the Brewer6 reference" | `plot sld-energy -p P --layer SOG --models Model2 Model4 --ref <material-or-csv> ...` |
+| "show ModelNa's new bounds on that SLD plot" | add `--bounds-from ModelNa` to `plot sld-energy` (works for unfitted models; widened energies marked ▲/▼). |
 | "thickness of SOC vs energy" | `plot param -p P --param "SOC - thick" --models ...` |
 | "depth profiles" | `plot profiles -p P --models ... [--energies ...] [--ref SOG SOC]` |
 | "save/export Model3's SOG SLD (to seed the next sample)" | `export-sld -p P --model Model3 --layer SOG [--register-as SOG_B9M3]` |
@@ -85,6 +89,7 @@ sld_offset=None, sld_real_bounds=None, sld_imag_bounds=None)`; bounds are
 - `{"op": "set_layer", "layer": L, <fields>}` (value `None` clears a bound), `{"op": "set_material", "layer": L, "material": M}`
 - `{"op": "set_instrument", <InstrumentSpec fields>}`
 - `{"op": "set_energy_override", "layer": L, "energy": E | "energies": [...], "sld_real": .., "sld_imag": .., "sld_offset": .., "thickness": .., "roughness": ..}` — SLD bounds re-centre on the new start using the layer's offset.
+  Give only `sld_offset` (no sld_real/sld_imag) to re-window the bounds around the tabulated SLD while keeping the current/seeded start (asymmetric OK, e.g. `{"real": (-3, 2, True)}`).
 - `{"op": "clear_energy_override", "layer": L?, "energy": E?}`, `{"op": "seed_from_fit", "model": M}`
 
 **Independent materials:** if the user wants a layer's optical constants tracked
@@ -130,8 +135,8 @@ only the starting table is shared otherwise — say so.
 
 ## Not implemented yet (milestone M6)
 
-Stoichiometric fitting (`kk_stoichiometry_fit.py`), global/shared-parameter fits
-across energies (`Model_Setup.create_energy_linked_reflectometry_models`),
+Global-fit JAXNS/NUTS (M6 step 2 — `run jaxns` on a linked model is not yet
+global), linking SLD across energies, stoichiometric fitting (`kk_stoichiometry_fit.py`),
 Kramers–Kronig-constrained fitting, intensity-vs-energy scans. Say so and offer
 to do it with the underlying Refltools functions directly.
 

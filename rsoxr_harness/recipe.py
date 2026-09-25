@@ -157,6 +157,8 @@ class ModelRecipe:
     description: str = ""
     overrides: list = field(default_factory=list)
     seed: dict | None = None      # {"model", "criteria", "runs": {E: run}}
+    links: dict | None = None     # {"params": {layer: [thickness|roughness]},
+                                  #  "energies": [E, ...] | None (= all data)}
 
     def __post_init__(self):
         self.layers = [l if isinstance(l, LayerSpec) else LayerSpec.from_json(l)
@@ -165,6 +167,12 @@ class ModelRecipe:
             self.instrument = InstrumentSpec.from_json(self.instrument)
         self.overrides = sorted((_norm_override(o) for o in self.overrides),
                                 key=lambda o: (o["energy"], o["layer"]))
+        self.links = _norm_links(self.links)
+
+    @property
+    def is_linked(self):
+        """True if some parameter is shared across energies (global fit)."""
+        return bool(self.links and self.links["params"])
 
     def overrides_at(self, energy):
         return [o for o in self.overrides if abs(o["energy"] - float(energy)) < 1e-3]
@@ -198,6 +206,7 @@ class ModelRecipe:
             "instrument": self.instrument.to_json(),
             **({"overrides": copy.deepcopy(self.overrides)} if self.overrides else {}),
             **({"seed": copy.deepcopy(self.seed)} if self.seed else {}),
+            **({"links": copy.deepcopy(self.links)} if self.links else {}),
         }
 
     @classmethod
@@ -206,7 +215,8 @@ class ModelRecipe:
                    instrument=d.get("instrument", {}),
                    parent=d.get("parent"), ops=d.get("ops", []),
                    description=d.get("description", ""),
-                   overrides=d.get("overrides", []), seed=d.get("seed"))
+                   overrides=d.get("overrides", []), seed=d.get("seed"),
+                   links=d.get("links"))
 
     def physics_hash(self):
         """Hash of what determines the objectives (layers + instrument)."""
@@ -216,6 +226,11 @@ class ModelRecipe:
             d["overrides"] = self.overrides
         if self.seed:
             d["seed"] = {"model": self.seed["model"], "runs": self.seed.get("runs")}
+            for k in ("layers", "instrument"):     # absent → older hashes unchanged
+                if k in self.seed:
+                    d["seed"][k] = self.seed[k]
+        if self.links:
+            d["links"] = self.links
         payload = json.dumps(d, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -288,6 +303,9 @@ def remove_layer(r, name):
     out = copy.deepcopy(r)
     out.layers.pop(out.index(name))
     out.overrides = [o for o in out.overrides if o["layer"] != name]
+    if out.links:
+        out.links["params"].pop(name, None)
+        out.links = _norm_links(out.links)
     return out
 
 
@@ -325,6 +343,8 @@ def rename_layer(r, old, new):
     for o in out.overrides:
         if o["layer"] == old:
             o["layer"] = new
+    if out.links and old in out.links["params"]:
+        out.links["params"][new] = out.links["params"].pop(old)
     return out
 
 
@@ -336,6 +356,93 @@ def set_instrument(r, **kw):
     d = out.instrument.to_json()
     d.update(kw)
     out.instrument = InstrumentSpec.from_json(d)
+    return out
+
+
+# --- energy links (global fits) ---------------------------------------------
+
+LINKABLE = ("thickness", "roughness")
+
+
+def _norm_links(d):
+    """{"params": {layer: [...]}, "energies": None | [E | {"erange": [lo, hi]}]}.
+    An erange entry is resolved to data energies by the project on save."""
+    if not d:
+        return None
+    params = {}
+    for layer, ps in (d.get("params") or {}).items():
+        ps = [ps] if isinstance(ps, str) else list(ps)
+        bad = set(ps) - set(LINKABLE)
+        if bad:
+            raise ValueError(f"cannot link {sorted(bad)} of '{layer}'; "
+                             f"linkable: {list(LINKABLE)}")
+        ps = [p for p in LINKABLE if p in ps]
+        if ps:
+            params[str(layer)] = ps
+    en = d.get("energies")
+    if en is not None:
+        fl = sorted({float(e) for e in en if not isinstance(e, dict)})
+        rg = [{"erange": sorted(float(x) for x in e["erange"])}
+              for e in en if isinstance(e, dict)]
+        en = fl + rg
+    if not params and en is None:
+        return None
+    return {"params": params, "energies": en}
+
+
+def link(r, layer, params=LINKABLE):
+    """
+    Share `layer`'s thickness and/or roughness across all fitted energies
+    (one parameter for the whole global fit).  SLD, scale and bkg stay per
+    energy.  A recipe with links is fitted as one global objective over its
+    link energy set (see link_energies).
+    """
+    r.layer(layer)
+    out = copy.deepcopy(r)
+    cur = copy.deepcopy(out.links) or {"params": {}, "energies": None}
+    ps = [params] if isinstance(params, str) else list(params)
+    cur["params"][layer] = sorted(set(cur["params"].get(layer, [])) | set(ps),
+                                  key=LINKABLE.index)
+    out.links = _norm_links(cur)
+    return out
+
+
+def unlink(r, layer=None, params=None):
+    """Remove links (all, one layer's, or some of its params)."""
+    out = copy.deepcopy(r)
+    if not out.links:
+        return out
+    cur = out.links
+    for l in ([layer] if layer else list(cur["params"])):
+        if l not in cur["params"]:
+            continue
+        keep = [] if params is None else [p for p in cur["params"][l]
+                                          if p not in ([params] if isinstance(params, str) else params)]
+        if keep:
+            cur["params"][l] = keep
+        else:
+            del cur["params"][l]
+    out.links = _norm_links(cur)
+    return out
+
+
+def link_energies(r, energies=None, erange=None):
+    """
+    Fix the energy set of the global fit: energies=[...] and/or
+    erange=(lo, hi) (matched to data energies by the project).  Both None →
+    all data energies.  The set is part of the model so global χ² / log Z are
+    comparable between runs of the same model.
+    """
+    out = copy.deepcopy(r)
+    cur = copy.deepcopy(out.links) or {"params": {}, "energies": None}
+    if energies is None and erange is None:
+        cur["energies"] = None
+    else:
+        es = list(energies or [])
+        if erange is not None:
+            es.append({"erange": [float(x) for x in erange]})
+        cur["energies"] = es
+    out.links = _norm_links(cur)
     return out
 
 
@@ -365,7 +472,9 @@ def set_energy_override(r, layer, energies=None, energy=None, **kw):
     """
     At the given energy/energies only, start `layer` from other values.
     sld_real / sld_imag: new initial SLD; bounds are re-centred on it using
-    sld_offset (default: the layer's own sld_offset).  thickness / roughness:
+    sld_offset (default: the layer's own sld_offset).  sld_offset alone (no
+    sld_real/sld_imag for that part) re-windows the bounds around the
+    tabulated SLD and keeps the current start value.  thickness / roughness:
     new initial values within the layer's usual bounds.  Merges with an
     existing override for the same energy and layer.
     """
@@ -397,27 +506,52 @@ def clear_energy_override(r, layer=None, energies=None, energy=None):
     return out
 
 
-def seed_from_fit(r, model, criteria="best"):
+def seed_from_fit(r, model, criteria="best", layers=None, instrument=True):
     """
     Start this recipe's *varying* parameters from `model`'s fitted values
     (per energy, matched by exact parameter name).  The project resolves which
     run is used at each energy when the recipe is saved and records it, so the
     start point is reproducible.  Bounds are unchanged; out-of-bounds seeds
     are clipped.  model=None removes the seed.
+
+    layers=[...] seeds only those layers' parameters ("<layer> - ..."); the
+    instrument parameters (scale, bkg, ...) follow `instrument`.  Other layers
+    start from the recipe values.
     """
     out = copy.deepcopy(r)
-    out.seed = None if model is None else {"model": str(model), "criteria": criteria}
+    if model is None:
+        out.seed = None
+        return out
+    out.seed = {"model": str(model), "criteria": criteria}
+    if layers is not None:
+        for l in layers:
+            r.layer(l)                                     # must exist
+        out.seed["layers"] = [str(l) for l in layers]
+        out.seed["instrument"] = bool(instrument)
+    elif not instrument:
+        out.seed["instrument"] = False
     return out
 
 
-def apply_seed(values, objective):
+def seed_selects(seed, pname):
+    """True if a seed spec covers parameter `pname`."""
+    if " - " not in pname:                                # scale, bkg, dq ...
+        return seed.get("instrument", True)
+    layers = seed.get("layers")
+    return layers is None or pname.split(" - ", 1)[0] in layers
+
+
+def apply_seed(values, objective, seed=None):
     """
     values: {param_name: fitted value} for one energy.  Sets varying
     parameters of `objective` (clipped into bounds) → (n_seeded, clipped list).
+    seed (the recipe's seed spec) restricts which parameters are set.
     """
     n, clipped = 0, []
     for p in objective.parameters.flattened():
         if not p.vary or p.name not in values:
+            continue
+        if seed is not None and not seed_selects(seed, p.name):
             continue
         v = float(values[p.name])
         lo, hi = getattr(p.bounds, "lb", -np.inf), getattr(p.bounds, "ub", np.inf)
@@ -429,8 +563,12 @@ def apply_seed(values, objective):
     return n, clipped
 
 
-def apply_overrides(r, energy, objective):
-    """Apply r's overrides at `energy` to a built objective (in place)."""
+def apply_overrides(r, energy, objective, rebound=True):
+    """
+    Apply r's overrides at `energy` to a built objective (in place).
+    rebound=False skips bounds-only SLD re-windowing, which must run exactly
+    once (it reads the tabulated centre back from the current bounds).
+    """
     params = {p.name: p for p in objective.parameters.flattened()}
     done = []
     for o in r.overrides_at(energy):
@@ -439,6 +577,19 @@ def apply_overrides(r, energy, objective):
         for part, key, pname in (("real", "sld_real", f"{lay.name} - sld"),
                                  ("imag", "sld_imag", f"{lay.name} - isld")):
             if key not in o:
+                if (rebound and part in (o.get("sld_offset") or {})
+                        and part in (lay.sld_offset or {})):
+                    # bounds-only: re-window around the tabulated SLD, keep the
+                    # current (possibly seeded) start value
+                    p = params[pname]
+                    lo, hi, vary = o["sld_offset"][part]
+                    centre = float(p.bounds.ub) - lay.sld_offset[part][1]
+                    lo, hi = centre + lo, centre + hi
+                    if part == "imag":
+                        lo = max(0.0, lo)
+                    v = float(min(max(p.value, lo), hi))
+                    p.setp(value=v, bounds=(lo, hi), vary=vary)
+                    done.append(f"{pname} bounds=[{lo:g}, {hi:g}]")
                 continue
             p = params[pname]
             v = o[key]
@@ -474,6 +625,9 @@ OPS = {
     "set_energy_override": set_energy_override,
     "clear_energy_override": clear_energy_override,
     "seed_from_fit": seed_from_fit,
+    "link": link,
+    "unlink": unlink,
+    "link_energies": link_energies,
 }
 
 
@@ -552,6 +706,28 @@ def validate(r, known_materials=None):
                               f"{o['energy']:g} eV outside {b[:2]}")
         if l.is_constant and ("sld_real" in o or "sld_imag" in o):
             errors.append(f"override changes the SLD of constant layer '{l.name}'")
+        bounds_only = [k for k in (o.get("sld_offset") or {})
+                       if f"sld_{k}" not in o and k not in (l.sld_offset or {})]
+        if bounds_only:
+            errors.append(f"override at {o['energy']:g} eV re-bounds {o['layer']} "
+                          f"{bounds_only} but the layer has no sld_offset for it")
+    if r.links:
+        for layer, ps in r.links["params"].items():
+            if layer not in names:
+                errors.append(f"link names missing layer '{layer}'")
+                continue
+            l = r.layer(layer)
+            for pn in ps:
+                b = getattr(l, f"{pn}_bounds")
+                if l.is_constant or b is None or not b[2]:
+                    warnings.append(f"link {layer} {pn}: parameter is fixed, "
+                                    f"linking has no effect")
+                if any(o["layer"] == layer and pn in o for o in r.overrides):
+                    errors.append(f"link {layer} {pn}: a per-energy override sets "
+                                  f"its start value; clear it or unlink")
+        if r.links["params"] and r.links.get("energies") is not None \
+                and len(r.links["energies"]) < 2:
+            errors.append("a global fit needs at least 2 link energies")
     return errors, warnings
 
 
@@ -602,12 +778,30 @@ def layer_table(r):
         lines.append("override " + _fmt_override(o, r))
     if r.seed:
         lines.append("seed " + _fmt_seed(r.seed))
+    if r.links:
+        lines.append("links " + _fmt_links(r.links))
     return "\n".join(lines)
+
+
+def _fmt_links(lk):
+    ps = "; ".join(f"{l} {'+'.join(v)}" for l, v in lk["params"].items()) or "(none)"
+    en = lk.get("energies")
+    en = ("all data energies" if en is None else
+          f"{len(en)} energies " + ", ".join(f"{e:g}" if not isinstance(e, dict)
+                                             else f"{e['erange'][0]:g}–{e['erange'][1]:g}"
+                                             for e in en))
+    return f"shared across energies: {ps}  [global fit over {en}]"
 
 
 def _fmt_seed(sd):
     runs = sd.get("runs") or {}
-    return (f"start from {sd['model']} fitted values ({sd.get('criteria', 'best')} run; "
+    what = "fitted values"
+    if sd.get("layers") is not None:
+        what = ("fitted values of " + ", ".join(sd["layers"])
+                + (" + instrument" if sd.get("instrument", True) else ""))
+    elif not sd.get("instrument", True):
+        what = "fitted layer values (not instrument)"
+    return (f"start from {sd['model']} {what} ({sd.get('criteria', 'best')} run; "
             f"{len(runs)} energies" + ("" if runs else ", resolved on save") + ")")
 
 
@@ -619,6 +813,8 @@ def _fmt_override(o, r=None):
                                       else None)
         sld = ", ".join(f"{k[4:]}={o[k]:g}" for k in ("sld_real", "sld_imag") if k in o)
         parts.append(f"SLD start {sld} ({_fmt_off(off)})")
+    elif o.get("sld_offset"):
+        parts.append(f"SLD bounds tab {_fmt_off(o['sld_offset'])}")
     for k in ("thickness", "roughness"):
         if k in o:
             parts.append(f"{k}={o[k]:g}")
@@ -660,7 +856,10 @@ def diff(a, b):
             out.append("- override " + _fmt_override(ka[k], a))
         elif ka[k] != kb[k]:
             out.append("~ override " + _fmt_override(kb[k], b))
-    if (a.seed or {}).get("model") != (b.seed or {}).get("model"):
+    if a.links != b.links:
+        out.append(("~ links " + _fmt_links(b.links)) if b.links else "- links")
+    _sk = lambda sd: {k: v for k, v in (sd or {}).items() if k != "runs"}
+    if _sk(a.seed) != _sk(b.seed):
         out.append(("~ seed " + _fmt_seed(b.seed)) if b.seed else "- seed")
     return out or ["(no differences)"]
 
