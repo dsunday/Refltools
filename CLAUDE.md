@@ -11,7 +11,12 @@ modules directly (`batch`, `h5io`, `Model_Setup`, `gpu_*`, `Plotting_Refl`, ...)
 - **Plain-text fitting harness:** `rsoxr_harness/` (CLI `python -m rsoxr_harness`),
   driven by the `rsoxr-fit` skill in `.claude/skills/rsoxr-fit/SKILL.md`. Use it
   for any fitting request instead of writing notebook-style code.
-- Tests: `python tests/test_harness.py` (harness only).
+- **Plain-text reduction harness:** `rsoxr_reduce/` (CLI `python -m rsoxr_reduce`),
+  driven by the `rsoxr-reduce` skill in `.claude/skills/rsoxr-reduce/SKILL.md`. Use it
+  for raw-data reduction (stitching/trimming/open beam/energy scans) instead of
+  `RSoXRTrimWidget`; outputs go to `<raw>/ReducedAuto/`, never `Reduced/`.
+- Tests: `python tests/test_harness.py` (fitting harness), `python tests/test_reduce_harness.py`
+  (reduction harness).
 - GPUs are shared: check `nvidia-smi` first, set `CUDA_VISIBLE_DEVICES` and
   `XLA_PYTHON_CLIENT_PREALLOCATE=false`; the harness job runner does this.
 - Known issue (not fixed): `h5io.extract_sld_from_h5(materials_filter=...)`

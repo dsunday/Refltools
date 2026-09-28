@@ -111,7 +111,10 @@ only the starting table is shared otherwise — say so.
 - `scale_bounds` / `bkg_bounds` are **multiplicative** on the start value;
   `bkg=None` = data minimum. **`bkg_bounds=(0.001, 1)` (bkg can only decrease)
   is intentional — do not flag it.** Typical ALS carbon settings: scale 9–10
-  (data are not normalised; R ≈ 7 at low q), dq 0.7 fixed.
+  (data are not normalised; R ≈ 7 at low q), dq 0.7 fixed. That applies to the
+  manual `Reduced/` files (gain-8 open beam vs gain-9 data → ×10); files from the
+  reduction harness (`ReducedAuto/`, rsoxr-reduce skill) are gain-corrected,
+  R ≈ 0.7–1 at low q, so start scale near 1.
 - Models named `Model1, Model2, …`; a second copy of a layer is `SOG2` etc.
 - Fitted parameter names: `"<layer> - thick|rough|sld|isld"`, `scale`, `bkg`.
 - Fits are per energy and independent; `normalize=False` for CMA-ES,
