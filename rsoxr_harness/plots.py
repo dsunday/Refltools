@@ -169,7 +169,7 @@ def plot_sld_vs_energy(project, layer, models=None, references=(),
                        components=("real", "imag"), criteria="best",
                        energies=None, erange=None, show_bounds=False,
                        show_chi2=True, bounds_from=(), h5=None, sample=None,
-                       out=None):
+                       xlim=None, out=None):
     """
     Fitted SLD of one layer vs energy for several models, with reference SLD
     tables (project material names or CSV paths) overlaid as black lines.
@@ -190,7 +190,9 @@ def plot_sld_vs_energy(project, layer, models=None, references=(),
     refs = [(r, reference_array(project, r)) for r in references]
     extra = {}                                  # model → {E: {pname: (lo, hi)}}
     if bounds_from:
-        eb = elist or [e for e in project.energies if e in set(avail)]
+        # windows of unfitted models exist at every data energy, not just fitted ones
+        eb = (project.select_energies(energies, erange) if (energies or erange)
+              else project.energies)
         for m in bounds_from:
             with _quiet():
                 objs = project.build_objectives(m, eb)["objectives"]
@@ -230,6 +232,12 @@ def plot_sld_vs_energy(project, layer, models=None, references=(),
                         label=f"{m} widened" if j == 0 else "_nolegend_")
         col = 1 if comp == "real" else 2
         lo, hi = ax.get_xlim()
+        ew = [e for eb in extra.values() for e in eb]
+        if ew:                                   # widen to cover the overlaid windows
+            pad = 0.02 * max(max(ew) - min(ew), 1.0)
+            lo, hi = min(lo, min(ew) - pad), max(hi, max(ew) + pad)
+        if xlim is not None:
+            lo, hi = xlim
         for i, (r, arr) in enumerate(refs):
             ax.plot(arr[:, 0], arr[:, col], color="k", ls=_LS[i % len(_LS)], lw=1.4,
                     label=_ref_label(r))
@@ -976,3 +984,54 @@ def plot_stoich_chi2_rows(rows, out=None, title=None):
     p0 = rows[0][0]
     return _save(p0, fig, "stoich-chi2-rows", [nm for _, nm, _ in rows],
                  dict(rows=[[p.path, nm, lab] for p, nm, lab in rows]), out)
+
+
+def plot_kk_check(project, names, xlim=None, out=None):
+    """
+    KK consistency check(s): fitted Re/Im (markers) vs the KK-consistent curves
+    from the fitted Im (lines), and ΔRe = Re_fit − Re_KK per energy with the
+    ±tol flag band.  Several checks of the same project overlay in colour.
+    """
+    from .kk import load_kk
+    if isinstance(names, str):
+        names = [names]
+    fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 3, 1.8]})
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    lo_e, hi_e = np.inf, -np.inf
+    for i, n in enumerate(names):
+        s, t, kk = load_kk(project, n)
+        c = colors[i % len(colors)]
+        lab = f"{s['source']} (ρ={s['density']:.2f}{'*' if s['density_fitted'] else ''})"
+        m = (kk[:, 0] >= t.energy_eV.min()) & (kk[:, 0] <= t.energy_eV.max())
+        u = t.used.astype(bool)
+        for ax, fcol, kcol in ((axes[0], "re_fit", 1), (axes[1], "im_fit", 2)):
+            ax.plot(kk[m, 0], kk[m, kcol], "-", color=c, lw=1.4,
+                    label=f"KK of fitted Im — {lab}")
+            ax.plot(t.energy_eV[u], t[fcol][u], "o", color=c, ms=5, label=f"fitted — {s['source']}")
+            if (~u).any():
+                ax.plot(t.energy_eV[~u], t[fcol][~u], "o", mfc="white", mec=c, ms=5)
+        step = float(np.median(np.diff(t.energy_eV))) if len(t) > 1 else 1.0
+        w = 0.8 * step / len(names)
+        axes[2].bar(t.energy_eV + (i - (len(names) - 1) / 2) * w, t.d_re, width=w,
+                    color=c, edgecolor=["#C0392B" if f else c for f in t.flag],
+                    linewidth=1.2, alpha=0.85)
+        axes[2].axhspan(-s["tol"], s["tol"], color=c, alpha=0.08, lw=0)
+        lo_e, hi_e = min(lo_e, t.energy_eV.min()), max(hi_e, t.energy_eV.max())
+        axes[0].text(0.01, 0.97 - 0.07 * i,
+                     f"{n}: rms ΔRe {s['rms_d_re']:.2f}, rms/span {s['rms_over_span']:.2f} → {s['verdict']}",
+                     transform=axes[0].transAxes, va="top", fontsize=8, color=c)
+    axes[0].set_ylabel("Re SLD (10⁻⁶ Å⁻²)")
+    axes[1].set_ylabel("Im SLD (10⁻⁶ Å⁻²)")
+    axes[2].set_ylabel("ΔRe = fit − KK")
+    axes[2].axhline(0, color="k", lw=0.8)
+    axes[2].set_xlabel("Energy (eV)")
+    for ax in axes:
+        ax.grid(alpha=0.3)
+    axes[0].legend(fontsize=7.5, loc="lower right")
+    pad = 0.02 * max(hi_e - lo_e, 1.0)
+    axes[0].set_xlim(*(xlim or (lo_e - pad, hi_e + pad)))
+    fig.suptitle(f"{project.sample_name}: Kramers–Kronig consistency "
+                 "(red-edged bars: |ΔRe| > tol; band = ±tol)")
+    fig.tight_layout()
+    return _save(project, fig, "kk", list(names), {"names": list(names)}, out)

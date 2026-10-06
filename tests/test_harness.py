@@ -436,6 +436,68 @@ def test_seed_from_fit():
     _raises(ProjectError, p.derive, "Model1", "SeedC", [], seed_from="Unfit")
 
 
+def test_cmaes_per_energy_start():
+    """Each energy must start CMA-ES from its own values (not energy 0's) and
+    never come back worse than that start (regression: shared start vector)."""
+    from gpu_sweep_optimizer import gpu_fit_models_cmaes, gpu_fit_models_cmaes_multistart
+    p = synthetic()
+    _two_fitted_models(p)
+    p.derive("Model1", "SeedCMA", [], seed_from="Model1", overwrite=True)
+    objs = p.build_objectives("SeedCMA")["objectives"]
+    e0 = sorted(objs)[0]
+    for q in objs[e0].varying_parameters():          # spoil ONLY the first energy's start
+        if q.name in ("Film - thick", "Film - sld"):
+            q.value = q.bounds.lb
+    # χ² on the GPU builder's own (float64) scale — the scale best_chisqr uses
+    import jax.numpy as jnp
+    from gpu_reflect import ModelsBatchBuilder, extract_free_params
+    b = ModelsBatchBuilder(objs, sorted(objs))
+    b.use_f32_abeles = False
+    x0 = np.stack([[q.value for q in extract_free_params(o)] for o in b.objectives])
+    start = dict(zip(b.energies, np.array(b.fitness_jax(jnp.array(x0[:, None, :])))[:, 0]))
+    assert start[e0] > 10 * min(start[e] for e in objs if e != e0)
+    for fn, kw in ((gpu_fit_models_cmaes, {}), (gpu_fit_models_cmaes_multistart, {"n_restarts": 2})):
+        r = fn(objs, popsize=8, n_generations=2, tol=0, seed=1, **kw)
+        for e in objs:
+            assert r["best_chisqr"][e] <= start[e] * (1 + 1e-6), (fn.__name__, e, r["best_chisqr"][e], start[e])
+
+
+def test_kk_check():
+    """KK check: a formula's own tabulated SLD is consistent with itself (and
+    the fitted density recovers the input); a bump added to Re is flagged."""
+    from rsoxr_harness import kk as K
+    p = synthetic()
+    from Model_Setup import generate_sld_array_from_material
+    E = np.arange(270.0, 320.0, 1.0)
+    ref = np.asarray(generate_sld_array_from_material("C8H8", 1.05, E, probe="x-ray"))[:, :3]
+    d = os.path.join(p.path, "kk_test")
+    os.makedirs(d, exist_ok=True)
+    good = os.path.join(d, "ps_formula.csv")
+    np.savetxt(good, ref, delimiter=",", header="E,Re,Im", comments="")
+    s = K.kk_check(p, good, "C8H8", density_range=(0.8, 1.4), name="good")
+    assert abs(s["density"] - 1.05) < 0.05, s["density"]
+    assert s["rms_over_span"] < 0.10 and s["verdict"] == "consistent", s
+    bad = ref.copy()
+    bad[(bad[:, 0] >= 300) & (bad[:, 0] <= 303), 1] += 4.0
+    badf = os.path.join(d, "ps_bump.csv")
+    np.savetxt(badf, bad, delimiter=",", header="E,Re,Im", comments="")
+    s2 = K.kk_check(p, badf, "C8H8", density=1.05, name="bump", tol=2.0)
+    # the sampled edge step itself can exceed tol near 283–284 eV: compare with
+    # the unperturbed table at the same density/tol
+    s0 = K.kk_check(p, good, "C8H8", density=1.05, name="good_fixed", tol=2.0)
+    new = set(s2["flagged_eV"]) - set(s0["flagged_eV"])
+    assert new == {300.0, 301.0, 302.0, 303.0}, (s2["flagged_eV"], s0["flagged_eV"])
+    assert s2["rms_d_re"] > s["rms_d_re"]
+    assert K.kk_names(p) == ["bump", "good", "good_fixed"]
+    summ, table, kk = K.load_kk(p, "bump")
+    assert len(table) == len(E) and table.flag.sum() == len(s2["flagged_eV"]) and kk.shape[1] == 3
+    from rsoxr_harness import plots as P
+    _png_ok(P.plot_kk_check(p, ["good", "bump"]))
+    from rsoxr_harness.__main__ import main
+    assert main(["kk", "list", "-p", p.path]) == 0
+    assert main(["kk", "show", "-p", p.path, "--name", "bump"]) == 0
+
+
 def test_widen_stuck_sld():
     from rsoxr_harness.analysis import param_table
     p = synthetic()
@@ -553,6 +615,42 @@ def test_global_build_and_fit():
     assert np.isclose(bs["shared_params"][("Film", "thickness")].value,
                       best[best.param == "Film - thick"].value.iloc[0])
     assert np.isclose(bs["checks"]["chi2_total"], tot, rtol=1e-6)
+    # a seeded global fit never ends above its start
+    assert main(["run", "fit", "-p", p.path, "--models", "G1s"] + _TINY) == 0
+    tot_s = chi2_table(p.h5_path, "Synth", ["G1s"], reduced=False)["G1s"].sum()
+    assert tot_s <= tot * (1 + 1e-6), (tot_s, tot)
+
+
+def test_global_cmaes_narrow_basin():
+    """Seeded start in a narrow ~100-D basin, bound widths spanning 1e-2…1e3 and
+    some optimum coordinates on their upper bound (one-sided bkg windows): the
+    raw-σ / clip-then-tell loop never beat this start; the normalised, penalised
+    loop must."""
+    from rsoxr_harness.worker import global_cmaes, GLOBAL_SIGMA_SEEDED
+    rng = np.random.default_rng(0)
+    n = 120
+    width = 10.0 ** rng.uniform(-2, 3, n)
+    lb = rng.uniform(-1, 1, n) * width
+    ub = lb + width
+    xs = lb + rng.uniform(0.2, 0.8, n) * width
+    on_ub = rng.random(n) < 0.15
+    xs[on_ub] = ub[on_ub] + 0.01 * width[on_ub]          # optimum just past the bound
+
+    class Quad:
+        n_global = n
+        bounds = np.stack([lb, ub], axis=1)
+
+        def fitness(self, pop):
+            z = (np.atleast_2d(pop) - xs) / (2e-3 * width)
+            return 1e3 + np.sum(z ** 2, axis=1)
+
+    x0 = np.clip(xs + 3e-3 * width * rng.standard_normal(n), lb, ub)
+    f = Quad()
+    c0 = float(f.fitness(x0)[0])
+    x, c, info = global_cmaes(f, x0, 64, 400, tol=0, sigma_init=GLOBAL_SIGMA_SEEDED,
+                              verbose=False)
+    assert np.all((x >= lb) & (x <= ub))
+    assert c < c0 - 0.5 * (c0 - 1e3 - np.sum(((np.clip(xs, lb, ub) - xs) / (2e-3 * width)) ** 2)), (c, c0)
 
 
 def _stoich_table(path, formula="C8H8", density=1.05):

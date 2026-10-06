@@ -325,7 +325,7 @@ class ReductionProject:
                     pe, v["res"], v["stats"], v["all_flags"],
                     os.path.join(ddir, f"{pe['energy']:.2f}eV.png"),
                     sample=self.sample, reference=ref)
-        if write:
+        if write and not energies:      # a subset run must not truncate the folder records
             self._write_record(plan, out)
             self._write_angular_ranges(written)
             self._write_report(plan, out)

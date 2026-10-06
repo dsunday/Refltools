@@ -236,6 +236,10 @@ def status_table(project, job_id=None, n_tail=0):
     for j in jobs:
         if j.get("error") and (job_id or j["status"] in ("failed", "crashed")):
             out.append(f"\n{j['id']} error: {j['error'].strip().splitlines()[-1]}")
+        for m, o in (j.get("outputs") or {}).items():
+            if isinstance(o, dict) and o.get("kept_start"):
+                out.append(f"\n{j['id']} WARNING: {m} global fit did not improve on its "
+                           f"start (χ² {o.get('chi2_total', float('nan')):.6g}); saved run = start point")
         if n_tail:
             out.append(f"\n--- {j['id']} log (last {n_tail} lines) ---")
             out.append(tail(j["log"], n_tail))

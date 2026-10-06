@@ -761,14 +761,20 @@ def gpu_fit_models_cmaes(
     # per_lb/per_ub: (n_energies, n_free) — each energy's own bounds
     per_lb = jnp.array(builder.per_energy_bounds[:, :, 0])  # (n_energies, n_free)
     per_ub = jnp.array(builder.per_energy_bounds[:, :, 1])  # (n_energies, n_free)
-    # mean_init: start from the current parameter values (clipped to bounds).
-    # Starting from the current objective values rather than bounds center means
-    # CMA-ES explores around the user's starting point, which is typically a
-    # physically meaningful initial guess and often much closer to the true optimum.
-    current_vals = np.array([p.value for p in builder.free_params], dtype=np.float64)
-    lb_shared = builder.bounds[:, 0]
-    ub_shared = builder.bounds[:, 1]
-    mean_init_shared = jnp.array(np.clip(current_vals, lb_shared, ub_shared))
+    # mean_init: each energy starts from ITS OWN current parameter values
+    # (clipped to its own bounds).  Starting from the objective values rather
+    # than the bounds centre means CMA-ES explores around the user's (or a
+    # seeded fit's) starting point.  These must be per energy: energy-dependent
+    # SLD starts differ by many units across an absorption edge, and a single
+    # shared start (energy 0's values) silently discarded every other energy's
+    # seed.
+    start_vals = np.stack([
+        np.array([p.value for p in extract_free_params(obj)], dtype=np.float64)
+        for obj in builder.objectives
+    ])  # (n_energies, n_free)
+    start_vals = np.clip(start_vals, builder.per_energy_bounds[:, :, 0],
+                         builder.per_energy_bounds[:, :, 1])
+    mean_init = jnp.array(start_vals)
 
     solution_proto = np.zeros(n_free, dtype=np.float64)
     strategy = _algo_cls(population_size=popsize, solution=solution_proto)
@@ -776,7 +782,7 @@ def gpu_fit_models_cmaes(
     if _sigma_init is not None:
         params = params.replace(std_init=_sigma_init)
 
-    v_init = jax.jit(jax.vmap(strategy.init, in_axes=(0, None, None)))
+    v_init = jax.jit(jax.vmap(strategy.init, in_axes=(0, 0, None)))   # per-energy mean
     v_ask  = jax.jit(jax.vmap(strategy.ask,  in_axes=(0, 0, None)))
     v_tell = jax.jit(jax.vmap(strategy.tell, in_axes=(0, 0, 0, 0, None)))
 
@@ -784,7 +790,7 @@ def gpu_fit_models_cmaes(
     master_key, init_key = jax.random.split(master_key)
     init_keys = jax.random.split(init_key, n_energies)
 
-    states = v_init(init_keys, mean_init_shared, params)
+    states = v_init(init_keys, mean_init, params)
 
     # Build the fori_loop body — all pure JAX, no Python callbacks per generation.
     # Captures: v_ask, v_tell, params, per_lb, per_ub, n_energies, fitness_jax_fn.
@@ -877,10 +883,21 @@ def gpu_fit_models_cmaes(
 
     # Re-evaluate best solutions in float64 for accurate reported chi2.
     # The f32 search may have ~0.1% error; final values must be exact.
+    # The starting point is evaluated too: CMA-ES never scores its own mean,
+    # so without this a good (e.g. seeded) start could be returned worse.
     builder.use_f32_abeles = False
     best_sols_j = jnp.array(best_solutions[:, np.newaxis, :], dtype=jnp.float64)
     best_chisqr_arr = np.array(builder.fitness_jax(best_sols_j))[:, 0]
+    start_j = jnp.array(start_vals[:, np.newaxis, :], dtype=jnp.float64)
+    start_chisqr_arr = np.array(builder.fitness_jax(start_j))[:, 0]
     builder.use_f32_abeles = True
+    keep_start = start_chisqr_arr < best_chisqr_arr
+    if keep_start.any():
+        best_solutions[keep_start] = start_vals[keep_start]
+        best_chisqr_arr = np.where(keep_start, start_chisqr_arr, best_chisqr_arr)
+        if verbose:
+            kept = [builder.energies[i] for i in np.flatnonzero(keep_start)]
+            print(f"  kept starting point (better than CMA-ES result) at: {kept}")
 
     fitted_objectives = {}
     best_chisqr_dict = {}

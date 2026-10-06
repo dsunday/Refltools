@@ -62,6 +62,7 @@ Any older notebook h5 can be read by plot/fits/nuts/jaxns commands via
 | "thickness of SOC vs energy" | `plot param -p P --param "SOC - thick" --models ...` |
 | "depth profiles" | `plot profiles -p P --models ... [--energies ...] [--ref SOG SOC]` |
 | "save/export Model3's SOG SLD (to seed the next sample)" | `export-sld -p P --model Model3 --layer SOG [--register-as SOG_B9M3]` |
+| "check KK consistency" / "KK check of Model2's PS" / "are Re and Im Kramers–Kronig consistent" | `kk -p P --source Model2:PS --formula C8H8 [--density 1.05 \| --density-range lo hi] [--merge lo hi] [--mask lo hi ...] [--name N] [--tol T]` → KK-transforms the fitted Im (formula tails, density fitted unless given), compares with the fitted Re per energy; prints rms ΔRe, rms/(Re span) with a rough verdict (<0.10 consistent, <0.25 roughly), flagged energies (|ΔRe| > tol, default max(1, 10 % of span)) and writes a 3-panel plot. Results in `<project>/kk/<name>/` (kk_table.csv, kk_sld.csv, summary.json). `kk list`, `kk show --name N`; compare models: `plot kk --names N1 N2`. Report the density (and whether it hit the range edge), the verdict and where the mismatch sits. Source can also be a material or CSV (e.g. a NEXAFS-derived table). |
 | "fit the stoichiometry / density of SOG (from Model3's fit / a CSV)" | Register a search: `p.add_stoich(name=, source=, atoms=[...], counts=[...], density_range=(lo, hi), merge_points=, energy_mask=)` — source = material name \| `"Model3:SOG"` (fitted layer SLD) \| CSV path; counts entries int (fixed) \| `[lo, hi]` \| `[lo, hi, step]`. Fragment search: `mode="fragments", fragments=["SiO2", "CH3"], counts=[...]`. State the candidate count (`p.get_stoich(n).n_candidates()`, ~40 s per 1600 at the 56-worker cap), then `stoich run NAME [NAME2] -p P [--workers N] --detach`; `stoich list` / `stoich show NAME`. Fix one count (or use a fixed fragment) — formulas differing by an overall factor have identical cost. Best density is refined within ±`refine_density` (default 0.1). |
 | "proper uncertainty" / "Δχ² intervals" for a stoich run | `stoich chi2 NAME -p P` (needs σ columns 4–5 in the source table, e.g. from `sld_from_jaxns_cache`) → σ-weighted χ² per formula with density profiled, 401-pt χ²(ρ) grid; prints raw-σ and Birge-scaled (Δχ²/(χ²_best/ν)) profile intervals at Δχ²=1 (68%) and 4 (95%); `plot stoich-chi2 --name N`. Several runs (any projects) stacked as rows with shared column limits: `plots.plot_stoich_chi2_rows([(proj, name, label), ...], out=...)`. Prefer Birge-scaled when χ²/ν ≫ 1 or σ are mis-scaled (JAXNS normalize=True tempers σ). Flag interval ends that sit on the count grid edge. Noise model assumes the imaginary SLD fed to KK is exact. |
 | "uncertainty with a ±5% RMSE cutoff" | `plot stoich-accept --name N --tol-pct 5` (+ `plots.stoich_accepted(p, N, 5)` for the table: counts, atom and mass fractions, density of every candidate within +tol% of the best). Report ranges of ρ, element ratios and mass fractions, and flag counts whose accepted range touches the grid edge (range is then a lower bound on the uncertainty). Split residual windows: `energy_mask=[[270, 284], [310, 330]]`. |
@@ -143,11 +144,79 @@ only the starting table is shared otherwise — say so.
 5. **Failures:** `status --job ID --tail 40`; job records keep the traceback.
 6. Don't kill processes you didn't start; `pkill -f` patterns can match your own shell — kill by PID.
 
+## General fitting workflow
+
+General guidance from the user, not absolute: they will override steps or the
+order at times; follow their direction when they do. Say which step you are on
+when proposing the next action.
+
+1. **Start non-resonant.** Begin with a non-resonant energy (lowest in the
+   series, e.g. 230 or 270 eV for carbon) or hard X-ray data if available
+   (HXR: follow the HXR fitting guidelines: no q_offset, wide density scan,
+   choose ρ by critical-edge dip alignment). Away from an edge the optical
+   constants are close to the formula/tabulated values, so thickness is the
+   best-determined parameter.
+2. **Total thickness + surface roughness.** `new_model("Model0", ...)` with a
+   wide thickness window (e.g. 300–1600 Å if unknown), roughness ~1–20, modest
+   SLD offsets (re ±3, im ±1), scale free;
+   `run fit --models Model0 --energies <E> --restarts 3` (seconds).
+   Wrong-basin check: thickness at a window edge + roughness/SiO2 at their max
+   = CMA-ES in a wrong fringe basin (seen on PS Oct2019 with 300–1600 Å). Derive
+   `Model0b` with the window narrowed around d ≈ 2π/Δq_minima (±~20 %) and
+   refit. Fringe estimates only guide the window; they don't replace the fit.
+3. **More than one layer?** Look at the data/residuals for beating or
+   modulations that one layer can't make (two fringe periods, envelopes), or
+   use the user's stated layer structure. If present, refit the non-resonant
+   data with those layers to estimate each layer's thickness (split the Model0
+   total; bounds that keep the sum near the Model0 value).
+4. **NEXAFS starting point.** Check for NEXAFS-derived optical constants
+   (δ/β or SLD tables next to the data / in the sample folder). If they exist
+   and density + stoichiometry estimates are reasonable, use them as the
+   starting optical constants (register as a material; a table that doesn't
+   cover all data energies → hybrid with the formula outside its range, since
+   the harness holds table end values constant). Starting values matter: each
+   energy starts CMA-ES from its own values, and a formula start just past an
+   edge is a poor basin. Check energy-scale alignment against the NEXAFS
+   (compare fitted Re/Im with the table vs a shift; PS Undated was +0.65 eV);
+   shifting = symlinked copy with relabelled energies in a new project.
+5. **Initial full-series fit** (Model1): thickness/roughness from steps 2–3 with
+   tight bounds (±2–3 %), SLD windows widened where the resonance is
+   (`set_energy_override` + `sld_offset`). Then look at where it fits well and
+   where it doesn't: χ² vs energy, SLD vs energy (near-bound dots),
+   reflectivity overlays at the worst energies. Re-run poor energies with
+   `--restarts`; an unchanged χ² across restarts means a model/data limit, not
+   the optimizer. Fixed-angle residual features (same θ at every energy) point
+   to reduction artifacts, not structure.
+6. **Next steps depend on the system and fit quality.**
+   - Two-layer systems with reference fits available: compare to the
+     references, then test combinations where some layers are tightly
+     constrained to the reference SLD (e.g. ±0.1) and others float (e.g. ±1.5);
+     see the Brewer Track A/B setup.
+   - Then test interface layers: usually 1–3 nm (10–30 Å) at the top or bottom
+     of a layer (`add_layer` above/below, own material copy). Use caution:
+     thin layers can take unphysical optical constants. Keep their SLD windows
+     modest, watch for wild energy-to-energy swings or values far outside the
+     parent material's range, and check whether thickness pins to its bounds.
+     Prefer the simpler model unless χ²/BIC gain is clear and the values are
+     physical.
+   - 6a. Depending on the sample, a global fit connecting specified
+     parameters across energies (`link` / `link_energies` ops) — e.g. one
+     interface-layer thickness/roughness shared by all energies.
+7. **KK consistency** once a satisfactory model is chosen:
+   `kk --source ModelN:Layer --formula F` (density fitted) — KK-transforms the
+   fitted Im and compares with the fitted Re per energy. Compare candidate
+   models with `plot kk --names ...`. If far off, iterate the fit (e.g.
+   re-centre or tighten SLD windows where ΔRe is flagged, or seed Re from the
+   KK curve in `kk_sld.csv`). The match does not need to be perfect; sharp
+   resonances sampled at coarse energy steps always leave some residual.
+8. **Stoichiometry fit** if desired (`add_stoich` / `stoich run`; see the
+   Intent → action table).
+
 ## Not implemented yet (milestone M6)
 
 Global-fit JAXNS/NUTS (M6 step 2 — `run jaxns` on a linked model is not yet
 global), linking SLD across energies, multi-edge stoichiometry (independent/stitched KK across edges),
-Kramers–Kronig-constrained fitting, intensity-vs-energy scans. Say so and offer
+Kramers–Kronig-constrained fitting (the `kk` command only checks consistency after a fit), intensity-vs-energy scans. Say so and offer
 to do it with the underlying Refltools functions directly.
 
 ## Tests

@@ -16,6 +16,7 @@ Commands:
     plot       chi2 | chi2-energy | sld-energy | param | refl | profiles |
                uncertainty | posterior | evidence | corner | materials  → PNG
     export-sld save a layer's fitted SLD(E) as CSV (optionally register it)
+    kk         Kramers–Kronig consistency check of a layer's fitted SLD (run | list | show)
 """
 
 import argparse
@@ -171,6 +172,42 @@ def cmd_run(a):
     return 0 if job["status"] == "done" else 1
 
 
+def cmd_kk(a):
+    """Kramers–Kronig consistency check: run (default) | list | show NAME."""
+    from . import kk as K
+    from . import plots as P
+    p = _proj(a)
+    if a.action == "list":
+        names = K.kk_names(p)
+        if not names:
+            print("(no KK checks)")
+        for n in names:
+            s = K.load_kk(p, n)[0]
+            print(f"{n:32s} {s['source']:18s} {s['formula']:10s} ρ={s['density']:.3f} "
+                  f"rms ΔRe {s['rms_d_re']:.2f}  rms/span {s['rms_over_span']:.2f}  {s['verdict']}")
+        return 0
+    if a.action == "show":
+        if not a.name:
+            raise SystemExit("kk show needs --name")
+        s, t, _ = K.load_kk(p, a.name)
+        print(K.format_summary(s))
+        print(t.round(3).to_string(index=False))
+        return 0
+    if not (a.source and a.formula):
+        raise SystemExit("kk run needs --source (Model:Layer, material or CSV) and --formula")
+    mask = None
+    if a.mask:
+        if len(a.mask) % 2:
+            raise SystemExit("--mask takes pairs: LO HI [LO HI ...]")
+        mask = [[a.mask[i], a.mask[i + 1]] for i in range(0, len(a.mask), 2)]
+    s = K.kk_check(p, a.source, a.formula, density=a.density,
+                   density_range=tuple(a.density_range), merge_points=a.merge,
+                   energy_mask=mask, criteria=_crit(a.criteria), name=a.name, tol=a.tol)
+    print(K.format_summary(s))
+    print(P.plot_kk_check(p, s["name"], xlim=a.xlim))
+    return 0
+
+
 def cmd_stoich(a):
     from . import jobs as J
     from . import stoich as S
@@ -315,7 +352,8 @@ def cmd_plot(a):
         comps = {"both": ("real", "imag"), "real": ("real",), "imag": ("imag",)}[a.component]
         path = P.plot_sld_vs_energy(p, a.layer, a.models, references=a.ref or (),
                                     components=comps, show_bounds=a.bounds,
-                                    bounds_from=a.bounds_from or (), **sel, **common)
+                                    bounds_from=a.bounds_from or (), xlim=a.xlim,
+                                    **sel, **common)
     elif k == "param":
         if not a.param:
             raise SystemExit("plot param needs --param (e.g. 'SOG - thick')")
@@ -326,6 +364,10 @@ def cmd_plot(a):
     elif k == "profiles":
         path = P.plot_sld_profiles(p, a.models, references=a.ref or (),
                                    profile_xlim=a.xlim, **sel, **common)
+    elif k == "kk":
+        if not a.names:
+            raise SystemExit("plot kk needs --names (KK check names; see `kk list`)")
+        path = P.plot_kk_check(p, a.names, xlim=a.xlim, out=a.out)
     elif k.startswith("stoich-"):
         sims = []
         for x in a.sim or []:
@@ -464,6 +506,20 @@ def main(argv=None):
     s.add_argument("--detach", action="store_true",
                    help="return immediately (otherwise stream the log and wait)")
 
+    s = add("kk", cmd_kk, "Kramers–Kronig consistency check of fitted optical constants")
+    s.add_argument("action", nargs="?", default="run", choices=["run", "list", "show"])
+    s.add_argument("--source", help="Model:Layer (fitted SLD), material name or CSV")
+    s.add_argument("--formula", help="chemical formula for the KK tails, e.g. C8H8")
+    s.add_argument("--density", type=float, help="g/cm3 (default: fitted)")
+    s.add_argument("--density-range", type=float, nargs=2, default=[0.5, 2.5])
+    s.add_argument("--merge", type=float, nargs=2, help="merge points LO HI eV (default: data range)")
+    s.add_argument("--mask", type=float, nargs="+",
+                   help="energy windows LO HI [LO HI ...] for density fit + statistics")
+    s.add_argument("--tol", type=float, help="|ΔRe| flag threshold (default max(1, 10%% of Re span))")
+    s.add_argument("--criteria", default="best")
+    s.add_argument("--name", help="check name (default: <source>_<formula>)")
+    s.add_argument("--xlim", type=float, nargs=2)
+
     s = add("stoich", cmd_stoich, "KK stoichiometry searches: list | show | run | chi2")
     s.add_argument("action", choices=["list", "show", "run", "chi2"])
     s.add_argument("name", nargs="*")
@@ -502,7 +558,7 @@ def main(argv=None):
                                     "evidence", "corner", "materials",
                                     "stoich-results", "stoich-density", "stoich-counts",
                                     "stoich-accept", "stoich-chi2",
-                                    "stoich-overlay"])
+                                    "stoich-overlay", "kk"])
     s.add_argument("--name", help="stoich search name")
     s.add_argument("--formula", help="stoich-density: formula (default: best)")
     s.add_argument("--sim", nargs="+", metavar="FORMULA:RHO",
@@ -514,7 +570,7 @@ def main(argv=None):
     s.add_argument("--tol-pct", type=float, default=5.0,
                    help="stoich-accept: RMSE acceptance cut, %% above the best")
     s.add_argument("--method", default="jaxns", choices=["jaxns", "nuts"])
-    s.add_argument("--names", nargs="+", help="materials to plot (plot materials)")
+    s.add_argument("--names", nargs="+", help="plot materials: material names; plot kk: KK check names")
     s.add_argument("--models", "--model", nargs="+")
     s.add_argument("--layer")
     s.add_argument("--param")

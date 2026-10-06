@@ -105,39 +105,72 @@ def _run_fit(project, job):
     return outputs
 
 
+GLOBAL_SIGMA_SEEDED = 1e-3    # fraction of each bound width, fully seeded start
+GLOBAL_SIGMA_UNSEEDED = 0.1   # recipe start
+GLOBAL_SIGMA_MAX = 0.3
+
+
 def global_cmaes(builder, x0, popsize, n_generations, seed=0, tol=1e-4,
-                 patience=5, check_every=10, n_restarts=1, verbose=True):
+                 patience=5, check_every=50, n_restarts=1,
+                 sigma_init=GLOBAL_SIGMA_UNSEEDED, penalty=10.0, verbose=True):
     """
-    Sep-CMA-ES over a global fitness's parameter vector (FastGlobalFitness;
-    same loop as the LAMS7 global notebooks).  Restart 0 starts at x0; later restarts
-    start uniformly inside the bounds.  Returns (best_x, best_chi2, info).
+    Sep-CMA-ES over a global fitness's parameter vector (FastGlobalFitness),
+    searched in bound-normalised coordinates u = (x - lb) / (ub - lb), so one
+    step size suits thickness (window ~30 Å), SLD (~16) and bkg (~0.03) alike.
+
+    sigma_init is a fraction of each bound width.  A fully seeded start needs
+    ~1e-3: in ~200 dimensions the seed's basin is narrow (at 5 % of the widths
+    the best of 500 samples was ~5x worse than the seed), and CMA-ES moves its
+    mean to the best samples, so a wide first generation abandons the seed for good.
+
+    Bounds: samples are scored at their clipped point plus
+    penalty * χ²(start) * Σ(u - clip(u))², and told to CMA-ES unclipped.
+    Telling clipped samples makes every step one-sided for parameters sitting on
+    a bound (e.g. one-sided bkg windows); step-size adaptation reads that drift as
+    "steps too small" and σ grew ~200x in 50 generations, leaving the basin.
+
+    Restart 0 starts at x0; restart k ≥ 1 starts from the best point so far with
+    σ = sigma_init·10^k (capped at GLOBAL_SIGMA_MAX); uniform draws inside the
+    bounds are hopeless at this dimension.  Convergence is checked every
+    check_every generations (50: progress per generation is slow at this dimension).
+    Returns (best_x, best_chi2, info).
     """
     import jax
     import jax.numpy as jnp
     import numpy as np
     from evosax.algorithms import Sep_CMA_ES
     lb, ub = builder.bounds[:, 0], builder.bounds[:, 1]
-    lb_j, ub_j = jnp.array(lb), jnp.array(ub)
-    rng = np.random.default_rng(seed)
-    best = (None, np.inf)
+    width = np.where(ub > lb, ub - lb, 1.0)
+
+    def to_x(u):
+        return lb + np.clip(u, 0.0, 1.0) * width
+
+    x_start = np.clip(x0, lb, ub)
+    best = (x_start, float(builder.fitness(x_start[None, :])[0]))
     history = []
     gens_total = 0
+    converged = False
     for k in range(n_restarts):
-        start = np.clip(x0, lb, ub) if k == 0 else rng.uniform(lb, ub)
+        start_u = (best[0] - lb) / width
+        sig = min(sigma_init * 10.0 ** k, GLOBAL_SIGMA_MAX)
+        pen = penalty * max(best[1], 1.0)
         strategy = Sep_CMA_ES(population_size=popsize,
                               solution=np.zeros(builder.n_global, dtype=np.float64))
-        params = strategy.default_params
+        params = strategy.default_params.replace(std_init=sig)
         key = jax.random.PRNGKey(seed + k)
         key, ik = jax.random.split(key)
-        state = strategy.init(ik, jnp.array(start), params)
+        state = strategy.init(ik, jnp.array(start_u), params)
         prev, bad, converged, gen = np.inf, 0, False, 0
+        if verbose:
+            print(f"  restart {k}: σ_init = {sig:g} of bound widths", flush=True)
         for gen in range(n_generations):
             key, gk = jax.random.split(key)
             pop, state = strategy.ask(gk, state, params)
-            pop = jnp.clip(pop, lb_j, ub_j)
-            chi = jnp.array(builder.fitness(np.array(pop, dtype=np.float64)),
-                            dtype=jnp.float64)
-            state, _ = strategy.tell(gk, pop, chi, state, params)
+            u = np.array(pop, dtype=np.float64)
+            uc = np.clip(u, 0.0, 1.0)
+            chi = builder.fitness(lb + uc * width) + pen * np.sum((u - uc) ** 2, axis=1)
+            state, _ = strategy.tell(gk, pop, jnp.array(chi, dtype=jnp.float64),
+                                     state, params)
             if (gen + 1) % check_every == 0:
                 b = float(state.best_fitness)
                 if verbose and (gen + 1) % (check_every * 10) == 0:
@@ -150,7 +183,7 @@ def global_cmaes(builder, x0, popsize, n_generations, seed=0, tol=1e-4,
                 else:
                     bad = 0
                 prev = b
-        x = np.clip(np.array(state.best_solution), lb, ub)
+        x = to_x(np.array(state.best_solution, dtype=np.float64))
         c = float(builder.fitness(x[None, :])[0])
         history.append(c)
         gens_total += gen + 1
@@ -188,14 +221,23 @@ def _run_global_fit(project, job, recipe):
     builder = FastGlobalFitness(g, normalize_by_n_q=p.get("normalize", False))
     c_start = float(builder.fitness(x0[None, :])[0])
 
+    # a fully seeded start sits in a narrow basin → small first step; a recipe
+    # (or partially seeded) start needs room to move
+    seeded = bool(recipe.seed) and not recipe.seed.get("layers")
+    sigma = p.get("sigma_init") or (GLOBAL_SIGMA_SEEDED if seeded else GLOBAL_SIGMA_UNSEEDED)
+    print(f"[harness] start χ² {c_start:.6g} ({'seeded from ' + recipe.seed['model'] if seeded else 'recipe start'}); "
+          f"σ_init {sigma:g} of bound widths", flush=True)
+
     t0 = time.time()
     x, c, info = global_cmaes(builder, x0, p["popsize"], p["n_generations"],
                               seed=p.get("seed", 0), tol=p["tol"],
-                              patience=p["patience"], n_restarts=p.get("n_restarts", 1))
-    kept_start = False
-    if c > c_start:                         # never return worse than the start
-        x, c, kept_start = x0, c_start, True
-        print("[harness] CMA-ES ended above its start point; keeping the start", flush=True)
+                              patience=p["patience"], n_restarts=p.get("n_restarts", 1),
+                              sigma_init=sigma)
+    kept_start = not c < c_start
+    if kept_start:                          # never return worse than the start
+        x, c = x0, c_start
+        print("[harness] WARNING: global CMA-ES did not improve on its start; "
+              "the saved run IS the start point", flush=True)
     elapsed = time.time() - t0
     set_global_params(gobj, x)
     chi = {e: float(o.chisqr()) for e, o in zip(elist, objs)}
