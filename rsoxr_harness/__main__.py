@@ -17,6 +17,8 @@ Commands:
                uncertainty | posterior | evidence | corner | materials  → PNG
     export-sld save a layer's fitted SLD(E) as CSV (optionally register it)
     kk         Kramers–Kronig consistency check of a layer's fitted SLD (run | list | show)
+    nexafs     NEXAFS peak fitting of spectra / fitted Im SLD
+               (models | show-model | suggest | fit | list | show | series | export)
 """
 
 import argparse
@@ -208,6 +210,81 @@ def cmd_kk(a):
     return 0
 
 
+def cmd_nexafs(a):
+    """NEXAFS peak models and fits (see rsoxr_harness/nexafs.py)."""
+    from . import nexafs as N
+    from . import plots as P
+    p = _proj(a)
+    act = a.action
+    col = a.column
+    if act == "models":
+        for n in N.model_names(p):
+            m = N.get_model(p, n)
+            print(f"{n:24s} {len(m['peaks']):2d} peaks  {len(N.free_keys(m)):3d} free  "
+                  f"parent={m.get('parent') or '-':12s} {m.get('description', '')}")
+        return 0
+    if act == "show-model":
+        print(N.model_table(N.get_model(p, a.model or a.name)))
+        return 0
+    if act == "suggest":
+        if not a.source:
+            raise SystemExit("nexafs suggest needs --source")
+        d = N.load_signal(p, a.source, col, a.signal, a.sigma_column, a.shift, _crit(a.criteria))
+        m = N.suggest_model(d["E"], d["y"], name=a.save_as or "suggested",
+                            element=a.element, erange=a.erange, edge_location=a.edge)
+        print(N.model_table(m))
+        if a.save_as:
+            N.save_model(p, m, overwrite=a.overwrite)
+            print(f"saved peak model {a.save_as}")
+        return 0
+    if act == "fit":
+        if not (a.model and a.source):
+            raise SystemExit("nexafs fit needs --model and --source")
+        s = N.run_fit(p, a.model, a.source, name=a.name, column=col, signal=a.signal,
+                      erange=a.erange, energy_shift=a.shift, sigma_column=a.sigma_column,
+                      weights=a.weights, n_starts=a.starts, seed=a.seed,
+                      criteria=_crit(a.criteria))
+        print(N.format_fit(N.load_fit(p, s["name"])))
+        print(P.plot_nexafs_fit(p, s["name"], xlim=a.xlim))
+        return 0
+    if act == "list":
+        names = N.fit_names(p)
+        if not names:
+            print("(no NEXAFS fits)")
+        for n in names:
+            s = N.load_fit(p, n)
+            print(f"{n:34s} model {s['model']:14s} {s['signal']:5s} "
+                  f"{s['erange'][0]:g}-{s['erange'][1]:g} eV  n={s['n_points']:4d} "
+                  f"k={s['n_free']:3d}  RMSE {s['rmse']:.3g}  BIC {s['bic']:.1f}"
+                  + (f"  at-bound {len(s['at_bound'])}" if s["at_bound"] else ""))
+        return 0
+    if act == "show":
+        if not a.name:
+            raise SystemExit("nexafs show needs --name")
+        print(N.format_fit(N.load_fit(p, a.name)))
+        return 0
+    if act == "series":
+        if not a.names or not (a.peak or a.ratio):
+            raise SystemExit("nexafs series needs --names and --peak P or --ratio A B")
+        by = "energy" if (a.peak or a.ratio[0]).replace(".", "", 1).isdigit() else "name"
+        t = N.peak_series(p, a.names, peak=a.peak, ratio=a.ratio,
+                          normalize_by_edge=a.norm_edge, by=by)
+        print(t.round(4).to_string(index=False))
+        print(P.plot_nexafs_series(p, a.names, peak=a.peak, ratio=a.ratio, x=a.x,
+                                   labels=a.labels, normalize_by_edge=a.norm_edge, by=by,
+                                   x_label=a.x_label))
+        return 0
+    if act == "export":
+        if not (a.name and a.formula and a.density):
+            raise SystemExit("nexafs export needs --name FIT --formula F --density RHO")
+        path, info = N.export_material(p, a.name, a.formula, a.density,
+                                       register_as=a.register_as)
+        print(path + (f"  (registered as material {a.register_as})" if a.register_as else ""))
+        print(f"kkcalc Im rescale vs peak model: ×{info['im_scale']:.3f}")
+        return 0
+    raise SystemExit(f"unknown nexafs action {act}")
+
+
 def cmd_stoich(a):
     from . import jobs as J
     from . import stoich as S
@@ -278,6 +355,81 @@ def cmd_stoich(a):
     return 0 if job["status"] == "done" else 1
 
 
+def cmd_escan(a):
+    from . import jobs as J
+    from . import stoich as S
+    p = _proj(a)
+    if a.action == "list":
+        print(p.escan_table() if p.escan_names else "(no energy-scan fits)")
+        return 0
+    if not a.name:
+        raise SystemExit(f"escan {a.action} needs a NAME")
+    if a.action == "add":
+        if not (a.model and a.scans and a.kk):
+            raise SystemExit("escan add needs --model, --scans and --kk LAYER:FORMULA:DENSITY")
+        kk = []
+        for s in a.kk:
+            layer, formula, rho = s.split(":")
+            kk.append({"layer": layer, "formula": formula, "density": float(rho)})
+        flat = []
+        for s in a.flat or []:
+            layer, below, sig = s.split(":")
+            flat.append({"layer": layer, "below": float(below), "sigma": float(sig)})
+        group = None
+        if a.thickness_group:
+            names, lo, hi = a.thickness_group.split(":")
+            group = {"layers": names.split(","), "bounds": [float(lo), float(hi)]}
+        kw = dict(name=a.name[0], model=a.model, scans=a.scans, kk=kk, seed_model=a.seed_model,
+                  window=a.window, outer_step=a.outer_step, sigma_curv=a.sigma_curv,
+                  sigma_curv_outside=a.sigma_curv_outside, flat=flat,
+                  angle=not a.escan_only, min_theta=a.min_theta, high_theta=a.high_theta,
+                  high_sigma=(a.high_sigma if a.high_sigma == "auto" else float(a.high_sigma)),
+                  sigma_data=a.sigma_data, scan_weights=a.scan_weights,
+                  angle_scale_bounds=tuple(a.angle_scale_bounds), thickness_group=group,
+                  max_nfev=a.max_nfev or 2000, description=a.description or "")
+        sp = p.add_escan(overwrite=a.overwrite, **kw)
+        print(sp.describe())
+        return 0
+    if a.action == "show":
+        for n in a.name:
+            print(p.get_escan(n).describe())
+            f = os.path.join(p.path, "escan", n, "summary.json")
+            if os.path.exists(f):
+                import json as _json
+                s = _json.load(open(f))
+                print(f"  last run: cost {s['cost']:.1f} ({'converged' if s['converged'] else 'max_nfev'}, "
+                      f"{s['nfev']} evaluations); energy scans {', '.join(f'{c:.1f}' for c in s['cost_escan'])}"
+                      + (f"; angle scans {s['cost_angle']:.1f}" if 'cost_angle' in s else ""))
+                print("  params: " + ", ".join(f"{k} {v:.4g}" for k, v in s["params"].items()))
+                if s.get("at_bound"):
+                    print(f"  at bound: {', '.join(s['at_bound'])}")
+            else:
+                print("  (not run yet)")
+            print()
+        return 0
+    # run
+    for n in a.name:
+        p.get_escan(n)
+    gpu = "cpu" if a.cpu else a.gpu
+    if gpu is None:
+        print("error: pass --gpu N or --cpu", file=sys.stderr)
+        return 2
+    in_use = S.cpus_in_use()
+    workers = S.resolve_workers(a.workers or 8, in_use)
+    params = {"n_workers": workers, "start": a.start, "max_nfev": a.max_nfev}
+    job = J.new_job(p, "escan", list(a.name), [], params, gpu)
+    print(f"job {job['id']}: escan {' '.join(a.name)} on gpu={gpu} (start: {a.start}, "
+          f"{workers} CPU workers for KK responses)")
+    print(f"log: {job['log']}")
+    proc = J.launch(p, job, detach=a.detach)
+    if a.detach:
+        print(f"launched pid {proc.pid}; check with: python -m rsoxr_harness status -p {p.path}")
+        return 0
+    job = J.read_job(p, job["id"])
+    print(f"\njob {job['id']}: {job['status']}")
+    return 0 if job["status"] == "done" else 1
+
+
 def cmd_unc(a):
     import pandas as pd
     from . import analysis as A
@@ -342,6 +494,13 @@ def cmd_plot(a):
     common = dict(criteria=_crit(a.criteria), h5=a.h5, sample=a.sample, out=a.out)
     sel = dict(energies=a.energies, erange=a.erange)
     k = a.what
+    if k == "escan":
+        from . import escan as X
+        if not a.name:
+            raise SystemExit("plot escan needs --name")
+        for f in X.plot(p, a.name, out_dir=os.path.dirname(a.out) if a.out else None):
+            print(f)
+        return 0
     if k == "chi2":
         path = P.plot_chi2_bar(p, a.models, metric=a.metric, log=a.log, **sel, **common)
     elif k == "chi2-energy":
@@ -368,6 +527,14 @@ def cmd_plot(a):
         if not a.names:
             raise SystemExit("plot kk needs --names (KK check names; see `kk list`)")
         path = P.plot_kk_check(p, a.names, xlim=a.xlim, out=a.out)
+    elif k == "nexafs":
+        if not a.names:
+            raise SystemExit("plot nexafs needs --names (NEXAFS fit names; see `nexafs list`)")
+        path = P.plot_nexafs_fit(p, a.names, xlim=a.xlim, out=a.out)
+    elif k == "nexafs-series":
+        if not a.names or not (a.peak or a.ratio):
+            raise SystemExit("plot nexafs-series needs --names and --peak or --ratio")
+        path = P.plot_nexafs_series(p, a.names, peak=a.peak, ratio=a.ratio, out=a.out)
     elif k.startswith("stoich-"):
         sims = []
         for x in a.sim or []:
@@ -520,6 +687,37 @@ def main(argv=None):
     s.add_argument("--name", help="check name (default: <source>_<formula>)")
     s.add_argument("--xlim", type=float, nargs=2)
 
+    s = add("nexafs", cmd_nexafs, "NEXAFS peak fitting of spectra or fitted Im SLD")
+    s.add_argument("action", choices=["models", "show-model", "suggest", "fit", "list",
+                                      "show", "series", "export"])
+    s.add_argument("--model", help="peak model name")
+    s.add_argument("--source", help="Model:Layer, material name or file (CSV / 2-col spectrum)")
+    s.add_argument("--column", help="y column (header name or index; default Im / col 1)")
+    s.add_argument("--sigma-column", help="σ column (name or index)")
+    s.add_argument("--signal", default="auto", choices=["auto", "isld", "beta", "mu", "intensity"])
+    s.add_argument("--erange", type=float, nargs=2, help="fit window LO HI eV")
+    s.add_argument("--shift", type=float, default=0.0, help="energy shift added to the data (eV)")
+    s.add_argument("--weights", default="auto", choices=["auto", "none", "sigma"])
+    s.add_argument("--starts", type=int, default=0, help="extra random starts inside bounds")
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--name", help="fit name (fit/show/export) or model (show-model)")
+    s.add_argument("--names", nargs="+", help="series: fit names")
+    s.add_argument("--peak", help="series: peak name (or energy in eV)")
+    s.add_argument("--ratio", nargs=2, help="series: area(A)/area(B)")
+    s.add_argument("--norm-edge", action="store_true", help="series: divide by edge height")
+    s.add_argument("--x", type=float, nargs="+", help="series: x values (dose, ...)")
+    s.add_argument("--x-label")
+    s.add_argument("--labels", nargs="+")
+    s.add_argument("--save-as", help="suggest: store the proposal as this peak model")
+    s.add_argument("--overwrite", action="store_true")
+    s.add_argument("--element", default="C", help="suggest: edge element (C, N, O, F)")
+    s.add_argument("--edge", type=float, help="suggest: edge location (eV)")
+    s.add_argument("--formula", help="export: formula for the KK tails")
+    s.add_argument("--density", type=float, help="export: g/cm3")
+    s.add_argument("--register-as", help="export: register as a project material")
+    s.add_argument("--criteria", default="best")
+    s.add_argument("--xlim", type=float, nargs=2)
+
     s = add("stoich", cmd_stoich, "KK stoichiometry searches: list | show | run | chi2")
     s.add_argument("action", choices=["list", "show", "run", "chi2"])
     s.add_argument("name", nargs="*")
@@ -552,14 +750,48 @@ def main(argv=None):
     s.add_argument("--h5", help="read another h5 (e.g. a notebook's) instead")
     s.add_argument("--sample", help="sample name inside --h5")
 
+    s = add("escan", cmd_escan, "energy-scan fits (KK-linked; alone or co-refined with angle scans): "
+                                "add | list | show | run")
+    s.add_argument("action", choices=["add", "list", "show", "run"])
+    s.add_argument("name", nargs="*")
+    s.add_argument("--model", help="add: harness model giving layers/materials/bounds")
+    s.add_argument("--seed-model", help="add: fitted model to seed from (default: --model)")
+    s.add_argument("--scans", nargs="+", help="add: reduced energy-scan files (θ from header)")
+    s.add_argument("--kk", nargs="+", metavar="LAYER:FORMULA:DENSITY", help="add: KK-linked layers")
+    s.add_argument("--window", nargs=2, type=float, metavar=("LO", "HI"),
+                   help="add: KK merge window, eV (default data −20 / +30 eV)")
+    s.add_argument("--outer-step", type=float, default=2.0)
+    s.add_argument("--sigma-curv", type=float, default=0.05, help="add: isld curvature σ per 0.5 eV")
+    s.add_argument("--sigma-curv-outside", type=float,
+                   help="add: curvature σ outside the energy scans (default σ/10)")
+    s.add_argument("--flat", nargs="+", metavar="LAYER:BELOW_EV:SIGMA",
+                   help="add: flat-isld prior below an energy (σ per 0.5 eV)")
+    s.add_argument("--escan-only", action="store_true", help="add: energy scans only, geometry fixed")
+    s.add_argument("--min-theta", type=float, default=0.0, help="add: leave out angle-scan points below θ (deg)")
+    s.add_argument("--high-theta", type=float, help="add: re-weight angle-scan points above θ (deg)")
+    s.add_argument("--high-sigma", default="auto", help="add: σ above --high-theta: auto | number")
+    s.add_argument("--sigma-data", type=float, default=0.03)
+    s.add_argument("--scan-weights", nargs="+", type=float)
+    s.add_argument("--angle-scale-bounds", nargs=2, type=float, default=[0.5, 1.5])
+    s.add_argument("--thickness-group", metavar="L1,L2:LO:HI",
+                   help="add: fit the summed thickness of these layers within LO–HI")
+    s.add_argument("--max-nfev", type=int)
+    s.add_argument("--description")
+    s.add_argument("--overwrite", action="store_true")
+    s.add_argument("--start", default="last", help="run: last | model | path/to/result.npz")
+    s.add_argument("--gpu")
+    s.add_argument("--cpu", action="store_true")
+    s.add_argument("--workers", type=int)
+    s.add_argument("--detach", action="store_true")
+
     s = add("plot", cmd_plot, "make a figure (PNG path is printed)")
     s.add_argument("what", choices=["chi2", "chi2-energy", "sld-energy", "param",
                                     "refl", "profiles", "uncertainty", "posterior",
                                     "evidence", "corner", "materials",
                                     "stoich-results", "stoich-density", "stoich-counts",
                                     "stoich-accept", "stoich-chi2",
-                                    "stoich-overlay", "kk"])
-    s.add_argument("--name", help="stoich search name")
+                                    "stoich-overlay", "kk", "nexafs", "nexafs-series", "escan"])
+    s.add_argument("--name", help="stoich search / escan fit name")
     s.add_argument("--formula", help="stoich-density: formula (default: best)")
     s.add_argument("--sim", nargs="+", metavar="FORMULA:RHO",
                    help="stoich-overlay: extra/simulated formula:density pairs")
@@ -570,7 +802,10 @@ def main(argv=None):
     s.add_argument("--tol-pct", type=float, default=5.0,
                    help="stoich-accept: RMSE acceptance cut, %% above the best")
     s.add_argument("--method", default="jaxns", choices=["jaxns", "nuts"])
-    s.add_argument("--names", nargs="+", help="plot materials: material names; plot kk: KK check names")
+    s.add_argument("--names", nargs="+", help="plot materials: material names; plot kk: KK check names; "
+                                              "plot nexafs[-series]: NEXAFS fit names")
+    s.add_argument("--peak", help="nexafs-series: peak name")
+    s.add_argument("--ratio", nargs=2, help="nexafs-series: area(A)/area(B)")
     s.add_argument("--models", "--model", nargs="+")
     s.add_argument("--layer")
     s.add_argument("--param")

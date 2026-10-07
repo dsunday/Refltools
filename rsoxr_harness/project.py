@@ -392,6 +392,68 @@ class FitProject:
         w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
         return "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(r)) for r in rows)
 
+    # ------------------------------------------------------------------
+    # energy-scan fits (escan.py)
+    # ------------------------------------------------------------------
+    @property
+    def escan_names(self):
+        return list(self.cfg.get("escan", {}))
+
+    def add_escan(self, spec=None, overwrite=False, **kw):
+        """Register an energy-scan fit (EscanSpec or its fields).  Checks the model,
+        KK layers and scan files now; the fit runs as a job (`escan run NAME`)."""
+        from . import escan as X
+        spec = spec if isinstance(spec, X.EscanSpec) else X.EscanSpec(**(spec or kw))
+        rec = self.get_model(spec.model)
+        for k in spec.kk:
+            rec.layer(k["layer"])
+        if spec.seed_model:
+            self.get_model(spec.seed_model)
+        scans = []
+        for s in spec.scans:
+            path = os.path.abspath(s if os.path.isabs(s) else os.path.join(os.getcwd(), s))
+            if not os.path.exists(path):
+                raise ProjectError(f"energy-scan file not found: {s}")
+            X.read_scan(path)                         # header has θ, data parse
+            scans.append(path)
+        spec.scans = scans
+        for f in spec.flat:
+            if f["layer"] not in [k["layer"] for k in spec.kk]:
+                raise ProjectError(f"flat prior on '{f['layer']}', which is not a KK layer")
+        if spec.thickness_group:
+            for n in spec.thickness_group["layers"]:
+                rec.layer(n)
+        cur = self.cfg.setdefault("escan", {})
+        if spec.name in cur and not overwrite:
+            if cur[spec.name] == spec.to_json():
+                return spec
+            raise ProjectError(f"escan '{spec.name}' exists (overwrite=True to replace)")
+        cur[spec.name] = spec.to_json()
+        self.save()
+        return spec
+
+    def get_escan(self, name):
+        from . import escan as X
+        try:
+            return X.EscanSpec.from_json(self.cfg["escan"][name])
+        except KeyError:
+            raise ProjectError(f"no escan '{name}'; known: {self.escan_names}") from None
+
+    def escan_table(self):
+        rows = [("name", "model", "KK layers", "mode", "scans", "cost", "converged")]
+        for n in self.escan_names:
+            sp = self.get_escan(n)
+            cost, conv = "-", "-"
+            f = os.path.join(self.path, "escan", n, "summary.json")
+            if os.path.exists(f):
+                with open(f) as fh:
+                    s = json.load(fh)
+                cost, conv = f"{s['cost']:.1f}", str(s["converged"])
+            rows.append((n, sp.model, ",".join(k["layer"] for k in sp.kk),
+                         "co-refine" if sp.angle else "escan only", str(len(sp.scans)), cost, conv))
+        w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+        return "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(r)) for r in rows)
+
     def edit_model(self, name, ops):
         """Apply ops to an existing model in place (only while it has no fits)."""
         if self.has_fits(name):

@@ -1035,3 +1035,127 @@ def plot_kk_check(project, names, xlim=None, out=None):
                  "(red-edged bars: |ΔRe| > tol; band = ±tol)")
     fig.tight_layout()
     return _save(project, fig, "kk", list(names), {"names": list(names)}, out)
+
+
+# ---------------------------------------------------------------------------
+# NEXAFS peak fits
+# ---------------------------------------------------------------------------
+_NX = {"data": "#0b0b0b", "total": "#2a78d6", "peak": "#4a3aa7", "edge": "#eb6834",
+       "base": "#898781", "grid": "#e1e0d9", "ink2": "#52514e"}
+
+
+def _nexafs_axes(ax, rax, s, xlim, label_peaks=True, ylabel=None):
+    from .nexafs import SIGNAL_UNITS
+    d, c = s["data"], s["curve"]
+    fm = s["fitted_model"]
+    peaks = [p["name"] for p in fm["peaks"]]
+    edges = [e["name"] for e in fm["edges"]]
+    under = c["baseline"].to_numpy()
+    for e in edges:
+        under = under + c[e].to_numpy()
+    ax.plot(c.energy_eV, c["baseline"], "--", color=_NX["base"], lw=1, label="baseline")
+    if edges:
+        ax.plot(c.energy_eV, under, "-", color=_NX["edge"], lw=1.6, label="baseline + edge")
+    for i, pn in enumerate(peaks):
+        y = c[pn].to_numpy()
+        ax.fill_between(c.energy_eV, c["baseline"], c["baseline"] + y, color=_NX["peak"],
+                        alpha=0.10, lw=0)
+        ax.plot(c.energy_eV, c["baseline"] + y, "-", color=_NX["peak"], lw=0.9, alpha=0.8,
+                label="peaks" if i == 0 else None)
+    dense = len(d) > 150
+    if dense:
+        ax.plot(d.energy_eV, d.y, "-", color=_NX["data"], lw=1.0, label="data")
+    else:
+        ax.errorbar(d.energy_eV, d.y, yerr=d.sigma if d.sigma.notna().any() else None,
+                    fmt="o", ms=4.5, color=_NX["data"], mfc="white", mew=1.2, elinewidth=0.8,
+                    label="data", zorder=4)
+    ax.plot(c.energy_eV, c["total"], "-", color=_NX["total"], lw=2, label="fit", zorder=5)
+    if label_peaks:
+        lo, hi = xlim or (c.energy_eV.min(), c.energy_eV.max())
+        top = float(max(c["total"].max(), d.y.max()))
+        for i, pk in enumerate(sorted(s["peaks"], key=lambda p: p["energy"])):
+            if not lo <= pk["energy"] <= hi:
+                continue
+            yb = float(np.interp(pk["energy"], c.energy_eV, c["baseline"]))
+            ax.annotate(f"{pk['name']}\n{pk['energy']:.2f}", (pk["energy"], yb + pk["height"]),
+                        xytext=(0, 4 + 13 * (i % 2)), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=6.5, color=_NX["ink2"])
+        ax.set_ylim(top=top * 1.22)
+    rax.axhline(0, color=_NX["base"], lw=0.8)
+    if dense:
+        rax.plot(d.energy_eV, d.residual, "-", color=_NX["data"], lw=0.8)
+    else:
+        rax.plot(d.energy_eV, d.residual, "o", ms=3.5, color=_NX["data"], mfc="white")
+    for a in (ax, rax):
+        a.grid(color=_NX["grid"], lw=0.6)
+        a.set_axisbelow(True)
+        for sp in ("top", "right"):
+            a.spines[sp].set_visible(False)
+    ax.set_ylabel(ylabel or SIGNAL_UNITS.get(s["signal"], s["signal"]))
+    rax.set_ylabel("resid.", fontsize=8)
+    txt = (f"{s['name']}   model {s['model']}   RMSE {s['rmse']:.3g}   R² {s['r_squared']:.4f}"
+           f"   BIC {s['bic']:.0f}" + (f"   shift {s['energy_shift']:+g} eV" if s["energy_shift"] else ""))
+    ax.set_title(txt, fontsize=8.5, loc="left", color=_NX["ink2"])
+    if s["at_bound"]:
+        ax.text(0.99, 0.02, "at bound: " + ", ".join(sorted(s["at_bound"]))[:120],
+                transform=ax.transAxes, ha="right", va="bottom", fontsize=6.5, color="#d03b3b")
+
+
+def plot_nexafs_fit(project, names, xlim=None, out=None, label_peaks=True):
+    """One row per NEXAFS fit: data, total fit, Gaussian components (labelled),
+    baseline + edge, and a residual strip."""
+    from .nexafs import load_fit
+    if isinstance(names, str):
+        names = [names]
+    n = len(names)
+    fig = plt.figure(figsize=(10, 4.8 * n))
+    outer = fig.add_gridspec(n, 1, hspace=0.32)
+    first = None
+    for i, nm in enumerate(names):
+        s = load_fit(project, nm)
+        inner = outer[i].subgridspec(2, 1, height_ratios=[3.2, 1], hspace=0.06)
+        ax = fig.add_subplot(inner[0], sharex=first)
+        rax = fig.add_subplot(inner[1], sharex=ax)
+        first = first or ax
+        _nexafs_axes(ax, rax, s, xlim, label_peaks)
+        plt.setp(ax.get_xticklabels(), visible=False)
+        if i < n - 1:
+            plt.setp(rax.get_xticklabels(), visible=False)
+        if i == 0:
+            ax.legend(fontsize=7.5, loc="upper right", frameon=False, ncol=2)
+    rax.set_xlabel("Energy (eV)")
+    if xlim:
+        first.set_xlim(*xlim)
+    fig.suptitle(f"{project.sample_name}: NEXAFS peak fit", y=0.995, fontsize=11)
+    return _save(project, fig, "nexafs", list(names), {"names": list(names), "xlim": xlim}, out)
+
+
+def plot_nexafs_series(project, names, peak=None, ratio=None, x=None, labels=None,
+                       normalize_by_edge=False, by="name", x_label=None, out=None):
+    """Peak area (or area ratio) across fits, with 1σ error bars."""
+    from .nexafs import peak_series
+    t = peak_series(project, names, peak=peak, ratio=ratio,
+                    normalize_by_edge=normalize_by_edge, by=by)
+    xs = list(x) if x is not None else list(range(1, len(t) + 1))
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    ax.errorbar(xs, t.value, yerr=t.stderr, fmt="o-", color=_NX["total"], ms=8, lw=2,
+                capsize=3, mfc=_NX["total"], mec="white", mew=1.5)
+    labs = labels or list(t.fit)
+    for xi, yi, lb in zip(xs, t.value, labs):
+        ax.annotate(lb, (xi, yi), xytext=(6, 6), textcoords="offset points", fontsize=7,
+                    color=_NX["ink2"])
+    what = (f"area({ratio[0]}) / area({ratio[1]})" if ratio else f"area({peak})")
+    if normalize_by_edge:
+        what += " / edge height"
+    ax.set_ylabel(what)
+    ax.set_xlabel(x_label or ("fit" if x is None else "x"))
+    if x is None:
+        ax.set_xticks(xs)
+    ax.grid(color=_NX["grid"], lw=0.6)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    ax.set_title(f"{project.sample_name}: {what}", fontsize=10, loc="left")
+    fig.tight_layout()
+    tag = (f"{ratio[0]}-over-{ratio[1]}" if ratio else str(peak))
+    return _save(project, fig, "nexafs-series", list(names),
+                 {"names": list(names), "peak": peak, "ratio": ratio, "x": x}, out, tag=tag)

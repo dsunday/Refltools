@@ -986,6 +986,222 @@ def test_uncertainty_plots_and_evidence():
 # runner
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# energy scans (escan.py)
+# ---------------------------------------------------------------------------
+
+def _write_escan(p, theta=4.0):
+    """Simulate a fixed-angle energy scan of the true synthetic structure."""
+    from refnx.reflect import reflectivity
+    from rsoxr_harness.testing import TRUE, _film_table
+    from rsoxr_harness.materials import resolve
+    E = np.arange(276.0, 294.01, 0.5)
+    film = _film_table(E)
+    sio2 = resolve(p.material("SiO2"), E, p.path)
+    si = resolve(p.material("Si"), E, p.path)
+    R = []
+    for e in E:
+        q = np.array([4 * np.pi * np.sin(np.radians(theta)) / (12398.42 / e)])
+        f = lambda t: (np.interp(e, t[:, 0], t[:, 1]), np.interp(e, t[:, 0], t[:, 2]))
+        w = np.array([[0, 0, 0, 0], [TRUE["Film"][0], *f(film), TRUE["Film"][1]],
+                      [TRUE["SiO2"][0], *f(sio2), TRUE["SiO2"][1]], [0, *f(si), 4.0]])
+        R.append(reflectivity(q, w, dq=1.0, threads=1)[0])
+    path = os.path.join(p.path, f"Synth_Escan_th{theta:g}.dat")
+    with open(path, "w") as fh:
+        fh.write(f"# synthetic energy scan\n# theta = {theta} deg, two_theta = {2 * theta} deg\n")
+        fh.write("Energy(eV)\tR\tError\n")
+        for e, r in zip(E, R):
+            fh.write(f"{e}\t{r}\t{0.01 * r}\n")
+    return path
+
+
+def test_escan_fit():
+    """Energy-scan fits: spec validation, KK map = identity at the data, both modes
+    improve on their start, outputs/plots/CLI, restart from the previous result."""
+    from rsoxr_harness import escan as X
+    from rsoxr_harness.__main__ import main
+    p = synthetic()
+    if not p.has_fits("Model1"):
+        _m1(p)
+        assert main(["run", "fit", "-p", p.path, "--models", "Model1"] + _TINY) == 0
+    scan = _write_escan(p)
+    E, R, th = X.read_scan(scan)
+    assert th == 4.0 and E.size == 37 and np.all(R > 0)
+    _raises(Exception, p.add_escan, name="bad", model="Model1", scans=[scan],
+            kk=[{"layer": "Nope", "formula": "C8H8", "density": 1.05}])
+    _raises(ValueError, X.EscanSpec, name="x", model="Model1", scans=[scan], kk=[])
+    logs, costs = [], {}
+    for name, angle in (("only", False), ("co", True)):
+        p.add_escan(name=name, model="Model1", scans=[scan], angle=angle, max_nfev=25,
+                    kk=[{"layer": "Film", "formula": "C8H8", "density": 1.05}],
+                    min_theta=0.3, high_theta=3.0, high_sigma="auto")
+        s = X.run(p, name, start="model", workers=4, log=logs.append)
+        assert np.isfinite(s["cost"]) and s["nfev"] > 1, s
+        start_cost = float([l for l in logs if "start cost" in l][-1].split("start cost ")[1].split()[0])
+        assert s["cost"] < start_cost, (s["cost"], start_cost)
+        costs[name] = s["cost"]
+        r = X.load_result(p, name)
+        di = r["data_idx"]
+        assert r["E_grid"][0] < E[0] and r["E_grid"][-1] > E[-1]            # window extends past the data
+        assert np.allclose(r["E_grid"][di], E, atol=0.06)
+        resp = np.load(s["kk_response"]["Film"])
+        assert np.abs(resp["N"][1:-1, 1:-1] - np.eye(resp["N"].shape[0] - 2)).max() < 1e-6
+        d = X.escan_dir(p, name)
+        for f in ("result.npz", "summary.json", "paths_Film.csv"):
+            assert os.path.exists(os.path.join(d, f)), f
+        if angle:
+            assert "cost_angle" in s and "scale" in s["params"] and "thick:Film" in s["params"]
+        else:
+            assert "scale" not in s["params"]                               # geometry fixed
+        for f in X.plot(p, name):
+            _png_ok(f)
+    # restart from the previous result: starts at (about) the last cost
+    s2 = X.run(p, "only", start="last", max_nfev=5, workers=4, log=logs.append)
+    last_start = [l for l in logs if "start cost" in l][-1]
+    assert "start: previous result" in last_start
+    assert s2["cost"] <= costs["only"] * 1.001 + 1e-6, (s2["cost"], costs["only"])
+    assert os.path.exists(os.path.join(X.escan_dir(p, "only"), "result_prev.npz"))
+    assert main(["escan", "list", "-p", p.path]) == 0
+    assert main(["escan", "show", "only", "co", "-p", p.path]) == 0
+
+
+# ---------------------------------------------------------------------------
+# NEXAFS peak fitting
+# ---------------------------------------------------------------------------
+_NB_PEAKS = {   # INT_MOX notebook format (subset of peak_params_AsDep16mj_Carbon)
+    "peak_1_energy": 285.6, "peak_1_energy_bounds": (285.4, 285.6, False), "peak_1_width": 1.0,
+    "peak_1_width_bounds": (0.4, 1, True), "peak_1_height": 0.2, "peak_1_height_bounds": (0.1, 1, True),
+    "peak_1_color": "#0070C0",
+    "peak_2_energy": 287.2, "peak_2_energy_bounds": (287, 287.3, True), "peak_2_width": 0.8,
+    "peak_2_width_bounds": (0.3, 0.8, True), "peak_2_height": 0.4, "peak_2_height_bounds": (0.1, 1.3, True),
+    "peak_3_energy": 292.8, "peak_3_energy_bounds": (292.7, 293, True), "peak_3_width": 3.9,
+    "peak_3_width_bounds": (3.2, 5, True), "peak_3_height": 0.2, "peak_3_height_bounds": (0.1, 0.8, True),
+}
+_NB_EDGE = {"location": 289.5, "height": 1.0, "width": 0.8, "decay": 0.006}
+
+
+def test_nexafs_model_ops_and_notebook_import():
+    from rsoxr_harness import nexafs as N
+    m = N.from_notebook_dicts("nb", _NB_PEAKS, _NB_EDGE, baseline=0.1)
+    assert [p["name"] for p in m["peaks"]] == ["p1", "p2", "p3"]
+    assert not m["peaks"][0]["energy"]["vary"] and m["peaks"][0]["width"]["vary"]
+    assert m["edges"][0]["location"]["vary"] is False          # no bounds → fixed
+    assert N.free_keys(m) == ["p1.width", "p1.height", "p2.energy", "p2.width", "p2.height",
+                              "p3.energy", "p3.width", "p3.height"]
+    m2 = N.apply_ops(m, [
+        {"op": "add_peak", "energy": (288.5, 288.2, 288.8), "width": (1, 0.5, 2), "height": (0.5, 0, 2)},
+        {"op": "remove_peak", "name": "p3"},
+        {"op": "freeze", "params": ["energy", "width"]},
+        {"op": "window", "param": "location", "pm": 0.5, "peaks": [], "edges": True},
+        {"op": "shift_energies", "delta": -1.0},
+        {"op": "scale_heights", "factor": 4.0},
+    ])
+    names = [p["name"] for p in m2["peaks"]]
+    assert names == ["p1", "p2", "p4"], names                  # new peak got the next free name
+    assert all(not p["energy"]["vary"] and not p["width"]["vary"] for p in m2["peaks"])
+    loc = m2["edges"][0]["location"]
+    assert loc["vary"] and abs(loc["value"] - 288.5) < 1e-9 and abs(loc["lo"] - 288.0) < 1e-9
+    assert abs(m2["peaks"][1]["height"]["value"] - 1.6) < 1e-9
+    assert abs(m2["peaks"][1]["height"]["hi"] - 5.2) < 1e-9
+    _raises(KeyError, N.apply_ops, m, [{"op": "remove_peak", "name": "nope"}])
+    _raises(ValueError, N.apply_ops, m, [{"op": "set_peak", "name": "p2", "energy": (300, 287, 288)}])
+    p = synthetic()
+    N.save_model(p, m)
+    N.derive_peak_model(p, "nb", "nb2", [{"op": "freeze", "params": "height"}], description="d")
+    p = FitProject.open(p.path)                                # persisted in project.json
+    assert {"nb", "nb2"} <= set(N.model_names(p)) and N.get_model(p, "nb2")["parent"] == "nb"
+    _raises(ValueError, N.save_model, p, dict(N.get_model(p, "nb"), description="changed"))
+    assert "p2" in N.model_table(N.get_model(p, "nb"))
+
+
+def test_nexafs_fit_recovers_synthetic():
+    """Model = reference NEXAFS_BuildingBlock forward model; a perturbed start
+    recovers the truth; isld/µ files, frozen-shape transfer, series, plots."""
+    from rsoxr_harness import nexafs as N
+    from rsoxr_harness import plots as P
+    from NEXAFS_BuildingBlock import simulate_nexafs_spectrum_for_fitting
+    p = synthetic()
+    truth = N.make_model("truth", [
+        N.peak("pi", 285.3, 0.6, 6.0), N.peak("co", 288.4, 0.9, 3.0),
+        N.peak("sig", 294.0, 5.0, 2.5)], [N.edge(289.8, 4.0, 0.8, 0.01)], baseline=0.4)
+    E = np.arange(278.0, 320.0, 0.1)
+    y = N.evaluate(truth, E)
+    nb = {}
+    for i, pk in enumerate(truth["peaks"], 1):
+        nb.update({f"peak_{i}_energy": pk["energy"]["value"], f"peak_{i}_width": pk["width"]["value"],
+                   f"peak_{i}_height": pk["height"]["value"]})
+    ref = simulate_nexafs_spectrum_for_fitting(E, nb, {k: truth["edges"][0][k]["value"]
+                                                       for k in N.EDGE_PARAMS}, 0.4)
+    assert np.allclose(y, ref), "forward model differs from NEXAFS_BuildingBlock"
+    rng = np.random.default_rng(1)
+    noisy = y + rng.normal(0, 0.02, len(E))
+    d = os.path.join(p.path, "nexafs_test")
+    os.makedirs(d, exist_ok=True)
+    f3 = os.path.join(d, "sld.csv")
+    np.savetxt(f3, np.column_stack([E, np.zeros_like(E), noisy]), delimiter=",",
+               header="E,Re,Im", comments="")
+    f2 = os.path.join(d, "spec.dat")
+    np.savetxt(f2, np.column_stack([E, noisy]))
+    start = N.make_model("start", [
+        N.peak("pi", (285.5, 285.0, 286.0), (0.9, 0.3, 2), (4, 0, 15)),
+        N.peak("co", (288.2, 287.8, 288.8), (1.2, 0.3, 2), (2, 0, 10)),
+        N.peak("sig", (293.0, 291.0, 296.0), (4.0, 2, 8), (2, 0, 6))],
+        [N.edge((289.5, 289.0, 290.5), (3, 0, 10), (0.8, 0.3, 2), (0.02, 0, 0.1))],
+        baseline=(0.3, 0, 1))
+    N.save_model(p, start)
+    s = N.run_fit(p, "start", f3, name="syn", n_starts=3)
+    assert s["signal"] == "isld" and s["n_points"] == len(E) and s["success"]
+    v = s["all_values"]
+    for k, t in (("pi.energy", 285.3), ("co.energy", 288.4), ("pi.width", 0.6),
+                 ("pi.height", 6.0), ("edge.location", 289.8), ("baseline", 0.4)):
+        assert abs(v[k] - t) < 0.05 * max(1, abs(t) / 10), (k, v[k], t)
+    assert s["rmse"] < 0.03 and s["r_squared"] > 0.999 and not s["at_bound"]
+    pk = {q["name"]: q for q in s["peaks"]}
+    assert abs(pk["pi"]["area"] - 6.0 * 0.6 * N.GAUSS_AREA) < 0.1
+    # 2-column spectrum + window + shift
+    s2 = N.run_fit(p, "start", f2, name="syn2", erange=(280, 300), energy_shift=0.2)
+    assert s2["signal"] == "intensity" and abs(s2["all_values"]["pi.energy"] - 285.5) < 0.05
+    # isld → µ conversion: µ = 4πβ/λ = 2·isld·1e-6·λ, ×1e4 → µm⁻¹
+    dm = N.load_signal(p, f3, signal="mu")
+    lam = N.HC / E
+    assert np.allclose(dm["y"], noisy * 2e-6 * lam * 1e4)
+    _raises(ValueError, N.load_signal, p, f2, signal="mu")
+    # sparse transfer: shape frozen from the dense fit, heights only
+    N.derive_peak_model(p, "start", "frozen", [{"op": "seed_from_fit", "fit": "syn"},
+                                              {"op": "freeze", "params": ["energy", "width"]}])
+    sparse = os.path.join(d, "sparse.csv")
+    k = np.arange(0, len(E), 15)
+    np.savetxt(sparse, np.column_stack([E[k], np.zeros(len(k)), noisy[k]]), delimiter=",")
+    s3 = N.run_fit(p, "frozen", sparse, name="syn_sparse")
+    assert s3["n_free"] == len(N.free_keys(N.get_model(p, "frozen")))
+    t = N.peak_series(p, ["syn", "syn_sparse"], peak="pi")
+    assert abs(t.value.iloc[0] - t.value.iloc[1]) < 0.15 * t.value.iloc[0], t
+    r = N.peak_series(p, ["syn", "syn_sparse"], ratio=(285.3, 288.4), by="energy")
+    assert np.allclose(r.value, 6 * 0.6 / (3 * 0.9), rtol=0.1)
+    assert set(N.fit_names(p)) >= {"syn", "syn2", "syn_sparse"}
+    assert "AT BOUND" not in N.format_fit(N.load_fit(p, "syn"))
+    # suggestion finds the sharp peaks
+    sm = N.suggest_model(E, noisy, erange=(280, 320))
+    es = [q["energy"]["value"] for q in sm["peaks"]]
+    assert any(abs(e - 285.3) < 0.2 for e in es) and any(abs(e - 288.4) < 0.3 for e in es), es
+    _png_ok(P.plot_nexafs_fit(p, ["syn", "syn_sparse"]))
+    _png_ok(P.plot_nexafs_series(p, ["syn", "syn_sparse"], peak="pi", x=[0, 1]))
+
+
+def test_nexafs_export_kk_material():
+    from rsoxr_harness import nexafs as N
+    p = synthetic()
+    if "syn" not in N.fit_names(p):
+        test_nexafs_fit_recovers_synthetic()
+    path, info = N.export_material(p, "syn", "C8H8", 1.05, register_as="NX_syn")
+    a = load_table(path)
+    assert a.shape[1] == 3 and a[:, 0].min() <= 278.1 and a[:, 0].max() >= 319.8
+    assert 0.5 < info["im_scale"] < 2.0, info
+    p = FitProject.open(p.path)
+    assert "NX_syn" in p.cfg["materials"]
+    _raises(ValueError, N.export_material, p, "syn2", "C8H8", 1.05)   # intensity fit
+
+
 def _run_all():
     tests = [(n, f) for n, f in globals().items()
              if n.startswith("test_") and callable(f)]

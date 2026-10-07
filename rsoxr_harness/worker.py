@@ -27,6 +27,8 @@ def run_job(project_path, job_id):
             outputs = _run_sampling(project, job)
         elif job["kind"] == "stoich":
             outputs = _run_stoich(project, job)
+        elif job["kind"] == "escan":
+            outputs = _run_escan(project, job)
         else:
             raise ValueError(f"unknown job kind '{job['kind']}'")
     except BaseException as exc:          # includes KeyboardInterrupt / SIGTERM
@@ -428,4 +430,32 @@ def _run_stoich(project, job):
         print(f"[harness] stoich {name}: best {b['formula']}  ρ={b['density']:.4f} g/cm³  "
               f"RMSE={b['rmse']:.5f}  ({summ['n_candidates']} candidates, "
               f"{summ['search_sec']:.0f}s)", flush=True)
+    return outputs
+
+
+# ---------------------------------------------------------------------------
+# energy-scan fits (escan.py)
+# ---------------------------------------------------------------------------
+
+def _run_escan(project, job):
+    from . import escan as X
+    from . import stoich as S
+    outputs = {}
+    prm = job["params"]
+    n_workers = S.reserve_workers(prm.get("n_workers") or 8)
+    print(f"[harness] escan: {n_workers} worker processes for KK responses "
+          f"(cap {S.cpu_cap()} = 50% of {os.cpu_count()} CPUs)", flush=True)
+    try:
+        for name in job["models"]:
+            print("\n[harness] " + project.get_escan(name).describe(), flush=True)
+            summ = X.run(project, name, start=prm.get("start", "last"), max_nfev=prm.get("max_nfev"),
+                         workers=n_workers, log=lambda s: print(s, flush=True))
+            figs = X.plot(project, name)
+            outputs[name] = {"cost": summ["cost"], "converged": summ["converged"],
+                             "nfev": summ["nfev"], "figures": figs}
+            J.update_job(project, job["id"], outputs=outputs)
+            for f in figs:
+                print(f"[harness] figure: {f}", flush=True)
+    finally:
+        S.release_workers()
     return outputs

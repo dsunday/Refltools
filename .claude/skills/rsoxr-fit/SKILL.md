@@ -1,6 +1,6 @@
 ---
 name: rsoxr-fit
-description: Fit soft X-ray reflectivity (RSoXR) data with Refltools from plain-text requests — load a data folder, register optical constants, build and derive layer models ("add a SOG2 layer above SOG with ±0.5"), batch CMA-ES fits on GPU, χ²/SLD/reflectivity comparison plots, NUTS/JAXNS uncertainty and evidence. Use whenever the user talks about reflectivity fitting, RSoXR, layer models, SLD / optical constants, Brewer/LAM samples, fitting models, χ² comparisons, NUTS, JAXNS, BlackJAX, posterior or evidence for reflectivity.
+description: Fit soft X-ray reflectivity (RSoXR) data with Refltools from plain-text requests — load a data folder, register optical constants, build and derive layer models ("add a SOG2 layer above SOG with ±0.5"), batch CMA-ES fits on GPU, χ²/SLD/reflectivity comparison plots, NUTS/JAXNS uncertainty and evidence, fixed-angle energy-scan fits (KK-linked sld/isld, co-refinement with angle scans). Use whenever the user talks about reflectivity fitting, RSoXR, layer models, SLD / optical constants, Brewer/LAM samples, fitting models, χ² comparisons, NUTS, JAXNS, BlackJAX, posterior or evidence for reflectivity, energy scans / fixed-angle scans.
 ---
 
 # RSoXR fitting harness (Refltools/rsoxr_harness)
@@ -11,6 +11,20 @@ project-directory front end to the Refltools pipeline
 `gpu_mcmc` / `gpu_nested_sampler`). **Never write ad-hoc notebook-style fitting
 code when a harness call exists.** Package docs: module docstrings in
 `/homes/dfs1/Refltools/rsoxr_harness/*.py`.
+
+> **Pending ideas — mention these to the user once when this skill is loaded**
+> (requested 2026-10-07, not started). For energy-scan / KK-linked isld fits
+> (see "Energy scans" below), try two alternative isld representations, both
+> linear in their parameters so the cached KK response-matrix approach still
+> applies:
+> 1. **Cubic B-spline isld** on a coarser knot grid (instead of piecewise-linear
+>    node values), with the curvature prior as a proper ∫(isld″)² dE.
+> 2. **NEXAFS building-block isld** (edge step + peaks, `NEXAFS_BuildingBlock.py`)
+>    — far fewer parameters, imposes a physical shape.
+> Implement as an option in `rsoxr_harness/escan.py` (isld basis in `Problem.paths`,
+> prior in `Problem._arrays`) and compare against the current node-value fit
+> (Brewer1 O edge: `Harness_Brewer1_Oxygen_Auto`, `escan run O2L`). Remove this note
+> once done or declined.
 
 ## Environment
 
@@ -63,6 +77,7 @@ Any older notebook h5 can be read by plot/fits/nuts/jaxns commands via
 | "depth profiles" | `plot profiles -p P --models ... [--energies ...] [--ref SOG SOC]` |
 | "save/export Model3's SOG SLD (to seed the next sample)" | `export-sld -p P --model Model3 --layer SOG [--register-as SOG_B9M3]` |
 | "check KK consistency" / "KK check of Model2's PS" / "are Re and Im Kramers–Kronig consistent" | `kk -p P --source Model2:PS --formula C8H8 [--density 1.05 \| --density-range lo hi] [--merge lo hi] [--mask lo hi ...] [--name N] [--tol T]` → KK-transforms the fitted Im (formula tails, density fitted unless given), compares with the fitted Re per energy; prints rms ΔRe, rms/(Re span) with a rough verdict (<0.10 consistent, <0.25 roughly), flagged energies (|ΔRe| > tol, default max(1, 10 % of span)) and writes a 3-panel plot. Results in `<project>/kk/<name>/` (kk_table.csv, kk_sld.csv, summary.json). `kk list`, `kk show --name N`; compare models: `plot kk --names N1 N2`. Report the density (and whether it hit the range edge), the verdict and where the mismatch sits. Source can also be a material or CSV (e.g. a NEXAFS-derived table). |
+| "fit the energy scans" / "co-refine the angle and energy scans" | `escan add NAME --model M [--seed-model S] --scans … --kk LAYER:FORMULA:RHO …` (see "Energy scans"), show the `describe()` output, confirm, then `escan run NAME --gpu N --detach`; report cost (angle / each scan), scale, geometry at bounds, and Read the four `escan_NAME_*.png`. |
 | "fit the stoichiometry / density of SOG (from Model3's fit / a CSV)" | Register a search: `p.add_stoich(name=, source=, atoms=[...], counts=[...], density_range=(lo, hi), merge_points=, energy_mask=)` — source = material name \| `"Model3:SOG"` (fitted layer SLD) \| CSV path; counts entries int (fixed) \| `[lo, hi]` \| `[lo, hi, step]`. Fragment search: `mode="fragments", fragments=["SiO2", "CH3"], counts=[...]`. State the candidate count (`p.get_stoich(n).n_candidates()`, ~40 s per 1600 at the 56-worker cap), then `stoich run NAME [NAME2] -p P [--workers N] --detach`; `stoich list` / `stoich show NAME`. Fix one count (or use a fixed fragment) — formulas differing by an overall factor have identical cost. Best density is refined within ±`refine_density` (default 0.1). |
 | "proper uncertainty" / "Δχ² intervals" for a stoich run | `stoich chi2 NAME -p P` (needs σ columns 4–5 in the source table, e.g. from `sld_from_jaxns_cache`) → σ-weighted χ² per formula with density profiled, 401-pt χ²(ρ) grid; prints raw-σ and Birge-scaled (Δχ²/(χ²_best/ν)) profile intervals at Δχ²=1 (68%) and 4 (95%); `plot stoich-chi2 --name N`. Several runs (any projects) stacked as rows with shared column limits: `plots.plot_stoich_chi2_rows([(proj, name, label), ...], out=...)`. Prefer Birge-scaled when χ²/ν ≫ 1 or σ are mis-scaled (JAXNS normalize=True tempers σ). Flag interval ends that sit on the count grid edge. Noise model assumes the imaginary SLD fed to KK is exact. |
 | "uncertainty with a ±5% RMSE cutoff" | `plot stoich-accept --name N --tol-pct 5` (+ `plots.stoich_accepted(p, N, 5)` for the table: counts, atom and mass fractions, density of every candidate within +tol% of the best). Report ranges of ρ, element ratios and mass fractions, and flag counts whose accepted range touches the grid edge (range is then a lower bound on the uncertainty). Split residual windows: `energy_mask=[[270, 284], [310, 330]]`. |
@@ -187,6 +202,19 @@ when proposing the next action.
    `--restarts`; an unchanged χ² across restarts means a model/data limit, not
    the optimizer. Fixed-angle residual features (same θ at every energy) point
    to reduction artifacts, not structure.
+   - **Featureless fits (user rule).** If the data show fringes but the fit runs
+     straight through them (fit fringe amplitude ≪ data's), absorption or
+     thickness is probably too high. Before accepting it, refit those energies
+     with total thickness constrained to about the reference (off-edge) value
+     (±~0.5 %) and the imaginary SLD brought down (start from the NEXAFS/table
+     value; one run capped near the table, one with the normal window). For a
+     definitive answer, profile χ² with Im fixed on a grid (Re, thickness,
+     roughness, instrument refit) and look for a second basin. Report per
+     energy: local minimum (low-Im basin better → use it), bimodal (equal χ²
+     → prefer the table-consistent one), or real (high Im genuinely preferred;
+     check whether Re is pinned at a bound, a sign of an energy-scale or
+     resonance-sharpness problem). PS Undated example: 286.5 eV local minimum
+     (Im 8.3 → 2, χ² 6376 → 4541); 286.75 bimodal; 285.15 real but with Re pinned.
 6. **Next steps depend on the system and fit quality.**
    - Two-layer systems with reference fits available: compare to the
      references, then test combinations where some layers are tightly
@@ -212,12 +240,74 @@ when proposing the next action.
 8. **Stoichiometry fit** if desired (`add_stoich` / `stoich run`; see the
    Intent → action table).
 
+## Energy scans (fixed-angle R vs E) — `escan` commands
+
+Reduce first with the rsoxr-reduce skill (`escan` →
+`ReducedAuto/EnergyScans/*_Escan_th<θ>_<E0>-<E1>eV.dat`; find them with
+`rsoxr_reduce inventory`, not by file name). Work in **sld/isld** (10⁻⁶ Å⁻²).
+Module docs: `rsoxr_harness/escan.py`.
+
+```bash
+$PY -m rsoxr_harness escan add NAME -p P --model ModelNs --seed-model ModelN \
+    --scans <escan_th2.dat> <escan_th3.dat> --kk SOC_surf:C12O2H9:1.53 SOC:C12O2H9:1.53 \
+    --window 450 600 --sigma-curv 0.05 --flat SOC_surf:538:0.001 \
+    --min-theta 1.5 --high-theta 4 --high-sigma auto --thickness-group SOC_surf,SOC:958:968
+$PY -m rsoxr_harness escan run NAME -p P --gpu N [--start last|model|result.npz] --detach
+$PY -m rsoxr_harness escan list|show NAME -p P ;  plot escan --name NAME
+```
+- **Structure comes from a harness model** (layer order, materials, thickness /
+  roughness bounds, dq); start values from the best fits of `--seed-model`
+  (needed when the model itself is unfitted, e.g. a derived surface-layer model).
+  A surface/bulk split = derive a model with `add_layer SOC_surf above SOC like SOC`.
+- **KK layers** (`--kk LAYER:FORMULA:DENSITY`): isld = piecewise-linear through free
+  node values (a node at every energy-scan point, `--outer-step` eV outside),
+  sld = KK(isld) + one offset. Formula/density only set the tails and the pinned
+  end values → pick a density whose tabulated pre-edge isld matches the data.
+  The window must extend past the data (default −20/+30 eV); its edges are nodes
+  pinned to the tabulated isld, so kkcalc's merge rescale is the identity (the log
+  prints max |N − I|; a 470–570 window that coincided with the data gave edge
+  artefacts — dip/upturn in the last ~5 eV).
+- **Other layers follow the recipe**: sld window → free at each angle-scan energy
+  (interpolated across the scans, table outside); no window → table; air → const.
+- **Priors are per eV** (σ quoted per 0.5 eV): curvature everywhere,
+  `--sigma-curv-outside` (default σ/10) stiffer outside the scans so those nodes
+  can't act as a KK knob on the in-window sld; `--flat LAYER:E:σ` holds isld flat
+  below E (user's sharp-onset rule for a surface layer at the O edge).
+- **Modes**: default co-refinement with the angle scans (one shared angle-scan
+  scale, energy scans at scale 1, bkg per energy); `--escan-only` fixes geometry,
+  scale and non-KK layers at the seed model's values (user rule: thickness and
+  roughness otherwise float — keep them fixed or tightly bounded; use RSoXR fits
+  from the same spot, not HXR).
+- Outputs `escan/NAME/`: result.npz, summary.json, `paths_<layer>.csv` (E, sld,
+  isld, has-data flag), `free_<layer>.csv`; figures `escan_NAME_{optics,window,escans,angles}.png`.
+
+**Lessons (Brewer1, 2026-10-06/07)**
+- One angle per energy = one equation, two unknowns: a locus; continuity alone
+  is prior-driven. Use KK (seeded from the angle fits) or two angles.
+- **Critical angle**: θ below θc is surface-sensitive (evanescent), above it
+  bulk-sensitive. Opposite-sign misfits at two angles = depth structure → try a
+  surface layer. O edge: two-layer beat one layer in every test (also with only
+  the 3° scan).
+- Angle-scan points below ~1.5° sat 7–30 % under the model (energy-dependent, not
+  footprint per user) and pulled the scale to ~0.7–0.9 → `--min-theta 1.5`; the
+  channeltron region (> 4°) scatters ~15–25 % → `--high-theta 4 --high-sigma auto`.
+  Then the angle-scan scale came out 1.00 and agreed with the energy scans.
+- Remaining accepted misfit (O edge): model over-predicts R below θc in the
+  weakly absorbing pre-edge (2° scan +5–6 % at 495–525 eV). Ruled out: KK tail
+  slope (linear sld term → 0), dq, θ offset, SiO2, normalisation, footprint.
+- Per-energy angle fits near an edge often hide a wrong scale (1.1–2.5 at the C
+  edge, ~0.72 at the O edge) inside their sld/isld — compare at scale 1.
+- Carbon single-angle reference scripts (grid, continuity, pinned KK) and the
+  O-edge development scripts: `Brewer1_Fit_NB/Harness_Brewer1_Auto/escan_grid/`,
+  `Brewer1_Fit_NB/Harness_Brewer1_Oxygen_Auto/escan_grid/`.
+
 ## Not implemented yet (milestone M6)
 
 Global-fit JAXNS/NUTS (M6 step 2 — `run jaxns` on a linked model is not yet
 global), linking SLD across energies, multi-edge stoichiometry (independent/stitched KK across edges),
-Kramers–Kronig-constrained fitting (the `kk` command only checks consistency after a fit), intensity-vs-energy scans. Say so and offer
-to do it with the underlying Refltools functions directly.
+KK-constrained fitting of angle scans alone (the `kk` command only checks consistency after a fit; KK-linked fits
+with energy scans are the `escan` commands), single-angle grid/continuity tools (scripts only, see "Energy scans"). Say so and offer to do it with the underlying Refltools
+functions directly.
 
 ## Tests
 

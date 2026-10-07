@@ -11,6 +11,8 @@ modules directly (`batch`, `h5io`, `Model_Setup`, `gpu_*`, `Plotting_Refl`, ...)
 - **Plain-text fitting harness:** `rsoxr_harness/` (CLI `python -m rsoxr_harness`),
   driven by the `rsoxr-fit` skill in `.claude/skills/rsoxr-fit/SKILL.md`. Use it
   for any fitting request instead of writing notebook-style code.
+- Energy scans (fixed-angle R vs E): `python -m rsoxr_harness escan add|run|list|show`
+  (`rsoxr_harness/escan.py`; KK-linked optical constants, alone or co-refined with angle scans).
 - **Plain-text reduction harness:** `rsoxr_reduce/` (CLI `python -m rsoxr_reduce`),
   driven by the `rsoxr-reduce` skill in `.claude/skills/rsoxr-reduce/SKILL.md`. Use it
   for raw-data reduction (stitching/trimming/open beam/energy scans) instead of
