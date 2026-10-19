@@ -47,6 +47,22 @@ file, trims, angles, reasons, background, scale, flags, status),
 The beamline log is found by walking up from the raw folder; open beams from an
 `OpenBeam*`/`Open Beam` folder nearby, else the log's folder (`--open-beam` overrides).
 
+> **Current limitation: raw data must be pre-sorted by hand.** The harness assumes the
+> raw files are already sorted into one folder per sample × edge × round, because that
+> is how the data were organised when it was built. It can't yet take an unsorted
+> beamtime dump and split it.
+>
+> **Important feature to implement later: automatic sorting from the beamline log.**
+> The log already records, for every file, what's needed to sort it (energy → edge,
+> sample position x/y, scan type, detector, timestamp). The planned feature is a
+> command that reads the log, groups files into sample × edge × round, proposes the
+> grouping with reasons for the user to confirm, then creates the projects. Build it on
+> the existing parsing and classification in `inventory.py` (`parse_log`, `file_info`,
+> `edge_of`).
+>
+> **Until then:** if a user points at an unsorted folder, don't sort or move files
+> yourself. Say this isn't supported yet and ask them to pre-sort the data.
+
 ## Intent → action
 
 | User says | Do |
