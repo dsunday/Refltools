@@ -13,6 +13,10 @@ carries a reason string, and problem energies are held back until reviewed.
 `override` so the reason is recorded. Module docstrings in
 `/homes/dfs1/Refltools/rsoxr_reduce/*.py` document every rule.
 
+**Human-readable walk-through of every criterion** (thresholds, settings keys, flags,
+why): [`REDUCTION_GUIDE.md`](REDUCTION_GUIDE.md) in this folder. Read it when the user
+asks to explain a trim/flag/threshold or wants to change a setting; quote it to them.
+
 ## Environment
 
 ```bash
@@ -58,22 +62,31 @@ The beamline log is found by walking up from the raw folder; open beams from an
 
 ## The rules (reason codes)
 
-**Selection** (`selection.py`) — decided from the log + data, never the file name:
-`DUMMY/EMPTY/ZERO` (≤5 pts, max angle ≤1°, <200 B or no signal) never used;
-`ENERGY_SCAN` (column 0 in eV) → `escan`; `OPEN_BEAM`; `ALIGNMENT`; `UNLOGGED`.
-Sections = clusters of detector + angular range (count time ignored), ordered by
-start angle (PD first). Per energy × section: **latest full-range scan wins**
-(`SUPERSEDED`; user's rule), `PARTIAL_RANGE` if span < 80 % of nominal (review only if
-it ends early or leaves a gap), `OFF_SECTION`, `NO_PD` → energy rejected,
-`MISSING_SECTION` (middle, review), `TRUNCATED_Q` (trailing, info),
-`MIXED_SESSION` (> 6 h apart, review), `POSITION_MISMATCH` (sections at different
-spots; info ≤ 3 mm — spots are stepped on purpose to limit beam damage).
+Pipeline order: **classify → select → trim → background → ÷ open beam → stitch → QC
+→ write or hold**. Severity: *review* = energy held (no `.dat`) until accepted;
+*info* = recorded only. Full thresholds and reasons: `REDUCTION_GUIDE.md`.
 
-**Trims** (`trim.py`):
+**1. Selection** (`selection.py`) — decided from the log + data, never the file name.
+- `DUMMY/EMPTY/ZERO` (≤5 pts, max angle ≤1°, <200 B or no signal) — never used.
+- `ENERGY_SCAN` (column 0 in eV) → `escan`. Also `OPEN_BEAM`, `ALIGNMENT`, `UNLOGGED`.
+- Sections = clusters of detector + angular range (count time ignored), ordered by
+  start angle (PD first).
+- Per energy × section, **latest full-range scan wins** (`SUPERSEDED`; user's rule).
+- `PARTIAL_RANGE` — span < 80 % of nominal (review only if it ends early or leaves a gap).
+- `OFF_SECTION` — range matches no section.
+- `NO_PD` — energy rejected.
+- `MISSING_SECTION` — middle section absent (review).
+- `TRUNCATED_Q` — trailing section absent (info).
+- `MIXED_SESSION` — chosen scans > 6 h apart (review).
+- `POSITION_MISMATCH` — sections at different spots; info ≤ 3 mm (spots are stepped
+  on purpose to limit beam damage).
+
+**2. Trims** (`trim.py`)
 - *PD start (beam clipping)* — one angle per folder: median over energies of the
-  low-angle PD maximum; `CLIP_SHIFT` if an energy's own peak is > 2 steps away.
-  `PD_SATURATION`: PD at the ADC limit (≥ 9.99 V) → start after the plateau
-  (review if data above the clip angle are lost → lower the PD gain next time).
+  low-angle PD maximum.
+  - `CLIP_SHIFT` — an energy's own peak is > 2 steps away.
+  - `PD_SATURATION` — PD at the ADC limit (≥ 9.99 V) → start after the plateau
+    (review if data above the clip angle are lost → lower the PD gain next time).
 - *PD background* — one value per folder: intercept of a robust PD-vs-CEM
   regression in the overlap (PD dark offset), median over well-conditioned energies;
   fallback default per edge.
@@ -84,25 +97,35 @@ spots; info ≤ 3 mm — spots are stepped on purpose to limit beam damage).
   +22 % at 3e5–1e6 cps in Nov 2025) → leading points trimmed.
 - *Tail* — last section cut where counts < 10 (`LOW_COUNTS_TAIL`); final point always dropped.
 
-**Stitch** (`stitch.py`) — numerically identical to the widget/legacy path
-(trim → background → ÷ I0 → drop ≤0 → cumulative median-ratio stitch → Q with
-λ = 12399/E); flat 1 % errors. Open beam (`pipeline.choose_open_beam`): same edge,
-then same filter, same exit-slit gap (±3 %), covering the energy, closest in time.
-**PD gain is in decades: I0 is multiplied by 10^(gain_sample − gain_open-beam)**
-(`GAIN_CORRECTED`); slit/filter mismatches are flagged, not corrected.
+**3. Stitch and open beam** (`stitch.py`, `pipeline.choose_open_beam`)
+- Numerically identical to the widget/legacy path: trim → background → ÷ I0 →
+  drop ≤0 → cumulative median-ratio stitch → Q with λ = 12399/E; flat 1 % errors.
+- Open beam: same edge, then same filter, same exit-slit gap (±3 %), covering the
+  energy, closest in time.
+- **PD gain is in decades: I0 is multiplied by 10^(gain_sample − gain_open-beam)**
+  (`GAIN_CORRECTED`); slit/filter mismatches are flagged, not corrected.
 
-**QC** (`qc.py`) — review holds: `NO_OVERLAP` (then `SCALE_FROM_GAP`: log-linear
-bridge of a ≤0.5° gap, or `SCALE_FROM_TREND`: nearest energies), `SCALE_OUTLIER`
-(gain-normalised scale > 30 % and > 3σ off a robust local line through energies
-within 6 eV — detector sensitivity has real structure at the C edge),
-`JUMP` (ratio drifts across the overlap), `FILTER_CHANGE` (filter/aperture differs
-between adjacent sections — always review, the user's experience is that the
-higher-flux section can be over-exposed with damped fringes), `FRINGE_DAMPING`
-(upper/lower fringe amplitude < 0.75 with correlated fringes), `FRINGE_MISMATCH`
-(fringes don't correlate). Info: `NOISY_OVERLAP`, `LOW_OVERLAP`, `SCALE_BLENDED`
-(a noisy overlap scale combined with the neighbour trend by inverse variance),
-`FRINGES_MATCH`, `FRINGE_CHECK_WEAK` (adjacent-window test when the overlap is too
-short — weak: same-filter junctions scatter 0.4–1.8), `NEG_AFTER_BG`, `TRUNCATED_Q`.
+**4. QC** (`qc.py`)
+
+Review holds:
+- `NO_OVERLAP` — then `SCALE_FROM_GAP` (log-linear bridge of a ≤0.5° gap) or
+  `SCALE_FROM_TREND` (nearest energies).
+- `SCALE_OUTLIER` — gain-normalised scale > 30 % and > 3σ off a robust local line
+  through energies within 6 eV (detector sensitivity has real structure at the C edge).
+- `JUMP` — ratio drifts across the overlap.
+- `FILTER_CHANGE` — filter/aperture differs between adjacent sections. Always review:
+  the user's experience is that the higher-flux section can be over-exposed with
+  damped fringes.
+- `FRINGE_DAMPING` — upper/lower fringe amplitude < 0.75 with correlated fringes.
+- `FRINGE_MISMATCH` — fringes don't correlate.
+
+Info:
+- `NOISY_OVERLAP`, `LOW_OVERLAP`.
+- `SCALE_BLENDED` — a noisy overlap scale combined with the neighbour trend by inverse variance.
+- `FRINGES_MATCH`.
+- `FRINGE_CHECK_WEAK` — adjacent-window test when the overlap is too short (weak:
+  same-filter junctions scatter 0.4–1.8).
+- `NEG_AFTER_BG`, `TRUNCATED_Q`.
 
 ## Protocol
 
