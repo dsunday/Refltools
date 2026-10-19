@@ -6,8 +6,9 @@ the flag it raises and the reason for it. It goes with the
 [`rsoxr-reduce` skill](SKILL.md): the skill says *what to run*, this guide says
 *what the tool decides and why*.
 
-Every threshold below comes from the code (as of the `reduceskillsimplify` branch,
-Oct 2026). Each one is labelled in one of two ways:
+Every threshold below comes from the code (as of Oct 2026). Defaults were tuned on a
+reference dataset, the Nov 2025 ALS beamtime; numbers quoted from it are labelled
+"Nov 2025". Each one is labelled in one of two ways:
 
 - **`setting.key`**: stored in the project's `reduction.json` and changeable with
   `python -m rsoxr_reduce set <key> <value> -p <project>`. Defaults are in
@@ -87,7 +88,7 @@ Sections are ordered by start angle, PD first, which is also the stitch order.
 
 | Code | Rule | Severity |
 |---|---|---|
-| `SUPERSEDED` | Another full-range scan of the same section was taken **later**. The latest wins (the user's rule: a re-measurement was re-measured for a reason). | file not used |
+| `SUPERSEDED` | Another full-range scan of the same section was taken **later**. The latest wins (group convention: a re-measurement was re-measured for a reason). | file not used |
 | `PARTIAL_RANGE` | Span < **80 %** of the section's nominal span (`select.partial_frac`). Used only if no full-range scan exists. | **review** if it ends > 0.6° early (`group.section_match_deg`) or leaves a gap to the section below, otherwise info |
 | `OFF_SECTION` | Angular range matches no nominal section | file not used |
 | `NO_PD` | No photodiode section, so the energy can't be normalised | **reject** |
@@ -159,8 +160,9 @@ Per folder (`folder_background`):
 
 The report records which source was used ("pd-vs-ct regression" or "default").
 
-**Nov 2025 values:** dark offsets were about 0.0022–0.0028 V, but about 0.006 V in the
-Brewer9/10/13/15 carbon session. Manual reductions often used a lower background,
+**Nov 2025 values (reference data):** dark offsets were about 0.0022–0.0028 V, but
+about 0.006 V in one carbon session (samples Brewer9/10/13/15). Check your own
+session's value in the `reduce` report. Manual reductions often used a lower background,
 which over-scales CT at absorbing energies.
 
 Override for the whole folder with `folder --pd-background <V>`, or for one energy
@@ -331,7 +333,7 @@ is really **+30 % / −23 %**.
 
 **The concern.** When the filter or aperture changes between two sections, the
 higher-flux section can be over-exposed or see a larger footprint. Its Kiessig
-fringes then look **damped**, and the stitch is biased. This is the user's
+fringes then look **damped**, and the stitch is biased. This is the group's
 experience at the beamline, so a filter change is **always held for review**.
 
 | Flag | Trigger | Severity |
@@ -398,7 +400,7 @@ exact correction (`open_beam.gain_correct`).
 **Errors** written to the `.dat` are a flat **1 %** of R (`output.error_frac`), the
 same as the old widget.
 
-**Nov 2025 note:** the manual reductions used gain-8 open beams for gain-9 sample
+**Nov 2025 note (reference data):** the manual reductions used gain-8 open beams for gain-9 sample
 data, so their R is about 10× too high (×1.2–1.3 more where the slit also differed).
 ReducedAuto files are gain-corrected, with R ≈ 0.7–1 at low q.
 
@@ -479,7 +481,7 @@ Folder-wide values (clip angle, PD background) have their own command:
    upward there. It happens most when the background is set too high.
 5. **The background spread is never checked.** `folder_background` computes the
    spread of the per-energy backgrounds, but no flag uses it. If the fit falls back
-   to the default, a session like Brewer9/10/13/15 carbon (offset ≈ 0.006 V) would
+   to the default, a session with a high offset (≈ 0.006 V in one Nov 2025 carbon session) would
    get 0.0024 V.
 6. **`FRINGE_MISMATCH` can't tell noise from a real mismatch.** A noisy upper
    section lowers the correlation and causes a review hold even when the fringes
