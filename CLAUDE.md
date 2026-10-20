@@ -6,7 +6,8 @@ Not a package: notebooks do `sys.path.append('/homes/dfs1/Refltools')` and impor
 modules directly (`batch`, `h5io`, `Model_Setup`, `gpu_*`, `Plotting_Refl`, ...).
 
 - Environment: `/homes/dfs1/mambaforge/envs/refnxlocal/bin/python` (editable refnx,
-  jax+CUDA, blackjax, jaxns, h5py, corner). No pytest there.
+  jax+CUDA, blackjax, jaxns, h5py, corner). No pytest there. Setting up elsewhere:
+  `environment.yml` + `INSTALL.md` (refnx fork `dsunday/refnx@JAX` installed separately).
 - Model-building/fitting guide: `MODEL_GUIDE.md`.
 - **Plain-text fitting harness:** `rsoxr_harness/` (CLI `python -m rsoxr_harness`),
   driven by the `rsoxr-fit` skill in `.claude/skills/rsoxr-fit/SKILL.md`. Use it
