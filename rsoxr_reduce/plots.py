@@ -166,6 +166,8 @@ def overview_waterfall(entries, out, sample="", decade_step=1.0):
     for k, (E, qd, status) in enumerate(entries):
         off = 10 ** (decade_step * k)
         m = qd[:, 1] > 0
+        if not m.any():         # nothing positive to plot (e.g. a bad I0)
+            continue
         c = {"review": REVIEW, "rejected": REJECT}.get(status, SERIES[0])
         ax.plot(qd[m, 0], qd[m, 1] * off, "-", lw=0.9, color=c)
         ax.text(qd[m, 0].max() * 1.01, qd[m, 1][-1] * off, f"{E:.1f}", fontsize=6,

@@ -119,6 +119,47 @@ def test_reduced_curve_matches_truth():
         assert abs(ratio - 1) < 0.05, (E, ratio)
 
 
+def test_pd_floor_points():
+    """PD kept past its SNR floor: covered points and isolated dropouts are not
+    written, but still set the stitch scale."""
+    from rsoxr_reduce import trim as TR
+    st = S.defaults()
+    th = np.arange(0, 10.01, 0.25)
+    pd = np.c_[th, 0.002 + 0.01 * np.exp(-th)]           # bg 0.002, signal decays
+    i_drop = int(np.argmin(abs(th - 7.0)))
+    pd[i_drop, 1] = 0.002 + 1e-6                          # dropout at the floor
+    ct = np.c_[np.arange(8, 15.01, 0.25), np.ones(29)]
+    lo = {"id": "PD", "kind": "pd", "data": pd, "bg": 0.002, "sigma": 1e-4}
+    hi = {"id": "CT1", "kind": "cem", "data": ct}
+    cap, last = int(np.argmin(abs(th - 5.0))), len(th) - 2
+    idx, why, fl = TR.pd_floor_points(lo, hi, 0, last, cap, st)
+    assert i_drop in idx, (idx, why)
+    assert all(th[i] >= 8 for i in idx if i != i_drop), idx      # rest = covered by CT1
+    assert not [i for i in range(cap + 1, last + 1) if th[i] < 8 and i != i_drop and i in idx]
+    assert fl and fl[0]["code"] == "PD_FLOOR_POINTS"
+    # no extension past the floor -> nothing dropped
+    assert TR.pd_floor_points(lo, hi, 0, cap, cap, st)[0] == []
+    # stitch: dropped points absent from the output, scale unchanged
+    a = ST.reduce_sections([pd, ct], [(1, -1), (0, -1)], [0.002, 0.0], 285, i0=1.0)
+    b = ST.reduce_sections([pd, ct], [(1, -1), (0, -1)], [0.002, 0.0], 285, i0=1.0,
+                           point_drops={0: idx})
+    assert a["sections"][1]["scale"] == b["sections"][1]["scale"]
+    assert len(b["q_data"]) == len(a["q_data"]) - len(idx)
+    assert b["sections"][0]["n_floor_dropped"] == len(idx)
+
+
+def test_counting_error_model():
+    """rel_errs add in quadrature to the flat error; R and Q are unchanged."""
+    pd = np.c_[np.arange(0, 5.01, 0.25), np.linspace(1.0, 0.01, 21)]
+    rel = np.full(len(pd), 0.2)
+    a = ST.reduce_sections([pd], [(1, -1)], [0.0], 285, i0=1.0)
+    b = ST.reduce_sections([pd], [(1, -1)], [0.0], 285, i0=1.0, rel_errs={0: rel})
+    assert np.allclose(a["q_data"][:, :2], b["q_data"][:, :2])
+    assert np.allclose(a["q_data"][:, 2] / a["q_data"][:, 1], 0.01)
+    assert np.allclose(b["q_data"][:, 2] / b["q_data"][:, 1], np.sqrt(0.01 ** 2 + 0.2 ** 2))
+    assert S.defaults()["output"]["error_model"] == "flat"
+
+
 def test_gain_correction_and_filter_change_flags():
     p = project()
     plan = p.plan()

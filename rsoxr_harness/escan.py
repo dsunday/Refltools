@@ -21,6 +21,21 @@ Optical constants
              to the tabulated isld); sld = KK(isld) + one constant offset.  The KK map is
              linear for fixed merge points → response matrices built once (kkcalc via
              stoich.kk_sld, ≤ 50 % CPUs) and cached in escan/<name>/.
+  isld basis (spec.isld_basis) — how the free isld on the grid is parameterised; the KK
+             map, grid and pinned end nodes are the same for all three:
+             "nodes"   free value at every interior node (above).
+             "bspline" clamped cubic B-spline, knots every knot_step eV inside the energy
+                       scans (finer over knot_dense [[lo, hi, step], ...]), every
+                       knot_step_outside (default outer_step) eV outside; end coefficients
+                       pinned to the tabulated isld.  Curvature prior = h0³/σ² ∫ (isld″)² dE
+                       (Gram matrix of the basis second derivatives), same σ / σ_outside /
+                       curv_regions as the node prior.
+             "nexafs"  isld = a stored NEXAFS peak model (baseline + slope + edge steps +
+                       Gaussians, nexafs.evaluate maths) on the interior nodes; its varied
+                       parameters (with their bounds) are the fit parameters.  spec.nexafs
+                       [{"layer", "fit" | "model", "shift"}]: start from a `nexafs fit`
+                       result (its energy_shift is honoured) or a stored model; "shift" (eV)
+                       is added on top (model evaluated at E + shift).  No curvature prior.
   other layer per the model recipe: an sld window (sld_offset / absolute bounds) → free
              at each angle-scan energy, interpolated across the energy scans inside the
              angle-scan range, material table outside; no window → material table;
@@ -28,7 +43,10 @@ Optical constants
 Priors (per eV, σ quoted per 0.5 eV step so script values carry over)
   curvature  Σ (isld″·h0²·√(h̄/h0) / σ_curv)² over the grid, every KK layer; outside the
              energy scans σ_curv_outside (default σ_curv/10), so the unconstrained nodes
-             cannot be used as a KK knob on the in-window sld
+             cannot be used as a KK knob on the in-window sld; curv_regions
+             [{"lo", "hi", "sigma"}] override σ_curv over an energy range (outside the
+             scans the stiffer of the two applies) — e.g. sharp edge at σ 0.5 but a
+             smooth post-edge (Brewer2 carbon two-layer fit oscillated above 300 eV)
   flat       Σ (isld′·h0·√(h/h0) / σ)² below E for the listed layers
 Data / weights
   energy scans: ln R residual / sigma_data (per-scan weight, scale 1)
@@ -54,8 +72,11 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 
 HC = 12398.42
+JAC_CHUNK = 256              # forward-mode Jacobian columns per pass (GPU memory ∝ chunk)
 H0 = 0.5                     # eV; σ of the priors is quoted per H0 step
 NODE_TOL = 0.06              # eV; energy-scan points closer than this share a node
+ISLD_BASES = ("nodes", "bspline", "nexafs")
+GRAM_STEP = 0.02             # eV; quadrature step for the B-spline curvature Gram matrix
 
 
 # ---------------------------------------------------------------------------
@@ -74,17 +95,26 @@ class EscanSpec:
     outer_step: float = 2.0
     sigma_curv: float = 0.05
     sigma_curv_outside: float | None = None             # default sigma_curv / 10
+    curv_regions: list = field(default_factory=list)  # [{"lo", "hi", "sigma"}]
     flat: list = field(default_factory=list)          # [{"layer", "below", "sigma"}]
+    anchor: list = field(default_factory=list)        # [{"layer", "lo", "hi", "formula", "density", "sigma"}]
     angle: bool = True
     min_theta: float = 0.0
     high_theta: float | None = None
     high_sigma: str | float = "auto"
     sigma_data: float = 0.03
     scan_weights: list | None = None
+    scan_scales: list | None = None                     # per scan: True → own fitted scale (default 1, fixed)
+    escan_scale_bounds: tuple = (0.5, 1.5)
     angle_scale_bounds: tuple = (0.5, 1.5)
     thickness_group: dict | None = None
     max_nfev: int = 2000
     description: str = ""
+    isld_basis: str = "nodes"                           # nodes | bspline | nexafs
+    knot_step: float = 0.5                              # bspline: knot spacing inside the scans (eV)
+    knot_step_outside: float | None = None              # bspline: outside the scans (default outer_step)
+    knot_dense: list = field(default_factory=list)    # bspline: [[lo, hi, step], ...] finer knots
+    nexafs: list = field(default_factory=list)        # nexafs: [{"layer", "fit" | "model", "shift"}]
 
     def __post_init__(self):
         if not self.scans:
@@ -97,11 +127,42 @@ class EscanSpec:
         if not self.kk:
             raise ValueError("escan spec needs at least one KK layer")
         self.flat = [dict(f) for f in self.flat]
+        self.curv_regions = [dict(c) for c in self.curv_regions]
+        for c in self.curv_regions:
+            if not {"lo", "hi", "sigma"} <= set(c):
+                raise ValueError(f"curv_regions entry {c}: need lo, hi, sigma")
+        self.anchor = [dict(a) for a in self.anchor]
+        for a in self.anchor:
+            if not {"layer", "lo", "hi", "formula", "density", "sigma"} <= set(a):
+                raise ValueError(f"anchor entry {a}: need layer, lo, hi, formula, density, sigma")
         self.angle_scale_bounds = tuple(float(x) for x in self.angle_scale_bounds)
         if self.scan_weights is not None and len(self.scan_weights) != len(self.scans):
             raise ValueError("scan_weights must match scans")
+        if self.scan_scales is not None:
+            if len(self.scan_scales) != len(self.scans):
+                raise ValueError("scan_scales must match scans")
+            self.scan_scales = [bool(x) for x in self.scan_scales]
+        self.escan_scale_bounds = tuple(float(x) for x in self.escan_scale_bounds)
         if self.window is not None:
             self.window = [float(self.window[0]), float(self.window[1])]
+        if self.isld_basis not in ISLD_BASES:
+            raise ValueError(f"isld_basis '{self.isld_basis}': one of {ISLD_BASES}")
+        if self.knot_step <= 0 or (self.knot_step_outside is not None and self.knot_step_outside <= 0):
+            raise ValueError("knot steps must be > 0")
+        self.knot_dense = [[float(v) for v in d] for d in self.knot_dense]
+        for d in self.knot_dense:
+            if len(d) != 3 or d[0] >= d[1] or d[2] <= 0:
+                raise ValueError(f"knot_dense entry {d}: need [lo, hi, step] with lo < hi, step > 0")
+        self.nexafs = [dict(n) for n in self.nexafs]
+        for n in self.nexafs:
+            if "layer" not in n or not (("fit" in n) ^ ("model" in n)):
+                raise ValueError(f"nexafs entry {n}: need layer and one of fit / model")
+            n["shift"] = float(n.get("shift", 0.0))
+        if self.isld_basis == "nexafs":
+            have = {n["layer"] for n in self.nexafs}
+            miss = [k["layer"] for k in self.kk if k["layer"] not in have]
+            if miss:
+                raise ValueError(f"isld_basis 'nexafs' needs a nexafs entry for KK layer(s) {miss}")
 
     def to_json(self):
         return asdict(self)
@@ -116,10 +177,25 @@ class EscanSpec:
                  + (f" (seeded from {self.seed_model})" if self.seed_model else ""),
                  f"  scans: " + "; ".join(os.path.basename(s) for s in self.scans),
                  f"  KK layers: {kk}; window {self.window or 'auto'}; outer step {self.outer_step} eV",
+                 f"  isld basis: {self.isld_basis}"
+                 + (f" (knots {self.knot_step:g} eV in the scans, "
+                    f"{self.knot_step_outside or self.outer_step:g} eV outside"
+                    + "".join(f"; {d[2]:g} eV over {d[0]:g}–{d[1]:g}" for d in self.knot_dense) + ")"
+                    if self.isld_basis == "bspline" else "")
+                 + ("".join(f"; {n['layer']} ← {'fit' if 'fit' in n else 'model'} "
+                            f"{n.get('fit') or n.get('model')}" + (f" shift {n['shift']:+g} eV" if n["shift"] else "")
+                            for n in self.nexafs) if self.isld_basis == "nexafs" else ""),
                  f"  priors: curvature σ {self.sigma_curv} per {H0} eV "
                  f"(outside the scans {self.sigma_curv_outside or self.sigma_curv / 10:g})"
-                 + "".join(f"; {f['layer']} flat below {f['below']} eV (σ {f['sigma']})" for f in self.flat),
+                 + "".join(f"; σ {c['sigma']} over {c['lo']:g}–{c['hi']:g} eV" for c in self.curv_regions)
+                 + "".join(f"; {f['layer']} flat below {f['below']} eV (σ {f['sigma']})" for f in self.flat)
+                 + "".join(f"; {a['layer']} isld → bare-atom {a['formula']} {a['density']:g} over "
+                           f"{a['lo']:g}–{a['hi']:g} eV (σ {a['sigma']})" for a in self.anchor),
                  f"  mode: {'co-refinement with angle scans' if self.angle else 'energy scans only (geometry fixed)'}"]
+        if self.scan_scales and any(self.scan_scales):
+            lines.append("  own fitted scale for: "
+                         + ", ".join(os.path.basename(s) for s, f in zip(self.scans, self.scan_scales) if f)
+                         + f" (bounds {self.escan_scale_bounds}); other energy scans at scale 1")
         if self.angle:
             lines.append(f"  angle scans: θ < {self.min_theta}° left out"
                          + (f"; θ > {self.high_theta}° σ = {self.high_sigma}" if self.high_theta else "")
@@ -129,6 +205,110 @@ class EscanSpec:
         if self.description:
             lines.append(f"  {self.description}")
         return "\n".join(lines)
+
+
+RE_A = 2.8179403e-5          # classical electron radius, Å
+NA = 6.02214076e23
+
+
+def bare_isld(formula, density, E):
+    """Bare-atom (tabulated scattering factor) imaginary SLD, 1e-6 Å⁻², of a formula at density g/cm³."""
+    from kkcalc import data as kd
+    st = kd.ParseChemicalFormula(formula)
+    Ea, A = kd.calculate_asf(st)
+    E = np.atleast_1d(np.asarray(E, float))
+    f2 = np.array([kd.coeffs_to_ASF(e, A[(Ea > e).argmax() - 1]) for e in E])
+    n_f = density / kd.calculate_FormulaMass(st) * NA * 1e-24
+    return RE_A * n_f * f2 * 1e6
+
+
+def curv_sigma(spec, E, e_lo, e_hi):
+    """σ_curv (per H0 step) at energies E: sigma_curv inside the energy scans,
+    sigma_curv_outside outside; curv_regions override (outside, the stiffer wins)."""
+    E = np.atleast_1d(np.asarray(E, float))
+    s_out = spec.sigma_curv_outside or spec.sigma_curv / 10.0
+    inside = (E >= e_lo) & (E <= e_hi)
+    sig = np.where(inside, spec.sigma_curv, s_out)
+    for c in spec.curv_regions:
+        r = (E >= float(c["lo"])) & (E <= float(c["hi"]))
+        sig = np.where(r, np.where(inside, float(c["sigma"]), np.minimum(float(c["sigma"]), s_out)), sig)
+    return sig
+
+
+def bspline_knots(lo, hi, e_lo, e_hi, step_in, step_out, dense=()):
+    """Breakpoints (incl. lo, hi) for the clamped cubic isld spline."""
+    def seg(a, b, st):
+        n = max(1, int(np.ceil((b - a) / st - 1e-9)))
+        return np.linspace(a, b, n + 1)
+    br = np.concatenate([seg(lo, e_lo, step_out) if e_lo - lo > 1e-6 else [lo],
+                         seg(e_lo, e_hi, step_in),
+                         seg(e_hi, hi, step_out) if hi - e_hi > 1e-6 else [hi]])
+    for a, b, st in dense:
+        a, b = max(a, lo), min(b, hi)
+        if b <= a:
+            continue
+        br = np.concatenate([br[(br < a) | (br > b)], seg(a, b, st)])
+    br = np.unique(np.round(br, 6))
+    keep = [br[0]]
+    for v in br[1:]:
+        if v - keep[-1] > 1e-3:
+            keep.append(v)
+    keep[-1] = hi
+    return np.array(keep)
+
+
+def bspline_basis(E, breaks, sigma_at):
+    """Design matrix B (n_E × nb) of the clamped cubic spline on breakpoints, and the
+    curvature-prior root L (nb × nb, ‖L c‖² = Σ h0³/σ(E)² ∫ (Σ c_k B_k″)² dE)."""
+    from scipy.interpolate import BSpline
+    t = np.concatenate([[breaks[0]] * 3, breaks, [breaks[-1]] * 3])
+    nb = len(t) - 4
+    B = BSpline.design_matrix(np.clip(E, breaks[0], breaks[-1]), t, 3).toarray()
+    Ef = np.linspace(breaks[0], breaks[-1], int(np.ceil((breaks[-1] - breaks[0]) / GRAM_STEP)) + 1)
+    B2 = BSpline(t, np.eye(nb), 3).derivative(2)(Ef)                  # (nf, nb)
+    wq = np.full(Ef.size, Ef[1] - Ef[0])
+    wq[[0, -1]] *= 0.5
+    wq *= H0 ** 3 / sigma_at(Ef) ** 2
+    G = B2.T @ (wq[:, None] * B2)
+    lam, V = np.linalg.eigh(0.5 * (G + G.T))
+    L = np.sqrt(np.clip(lam, 0.0, None))[:, None] * V.T
+    return B, L, t
+
+
+def nexafs_struct(m, shift=0.0):
+    """Index structure of a NEXAFS peak model for the JAX evaluation (nexafs._flat order)."""
+    from . import nexafs as NX
+    flat = NX._flat(m)
+    keys = [k for k, _ in flat]
+    ix = {k: i for i, k in enumerate(keys)}
+    vals = np.array([p["value"] for _, p in flat], float)
+    free = np.array([i for i, (_, p) in enumerate(flat) if p["vary"]], int)
+    lo = np.array([flat[i][1]["lo"] for i in free], float)
+    hi = np.array([flat[i][1]["hi"] for i in free], float)
+    return {"keys": keys, "vals": vals, "free": free, "lo": lo, "hi": hi, "shift": float(shift),
+            "slope_ref": float(m["slope_ref"]), "ib": ix["baseline"], "isl": ix["slope"],
+            "peaks": [(ix[f"{p['name']}.energy"], ix[f"{p['name']}.width"], ix[f"{p['name']}.height"])
+                      for p in m["peaks"]],
+            "edges": [tuple(ix[f"{e['name']}.{k}"] for k in ("location", "height", "width", "decay"))
+                      for e in m["edges"]],
+            "model": m}
+
+
+def nexafs_eval(st, v, E):
+    """NEXAFS model (baseline + slope + NEXAFS.edge_bl_func edges + FWHM Gaussians) at
+    E + shift, differentiable in the full parameter vector v (JAX)."""
+    import jax.numpy as jnp
+    from jax.scipy.special import erf
+    E = jnp.asarray(E) + st["shift"]
+    y = v[st["ib"]] + v[st["isl"]] * (E - st["slope_ref"])
+    for il, ih, iw, idc in st["edges"]:
+        loc, h, w, dc = v[il], v[ih], v[iw], v[idc]
+        step = jnp.where(E >= loc + w, 1.0, 0.0)
+        y = y + 0.5 * h * (1 + erf((E - loc) * 2 * np.log(2) / w)) * (1 + step * (jnp.exp(-dc * (E - loc - w)) - 1))
+    for ie, iw, ih in st["peaks"]:
+        sg = v[iw] / (2 * np.sqrt(2 * np.log(2)))
+        y = y + v[ih] * jnp.exp(-0.5 * ((E - v[ie]) / sg) ** 2)
+    return y
 
 
 def escan_dir(project, name):
@@ -403,6 +583,35 @@ class Problem:
             resp, rpath = kk_response(cache, E, x_seed, k["formula"], k["density"], window, workers, log)
             self.kk[name] = dict(resp, path=rpath, seed_E=seed_E, seed_sld=s_sld, seed_isld=s_isld)
 
+        # ---- isld basis per KK layer
+        self.basis = {}
+        e_lo, e_hi = E[data_idx[0]], E[data_idx[-1]]
+        for name in self.kk_layers:
+            if spec.isld_basis == "bspline":
+                br = bspline_knots(E[0], E[-1], e_lo, e_hi, spec.knot_step,
+                                   spec.knot_step_outside or spec.outer_step, spec.knot_dense)
+                B, L, t = bspline_basis(E, br, lambda x: curv_sigma(spec, x, e_lo, e_hi))
+                self.basis[name] = {"kind": "bspline", "B": B, "L": L, "t": t, "breaks": br,
+                                    "npar": B.shape[1] - 2}
+            elif spec.isld_basis == "nexafs":
+                from . import nexafs as NX
+                ent = {n["layer"]: n for n in spec.nexafs}[name]
+                if "fit" in ent:
+                    fr = NX.load_fit(project, ent["fit"])
+                    if fr.get("signal") not in (None, "isld"):
+                        raise ValueError(f"nexafs fit '{ent['fit']}' was fitted to {fr['signal']}, "
+                                         f"not isld; refit it with --signal isld")
+                    m, shift = fr["fitted_model"], float(fr.get("energy_shift", 0.0))
+                else:
+                    m, shift = NX.get_model(project, ent["model"]), 0.0
+                st = nexafs_struct(m, shift + ent["shift"])
+                st.update(kind="nexafs", npar=int(st["free"].size), source=ent)
+                self.basis[name] = st
+                log(f"[escan] {name}: NEXAFS basis {m['name']} ({len(st['peaks'])} peaks, "
+                    f"{len(st['edges'])} edges, {st['npar']} free), evaluated at E {st['shift']:+g} eV")
+            else:
+                self.basis[name] = {"kind": "nodes", "npar": E.size - 2}
+
         # ---- free layers (per angle-scan energy)
         self.free_layers = [l.name for l, r in zip(layers, self.roles) if r == "free"]
         self.free_bounds = {}
@@ -438,8 +647,12 @@ class Problem:
         self.nf = n - 2
         idx, k = {}, 0
         for name in self.kk_layers:
-            idx[("x", name)] = slice(k, k + self.nf); k += self.nf
+            m = self.basis[name]["npar"]
+            idx[("x", name)] = slice(k, k + m); k += m
             idx[("c", name)] = k; k += 1
+        for j, f in enumerate(self.spec.scan_scales or []):
+            if f:
+                idx[("es", j)] = k; k += 1
         if self.angle:
             for g in self.geo:
                 idx[(g[0], g[1])] = k; k += 1
@@ -500,16 +713,20 @@ class Problem:
         h = np.diff(E)
         D2 = np.zeros((E.size - 2, E.size))
         e_lo, e_hi = E[self.data_idx[0]], E[self.data_idx[-1]]
-        s_out = spec.sigma_curv_outside or spec.sigma_curv / 10.0
+        sig_n = curv_sigma(spec, E, e_lo, e_hi)
         for j in range(1, E.size - 1):
             hm, hp = h[j - 1], h[j]
             hb = 0.5 * (hm + hp)
-            sig = spec.sigma_curv if e_lo <= E[j] <= e_hi else s_out
-            w = H0 ** 2 * np.sqrt(hb / H0) / sig
+            w = H0 ** 2 * np.sqrt(hb / H0) / sig_n[j]
             D2[j - 1, j - 1:j + 2] = w * 2 * np.array([1 / (hm * (hm + hp)), -1 / (hm * hp), 1 / (hp * (hm + hp))])
-        self.P = {}
+        # curvature prior per layer acts on the basis vector (paths(...)[3]): node values
+        # (D2), spline coefficients (Gram root L) or nothing (NEXAFS); flat prior on x
+        self.Pc, self.Pf = {}, {}
         for name in self.kk_layers:
-            P = [D2]
+            kind = self.basis[name]["kind"]
+            self.Pc[name] = (jnp.asarray(D2) if kind == "nodes" else
+                             jnp.asarray(self.basis[name]["L"]) if kind == "bspline" else None)
+            P = []
             for f in spec.flat:
                 if f["layer"] != name:
                     continue
@@ -519,7 +736,14 @@ class Problem:
                     w = H0 * np.sqrt(h[j] / H0) / float(f["sigma"]) / h[j]
                     D1[r, j], D1[r, j + 1] = -w, w
                 P.append(D1)
-            self.P[name] = jnp.asarray(np.vstack(P))
+            self.Pf[name] = jnp.asarray(np.vstack(P)) if P else None
+        self.Bj = {n: jnp.asarray(b["B"]) for n, b in self.basis.items() if b["kind"] == "bspline"}
+        # anchors: isld at grid nodes in [lo, hi] pulled to a formula's bare-atom isld
+        self.anchors = []
+        for a in spec.anchor:
+            sel = np.where((E >= float(a["lo"])) & (E <= float(a["hi"])))[0]
+            tgt = bare_isld(a["formula"], float(a["density"]), E[sel])
+            self.anchors.append((a["layer"], jnp.asarray(sel), jnp.asarray(tgt), float(a["sigma"])))
         self.Mj = {n: jnp.asarray(self.kk[n]["M"]) for n in self.kk_layers}
         self.Nj = {n: jnp.asarray(self.kk[n]["N"]) for n in self.kk_layers}
 
@@ -538,15 +762,28 @@ class Problem:
 
     # ------------------------------------------------------------------
     def paths(self, p):
-        """KK layers → {name: (sld on grid, isld on grid, x)}"""
+        """KK layers → {name: (sld on grid, isld on grid, x, basis vector)}; the basis
+        vector is what the curvature prior acts on (x for nodes, the full coefficient
+        vector for bspline, the free model parameters for nexafs)."""
         import jax.numpy as jnp
         out = {}
         for name in self.kk_layers:
-            k = self.kk[name]
-            x = jnp.asarray(k["x0"]).at[1:-1].set(p[self.idx[("x", name)]])
-            s = jnp.asarray(k["s0"]) + self.Mj[name] @ (x - k["x0"]) + p[self.idx[("c", name)]]
-            i = jnp.asarray(k["i0"]) + self.Nj[name] @ (x - k["x0"])
-            out[name] = (s, i, x)
+            k, b = self.kk[name], self.basis[name]
+            v = p[self.idx[("x", name)]]
+            x0 = jnp.asarray(k["x0"])
+            if b["kind"] == "bspline":
+                cv = jnp.concatenate([x0[:1], v, x0[-1:]])
+                x = self.Bj[name] @ cv
+            elif b["kind"] == "nexafs":
+                full = jnp.asarray(b["vals"]).at[b["free"]].set(v)
+                x = x0.at[1:-1].set(jnp.maximum(nexafs_eval(b, full, self.E[1:-1]), 0.0))
+                cv = v
+            else:
+                x = x0.at[1:-1].set(v)
+                cv = x
+            s = jnp.asarray(k["s0"]) + self.Mj[name] @ (x - x0) + p[self.idx[("c", name)]]
+            i = jnp.asarray(k["i0"]) + self.Nj[name] @ (x - x0)
+            out[name] = (s, i, x, cv)
         return out
 
     def _geometry(self, p):
@@ -578,7 +815,7 @@ class Problem:
                 re_, im_ = l.constant_sld["real"], l.constant_sld["imag"]
                 s, ii = jnp.full(m, re_), jnp.full(m, im_)
             elif role == "kk":
-                sg, ig, _ = P[name]
+                sg, ig = P[name][:2]
                 s, ii = jnp.interp(jnp.asarray(Eq), jnp.asarray(self.E), sg), jnp.interp(jnp.asarray(Eq), jnp.asarray(self.E), ig)
             elif role == "free":
                 fs, fi = self._free_values(name, p)
@@ -611,9 +848,10 @@ class Problem:
         smear = jax.vmap(_jabeles_smeared_pos, in_axes=(0, None, 0, 0, 0))
         P = self.paths(p)
         Re = []
-        for (Es, _, _), qq in zip(self.scans, self.QQe):
+        for j, ((Es, _, _), qq) in enumerate(zip(self.scans, self.QQe)):
             lay = self._layers(Es, False, P, p)
-            Re.append(smear(qq, self.COMBO, lay, jnp.ones(Es.size), jnp.zeros(Es.size))[:, 0])
+            sc = p[self.idx[("es", j)]] if ("es", j) in self.idx else 1.0
+            Re.append(sc * smear(qq, self.COMBO, lay, jnp.ones(Es.size), jnp.zeros(Es.size))[:, 0])
         Ra = None
         if self.angle:
             lay = self._layers(self.Ea, True, P, p)
@@ -630,7 +868,12 @@ class Problem:
         for w, R, lnR in zip(self.w_scan, Re, self.lnRe):
             parts.append(w * (jnp.log(R) - lnR) / self.spec.sigma_data)
         for name in self.kk_layers:
-            parts.append(self.P[name] @ P[name][2])
+            if self.Pc[name] is not None:
+                parts.append(self.Pc[name] @ P[name][3])
+            if self.Pf[name] is not None:
+                parts.append(self.Pf[name] @ P[name][2])
+        for layer, sel, tgt, sig in self.anchors:
+            parts.append((P[layer][1][sel] - tgt) / sig)
         return jnp.concatenate(parts)
 
     # ------------------------------------------------------------------
@@ -657,14 +900,44 @@ class Problem:
             tgt[hi] = np.interp(E[hi], [Eo[-1], E[-1]], [io[-1], k["x0"][-1]])
             xf = self.x_from_isld(name, tgt)
             full = np.concatenate([[k["x0"][0]], xf, [k["x0"][-1]]])
+            b = self.basis[name]
+            sx, sc = self.idx[("x", name)], self.idx[("c", name)]
+            if b["kind"] == "bspline":
+                # least-squares coefficients for the target x (end coefficients pinned)
+                B = b["B"]
+                rhs = full - B[:, 0] * k["x0"][0] - B[:, -1] * k["x0"][-1]
+                cf, *_ = np.linalg.lstsq(B[:, 1:-1], rhs, rcond=None)
+                if prev is not None and str(prev.get(f"basis_{name}", "")) == "bspline" \
+                        and prev[f"bparams_{name}"].size == cf.size:
+                    cf = np.asarray(prev[f"bparams_{name}"], float)
+                full = B @ np.concatenate([[k["x0"][0]], cf, [k["x0"][-1]]])
+                p[sx], lb[sx], ub[sx] = cf, -2.0, 15.0
+            elif b["kind"] == "nexafs":
+                v0 = b["vals"][b["free"]].copy()
+                if prev is not None and str(prev.get(f"basis_{name}", "")) == "nexafs" \
+                        and prev[f"bparams_{name}"].size == v0.size:
+                    v0 = np.asarray(prev[f"bparams_{name}"], float)
+                lo_, hi_ = np.nan_to_num(b["lo"], neginf=-1e3), np.nan_to_num(b["hi"], posinf=1e3)
+                v0 = np.clip(v0, lo_, hi_)
+                fv = b["vals"].copy()
+                fv[b["free"]] = v0
+                xi = np.maximum(np.asarray(nexafs_eval(b, fv, E[1:-1])), 0.0)
+                full = np.concatenate([[k["x0"][0]], xi, [k["x0"][-1]]])
+                p[sx], lb[sx], ub[sx] = v0, lo_, hi_
+            else:
+                p[sx], lb[sx], ub[sx] = xf, 0.0, 10.0
             sl = k["s0"] + k["M"] @ (full - k["x0"])
             inside = (E >= max(Eo[0], E[self.data_idx[0]])) & (E <= min(Eo[-1], E[self.data_idx[-1]]))
             c = float(np.mean(np.interp(E[inside], Eo, so) - sl[inside])) if inside.any() else 0.0
-            sx, sc = self.idx[("x", name)], self.idx[("c", name)]
-            p[sx], lb[sx], ub[sx] = xf, 0.0, 10.0
             p[sc], lb[sc], ub[sc] = c, -10.0, 10.0
+        prevp = prev.get("params") if prev is not None else None
+        for j, f in enumerate(self.spec.scan_scales or []):
+            if f:
+                i = self.idx[("es", j)]
+                p[i], (lb[i], ub[i]) = 1.0, self.spec.escan_scale_bounds
+                if prevp is not None and f"escale:{j}" in prevp:
+                    p[i] = prevp[f"escale:{j}"]
         if self.angle:
-            prevp = prev.get("params") if prev is not None else None
             for g in self.geo:
                 i = self.idx[(g[0], g[1])]
                 p[i], lb[i], ub[i] = g[4], g[2], g[3]
@@ -694,12 +967,37 @@ class Problem:
             d["scale"] = float(p[self.idx["scale"]])
         for name in self.kk_layers:
             d[f"offset:{name}"] = float(p[self.idx[("c", name)]])
+        for j, f in enumerate(self.spec.scan_scales or []):
+            if f:
+                d[f"escale:{j}"] = float(p[self.idx[("es", j)]])
         return d
 
 
 # ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
+
+def _chunked_jacfwd(f, n, chunk=None):
+    """Forward-mode Jacobian of f (ℝⁿ → ℝᵐ) in passes of ``chunk`` columns.
+
+    jax.jacfwd pushes all n tangents through f at once (memory ∝ n); the carbon
+    two-layer KK fit (1096 parameters) ran out of 48 GB that way.  Here f is
+    linearized once and the tangents go through in blocks (lax.map over vmap).
+    n ≤ chunk → plain jacfwd."""
+    import jax
+    import jax.numpy as jnp
+    chunk = chunk or JAC_CHUNK
+    if n <= chunk:
+        return jax.jacfwd(f)
+    nb = -(-n // chunk)
+
+    def jac(x):
+        _, f_jvp = jax.linearize(f, x)
+        basis = jnp.eye(nb * chunk, n, dtype=x.dtype).reshape(nb, chunk, n)
+        cols = jax.lax.map(jax.vmap(f_jvp), basis)          # (nb, chunk, m)
+        return cols.reshape(nb * chunk, -1)[:n].T
+    return jac
+
 
 def run(project, name, start="last", max_nfev=None, workers=8, log=print):
     """Fit one escan spec; writes escan/<name>/ and returns a summary dict.
@@ -719,7 +1017,7 @@ def run(project, name, start="last", max_nfev=None, workers=8, log=print):
     pr = Problem(project, spec, log=log, workers=workers, start=prev)
     p0, lb, ub = pr.seed_vector()
     res_j = jax.jit(pr.residual)
-    jac_j = jax.jit(jax.jacfwd(pr.residual))
+    jac_j = jax.jit(_chunked_jacfwd(pr.residual, pr.NP))
     r0 = np.asarray(res_j(jnp.asarray(p0)))
     n_data = sum(s[0].size for s in pr.scans) + (int(pr.FITa.sum()) if pr.angle else 0)
     log(f"[escan] {name}: {pr.NP} parameters, {n_data} data points, KK grid {pr.E.size} nodes "
@@ -738,11 +1036,33 @@ def run(project, name, start="last", max_nfev=None, workers=8, log=print):
             "escan_pts_gt5pct": [int((np.abs(l) > np.log(1.05)).sum()) for l in lre],
             "escan_theta": pr.theta, "params": pr.param_dict(p), "dq": pr.dq,
             "kk_grid": [float(pr.E[0]), float(pr.E[-1]), int(pr.E.size)],
-            "kk_response": {n: pr.kk[n]["path"] for n in pr.kk_layers}}
+            "kk_response": {n: pr.kk[n]["path"] for n in pr.kk_layers},
+            "isld_basis": spec.isld_basis,
+            "basis_params": {n: int(pr.basis[n]["npar"]) for n in pr.kk_layers}}
     save = dict(E_grid=pr.E, data_idx=pr.data_idx, p=p)
     for n in pr.kk_layers:
-        s, i, x = (np.asarray(a) for a in P[n])
+        s, i, x = (np.asarray(a) for a in P[n][:3])
         save[f"sld_{n}"], save[f"isld_{n}"] = s, i
+        b = pr.basis[n]
+        save[f"basis_{n}"] = b["kind"]
+        save[f"bparams_{n}"] = np.asarray(p[pr.idx[("x", n)]])
+        if b["kind"] == "bspline":
+            save[f"knots_{n}"] = b["breaks"]
+        elif b["kind"] == "nexafs":
+            from . import nexafs as NX
+            vals = dict(zip(b["keys"], b["vals"]))
+            vals.update({b["keys"][j]: float(v) for j, v in zip(b["free"], save[f"bparams_{n}"])})
+            fm = NX._set_values(b["model"], vals)
+            fm["description"] = (f"refined by escan '{name}' ({fm.get('description', '')})").strip()
+            with open(os.path.join(d, f"nexafs_{n}.json"), "w") as fh:
+                json.dump({"model": fm, "shift": b["shift"], "source": b["source"]}, fh, indent=2, default=float)
+            free = {b["keys"][j] for j in b["free"]}
+            summ.setdefault("nexafs", {})[n] = {
+                "values": {k: float(v) for k, v in vals.items() if k in free},
+                "at_bound": [b["keys"][j] for j, v, lo_, hi_ in
+                             zip(b["free"], save[f"bparams_{n}"], b["lo"], b["hi"])
+                             if np.isfinite(lo_) and np.isfinite(hi_) and min(v - lo_, hi_ - v) < 1e-3 * (hi_ - lo_)],
+                "model_json": os.path.join(d, f"nexafs_{n}.json")}
     for k, (Es, Rs, th) in enumerate(pr.scans):
         save[f"escan{k}_E"], save[f"escan{k}_R"], save[f"escan{k}_model"] = Es, Rs, Re[k]
         save[f"escan{k}_theta"] = th
@@ -863,7 +1183,8 @@ def plot(project, name, out_dir=None):
     axs[0].legend(frameon=False, fontsize=8)
     axs[1].set_xlabel("Energy (eV)")
     p = summ["params"]
-    fig.suptitle(f"{project.sample_name} escan '{name}': KK-linked optical constants\n"
+    fig.suptitle(f"{project.sample_name} escan '{name}': KK-linked optical constants "
+                 f"(isld basis: {summ.get('isld_basis', 'nodes')})\n"
                  f"cost {summ['cost']:.0f}; " + ", ".join(f"{k} {v:.3g}" for k, v in p.items()),
                  x=0.06, ha="left", fontsize=9.5, color=INK)
     files.append(_save_fig(fig, os.path.join(out_dir, f"escan_{name}_optics.png"), "escan-optics", name, dpi=140))
@@ -900,7 +1221,11 @@ def plot(project, name, out_dir=None):
     axs[-1].set_ylabel("model / measured")
     axs[-1].set_xlabel("Energy (eV)")
     axs[-1].legend(frameon=False, fontsize=8, ncol=4)
-    fig.suptitle(f"escan '{name}': energy scans (scale 1; grey band ±5 %)", x=0.06, ha="left")
+    es = {k: v for k, v in summ["params"].items() if k.startswith("escale:")}
+    fig.suptitle(f"escan '{name}': energy scans ("
+                 + (", ".join(f"θ = {float(r[f'escan{k.split(':')[1]}_theta']):g}° scale {v:.3f}"
+                              for k, v in es.items()) + ", others " if es else "")
+                 + "scale 1; grey band ±5 %)", x=0.06, ha="left")
     files.append(_save_fig(fig, os.path.join(out_dir, f"escan_{name}_escans.png"), "escan-escans", name, dpi=140))
 
     # angle scans

@@ -63,6 +63,13 @@ def write_energy_scan(out_dir, sample, result):
             if th is not None else
             f"{sample}_Escan_{os.path.splitext(m['file'])[0]}.dat")
     path = os.path.join(out_dir, name)
+    # a repeat scan at the same θ and range must not overwrite the first one
+    if os.path.exists(path):
+        with open(path) as fh:
+            fh.readline()
+            src = fh.readline()
+        if f"source: {m['file']} " not in src:
+            path = path[:-4] + f"_{os.path.splitext(m['file'])[0]}.dat"
     hdr = "\n".join([
         f"# RSoXR energy scan reduced by rsoxr_reduce",
         f"# source: {m['file']}  ({m['datetime']})",

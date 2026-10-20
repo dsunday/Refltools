@@ -33,6 +33,19 @@ Section end at a junction (PD→CT1, CTk→CTk+1)
     where the lower section itself gets too noisy (smoothed SNR <
     ``snr_min`` for PD, counts < ``ct_min_counts`` for CEM).
 
+PD floor points (PD_FLOOR_POINTS)
+    When the PD section is kept past its SNR floor so the next section has
+    ``min_overlap`` points (LOW_OVERLAP), single readings there can sit at the
+    dark offset and become ~0 after background subtraction (Brewer2 carbon
+    289.5 eV: R ×0.01 of its neighbours).  In that stretch (all points still
+    enter the stitch scale):
+      * points at/above the next section's first angle are not written – the
+        next section covers them with better statistics;
+      * below it (PD is the only data) a point is not written when
+        (PD − bg) < ``floor_outlier_ratio`` × the 5-point running median of
+        (PD − bg) – isolated dropouts only, so the kept noise stays unbiased
+        (a threshold in σ would keep only the upward fluctuations).
+
 CT start – saturation
     CEM rates above ``ct_max_rate`` are non-linear (Nov 2025: PD/CT ratio
     +3 % at 1–3e5 cps, +22 % at 3e5–1e6 cps); leading points above it are
@@ -289,6 +302,32 @@ def junction_end(lo, hi, start_lo, start_hi, settings):
                                 f"from {n_ov} points"})
     return last, (f"{why}; overlap {n_ov} {hi['id']} points to {dl[last, 0]:.2f}°, "
                   f"scale ±{sig:.1%}"), flags, stats
+
+
+def pd_floor_points(lo, hi, start_hi, last, cap, settings):
+    """PD indices in (cap, last] not to write. -> (idx list, reason, flags)"""
+    if lo["kind"] != "pd" or last <= cap:
+        return [], None, []
+    d = lo["data"]
+    th_hi = float(hi["data"][start_hi, 0])
+    k = settings["trim"]["floor_outlier_ratio"]
+    s = d[:, 1] - lo.get("bg", 0.0)
+    med = np.array([np.median(s[max(0, i - 2):i + 3]) for i in range(len(s))])
+    covered = [i for i in range(cap + 1, last + 1) if d[i, 0] >= th_hi - 1e-6]
+    dropout = [i for i in range(cap + 1, last + 1)
+               if d[i, 0] < th_hi - 1e-6 and med[i] > 0 and s[i] < k * med[i]]
+    if not covered and not dropout:
+        return [], None, []
+    parts = []
+    if covered:
+        parts.append(f"{len(covered)} past {th_hi:.2f}° left to {hi['id']}")
+    if dropout:
+        parts.append(f"{len(dropout)} dropout(s) < {k:g}× running median at "
+                     + ", ".join(f"{d[i, 0]:.2f}°" for i in dropout))
+    why = (f"PD past its SNR floor: {'; '.join(parts)} "
+           "(used for the stitch scale, not written)")
+    return sorted(covered + dropout), why, [{"code": "PD_FLOOR_POINTS", "severity": "info",
+                                             "detail": f"{lo['id']}: {why}"}]
 
 
 def tail_end(sec, start, settings):

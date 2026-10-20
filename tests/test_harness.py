@@ -197,6 +197,64 @@ def test_project_models_and_build():
     assert "Film2 - thick" in names and names["Film2 - thick"][2:] == (5.0, 40.0)
 
 
+def test_point_mask():
+    d = tempfile.mkdtemp(prefix="rsoxr_harness_mask_")
+    try:
+        p = make_synthetic_project(d)
+        p.add_model(base_recipe())
+        data, _ = p.load_data()
+        q = np.asarray(data[285.0]._x)
+        n0 = q.size
+        got = p.mask_points(285, [q[10] + 1e-5, q[20]], note="t")
+        assert np.allclose(got, [q[10], q[20]])
+        p.mask_points(285, [q[10]])                                   # no duplicate
+        _raises(ProjectError, p.mask_points, 285, [q[10] + 0.01])     # nothing near
+        p2 = FitProject.open(p.path)                                  # persisted
+        assert len(p2.point_mask_table()) == 2
+        obj = p2.build_objectives("Model1", energies=[285])["objectives"][285.0]
+        assert len(obj.data.x) == n0 - 2 and q[10] not in obj.data.x
+        obj280 = p2.build_objectives("Model1", energies=[280])["objectives"][280.0]
+        assert len(obj280.data.x) == len(data[280.0]._x)               # other energies intact
+        p2.clear_point_mask(285)
+        assert p2.point_mask_table() == []
+        assert len(p2.build_objectives("Model1", energies=[285])
+                   ["objectives"][285.0].data.x) == n0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_energy_exclusion():
+    import h5py
+    from rsoxr_harness.analysis import h5_energies
+    d = tempfile.mkdtemp(prefix="rsoxr_harness_excl_")
+    try:
+        p = make_synthetic_project(d)
+        p.add_model(base_recipe())
+        with h5py.File(p.h5_path, "a") as f:                          # stand-in fits
+            for e in ("280.0", "285.0"):
+                f.require_group(f"Synth/{e}/Model1/run_0").attrs["chi_sq_final"] = 1.0
+        out = p.exclude_energy(285, note="bad stitch")
+        assert out["energy"] == 285.0
+        assert out["moved_h5_groups"] == ["Synth/285.0 -> Synth_excluded/285.0"]
+        p2 = FitProject.open(p.path)                                  # persisted
+        assert p2.energies == [280.0, 290.0]
+        assert p2.excluded_energies() == [(285.0, "bad stitch")]
+        data, elist = p2.load_data()
+        assert elist == [280.0, 290.0] and 285.0 not in data
+        _raises(ProjectError, p2.select_energies, [285])
+        assert sorted(p2.build_objectives("Model1")["objectives"]) == [280.0, 290.0]
+        assert h5_energies(p2.h5_path, "Synth") == [280.0]
+        assert h5_energies(p2.h5_path, "Synth_excluded") == [285.0]
+        back = p2.include_energy(285)
+        assert back["moved_h5_groups"] == ["Synth_excluded/285.0 -> Synth/285.0"]
+        p3 = FitProject.open(p.path)
+        assert p3.energies == [280.0, 285.0, 290.0] and p3.excluded_energies() == []
+        assert h5_energies(p3.h5_path, "Synth") == [280.0, 285.0]
+        _raises(ProjectError, p3.include_energy, 285)                 # not excluded
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_build_bad_energy_and_missing_material():
     p = synthetic()
     if "Model1" not in p.model_names:
@@ -1063,6 +1121,194 @@ def test_escan_fit():
     assert os.path.exists(os.path.join(X.escan_dir(p, "only"), "result_prev.npz"))
     assert main(["escan", "list", "-p", p.path]) == 0
     assert main(["escan", "show", "only", "co", "-p", p.path]) == 0
+
+
+def test_escan_free_scan_scale():
+    """scan_scales: a scan written ×0.8 gets its own fitted scale ≈ 0.8; others stay at 1."""
+    from rsoxr_harness import escan as X
+    from rsoxr_harness.__main__ import main
+    p = synthetic()
+    if not p.has_fits("Model1"):
+        _m1(p)
+        assert main(["run", "fit", "-p", p.path, "--models", "Model1"] + _TINY) == 0
+    s4 = _write_escan(p, 4.0)
+    s3 = _write_escan(p, 3.0)
+    low = s3.replace(".dat", "_x0.8.dat")
+    with open(s3) as fh, open(low, "w") as out:
+        for line in fh:
+            parts = line.split("\t")
+            try:
+                out.write(f"{parts[0]}\t{0.8 * float(parts[1])}\t{0.8 * float(parts[2])}")
+            except (ValueError, IndexError):
+                out.write(line)
+    _raises(ValueError, X.EscanSpec, name="x", model="Model1", scans=[s4, low], scan_scales=[True],
+            kk=[{"layer": "Film", "formula": "C8H8", "density": 1.05}])
+    p.add_escan(name="sc", model="Model1", scans=[s4, low], scan_scales=[False, True], angle=False,
+                max_nfev=40, kk=[{"layer": "Film", "formula": "C8H8", "density": 1.05}], overwrite=True)
+    assert "own fitted scale" in p.get_escan("sc").describe()
+    s = X.run(p, "sc", start="model", workers=4, log=lambda *_: None)
+    assert "escale:1" in s["params"] and "escale:0" not in s["params"], s["params"]
+    # geometry is fixed at a short synthetic fit and the KK offset trades off with
+    # the scale, so only ask for the right neighbourhood and a clear cost gain
+    assert abs(s["params"]["escale:1"] - 0.8) < 0.08, s["params"]
+    p.add_escan(name="sc_fixed", model="Model1", scans=[s4, low], angle=False, max_nfev=40,
+                kk=[{"layer": "Film", "formula": "C8H8", "density": 1.05}], overwrite=True)
+    s_fixed = X.run(p, "sc_fixed", start="model", workers=4, log=lambda *_: None)
+    assert s["cost"] < 0.8 * s_fixed["cost"], (s["cost"], s_fixed["cost"])
+    for f in X.plot(p, "sc"):
+        _png_ok(f)
+
+
+def test_multiedge_stoich():
+    """Multi-edge (C + O) stoichiometry: spec validation and ties, edge sources
+    (file, Model:Layer, dir::Model:Layer, spread σ), recovery of a synthetic
+    formula/density from two edges, stoich-chi2-format outputs, CLI."""
+    from rsoxr_harness import multiedge as ME
+    from rsoxr_harness.stoich import load_chi2
+    from rsoxr_harness.__main__ import main
+    p = synthetic()
+    if not p.has_fits("Model1"):
+        _m1(p)
+        assert main(["run", "fit", "-p", p.path, "--models", "Model1"] + _TINY) == 0
+    # synthetic edge tables of C8O2H8 at 1.2 g/cc (bare-atom Im, Re from the same absolute KK)
+    true_f, true_rho = "C8O2H8", 1.2
+    Ec, Eo = np.arange(280.0, 300.01, 1.0), np.arange(525.0, 550.01, 1.0)
+    tabs = [np.column_stack([E, np.zeros_like(E), ME.bare_imag(true_f, true_rho, E)]) for E in (Ec, Eo)]
+    Ekk, re_kk, _ = ME.abs_kk(true_f, true_rho, [np.column_stack([t, np.full((len(t), 2), 0.1)]) for t in tabs])
+    paths = []
+    for lab, t in zip(("C", "O"), tabs):
+        t[:, 1] = np.interp(t[:, 0], Ekk, re_kk)
+        f = os.path.join(p.path, f"synth_{lab}.csv")
+        np.savetxt(f, np.column_stack([t, np.full((len(t), 2), 0.05)]), delimiter=",",
+                   header="E,Re,Im,sRe,sIm", comments="")
+        paths.append(f)
+    edges = [{"label": "C", "source": paths[0], "sigma": "columns"},
+             {"label": "O", "source": paths[1], "sigma": "columns"}]
+    # validation + ties
+    _raises(ValueError, ME.MultiEdgeSpec, name="x", edges=[], atoms=["C"], counts=[8])
+    _raises(ValueError, ME.MultiEdgeSpec, name="x", edges=edges, atoms=["C", "O"], counts=[8])
+    _raises(ValueError, ME.MultiEdgeSpec, name="x", edges=edges + [dict(edges[0])], atoms=["C"], counts=[8])
+    _raises(ValueError, ME.MultiEdgeSpec, name="x", edges=edges, atoms=["C", "H"], counts=[8, 0],
+            ties={"H": ["N", 1.0]})
+    sp = ME.MultiEdgeSpec(name="x", edges=edges, atoms=["C", "O", "H"], counts=[[4, 8, 4], [1, 2], 0],
+                          ties={"H": ["C", 1.0]})
+    assert sp.candidates() == ["C4O1H4", "C4O2H4", "C8O1H8", "C8O2H8"], sp.candidates()
+    # Model:Layer / dir::Model:Layer / spread σ sources resolve to [E, Re, Im, σRe, σIm]
+    for src in ("Model1:Film", f"{p.path}::Model1:Film"):
+        t, prov = ME.edge_table(p, {"label": "F", "source": src, "sigma": "spread:Model1"})
+        assert t.shape[1] == 5 and np.allclose(t[:, 3:], np.sqrt(0.05 ** 2 + (0.03 * np.abs(t[:, 1:3])) ** 2))
+    _raises(Exception, p.add_multiedge, name="bad", edges=[{"label": "F", "source": "Model1:Nope", "sigma": 0.1}],
+            atoms=["C"], counts=[8])
+    # recovery: true formula and density, both scorings, chi2-format outputs
+    p.add_multiedge(name="me", edges=edges, atoms=["C", "O", "H"], counts=[8, [1, 4], 0],
+                    ties={"H": ["C", 1.0]}, step_points=[280, 282, 548, 550], density_range=(0.8, 1.6),
+                    scoring="both", overwrite=True)
+    out = ME.run(p, "me", workers=2, verbose=False)
+    df, info, _ = out["twoedge"]
+    assert df.formula.iloc[0] == true_f and abs(info["best_density"] - true_rho) < 0.02, (df.head(), info)
+    assert out["stepedge"][0].formula.iloc[0] == true_f
+    for nm in ("me", "me_stepedge"):
+        d2, i2, g2 = load_chi2(p.stoich_dir(nm))
+        assert len(d2) == 4 and g2["chi2"].shape == (4, 401) and i2["nu"] >= 1
+    for f in ("spec.json", "edge_C.csv", "edge_O.csv"):
+        assert os.path.exists(os.path.join(p.stoich_dir("me"), f)), f
+    s = ME.summary(p, "me")
+    assert s["best"] == true_f and "O" not in s["at_grid_edge"], s
+    # grid-edge flag: truth (O2) outside a grid of O3..O4
+    p.add_multiedge(name="me_edge", edges=edges, atoms=["C", "O", "H"], counts=[8, [3, 4], 0],
+                    ties={"H": ["C", 1.0]}, density_range=(0.8, 1.6), overwrite=True)
+    ME.run(p, "me_edge", workers=2, verbose=False)
+    assert "O" in ME.summary(p, "me_edge")["at_grid_edge"]
+    # CLI
+    assert main(["multiedge", "add", "me_cli", "-p", p.path, "--edge", "C", paths[0], "columns",
+                 "--edge", "O", paths[1], "0.1", "525", "540", "--atoms", "C", "O", "H",
+                 "--counts", "8", "1:2", "0", "--tie", "H:C:1", "--density", "0.8", "1.6",
+                 "--overwrite"]) == 0
+    sp = p.__class__.open(p.path).get_multiedge("me_cli")
+    assert sp.edges[1]["erange"] == [525.0, 540.0] and sp.edges[1]["sigma"] == 0.1
+    assert main(["multiedge", "list", "-p", p.path]) == 0
+    assert main(["multiedge", "show", "me", "me_cli", "-p", p.path]) == 0
+
+
+def test_escan_isld_bases():
+    """isld_basis bspline / nexafs: basis algebra, spec validation, both fit modes run,
+    improve on their start, restart from their own coefficients, outputs + CLI."""
+    from rsoxr_harness import escan as X
+    from rsoxr_harness import nexafs as NX
+    from rsoxr_harness.__main__ import main
+    p = synthetic()
+    if not p.has_fits("Model1"):
+        _m1(p)
+        assert main(["run", "fit", "-p", p.path, "--models", "Model1"] + _TINY) == 0
+    scan = _write_escan(p)
+    # B-spline basis: partition of unity, clamped ends, prior blind to straight lines
+    E = np.linspace(250.0, 330.0, 161)
+    br = X.bspline_knots(250, 330, 270, 300, 0.5, 2.0, [[284, 290, 0.25]])
+    assert br[0] == 250 and br[-1] == 330 and np.all(np.diff(br) > 0)
+    assert np.allclose(np.diff(br[(br > 284.3) & (br < 289.7)]), 0.25, atol=1e-6)
+    sig = lambda x: np.full(np.size(x), 0.05)
+    B, L, t = X.bspline_basis(E, br, sig)
+    assert np.allclose(B.sum(1), 1) and B[0, 0] == 1 and B[-1, -1] == 1
+    grev = np.array([t[k + 1:k + 4].mean() for k in range(B.shape[1])])     # Greville: linear reproduction
+    assert np.allclose(B @ (2 + 0.01 * grev), 2 + 0.01 * E, atol=1e-9)
+    assert np.abs(L @ (2 + 0.01 * grev)).max() < 1e-6 * np.abs(L).max()
+    assert np.linalg.norm(L @ np.sin(grev / 3)) > 1.0
+    # spec validation
+    _raises(ValueError, X.EscanSpec, name="x", model="Model1", scans=[scan], isld_basis="spline",
+            kk=[{"layer": "Film", "formula": "C8H8", "density": 1.05}])
+    _raises(ValueError, X.EscanSpec, name="x", model="Model1", scans=[scan], isld_basis="nexafs",
+            kk=[{"layer": "Film", "formula": "C8H8", "density": 1.05}])
+    _raises(Exception, p.add_escan, name="x", model="Model1", scans=[scan], isld_basis="nexafs",
+            kk=[{"layer": "Film", "formula": "C8H8", "density": 1.05}],
+            nexafs=[{"layer": "Film", "fit": "no_such_fit"}])
+    # NEXAFS start models: a stored model (8 free) and a fit of a 2-free copy to the
+    # seed model's Film isld (the synthetic Model1 has only 3 energies)
+    pk = [NX.peak("p1", (285.5, 284.5, 286.5), (1.0, 0.3, 3.0), (1.0, 0.0, 5.0))]
+    m = NX.make_model("film_pk", pk, [NX.edge((288.0, 287.0, 289.0), (2.0, 0.0, 8.0), (0.8, 0.3, 3.0),
+                                               (0.01, 0.0, 0.1))], baseline=(1.0, 0.0, 3.0))
+    NX.save_model(p, m, overwrite=True)
+    m2 = NX.make_model("film_pk2", [NX.peak("p1", 285.5, 1.0, 1.0)],
+                       [NX.edge(288.0, (2.0, 0.0, 8.0), 0.8, 0.01)], baseline=(1.0, 0.0, 3.0))
+    NX.save_model(p, m2, overwrite=True)
+    NX.run_fit(p, "film_pk2", "Model1:Film", name="film_pk_fit", signal="isld")
+    logs = []
+    kk = [{"layer": "Film", "formula": "C8H8", "density": 1.05}]
+    cases = (("bs_only", False, dict(isld_basis="bspline", knot_step=1.0, knot_dense=[[283, 290, 0.5]])),
+             ("bs_co", True, dict(isld_basis="bspline", knot_step=1.0)),
+             ("nx_only", False, dict(isld_basis="nexafs", nexafs=[{"layer": "Film", "fit": "film_pk_fit"}])),
+             ("nx_co", True, dict(isld_basis="nexafs", nexafs=[{"layer": "Film", "model": "film_pk"}])))
+    for nm, angle, kw in cases:
+        name = nm[:2]
+        p.add_escan(name=nm, model="Model1", scans=[scan], angle=angle, max_nfev=20, kk=kk,
+                    min_theta=0.3, overwrite=True, **kw)
+        assert kw["isld_basis"] in p.get_escan(nm).describe()
+        s = X.run(p, nm, start="model", workers=4, log=logs.append)
+        start_cost = float([l for l in logs if "start cost" in l][-1].split("start cost ")[1].split()[0])
+        assert np.isfinite(s["cost"]) and s["cost"] < start_cost, (nm, s["cost"], start_cost)
+        assert s["isld_basis"] == kw["isld_basis"]
+        r = X.load_result(p, nm)
+        assert str(r["basis_Film"]) == kw["isld_basis"]
+        assert np.all(np.isfinite(r["isld_Film"])) and np.all(np.isfinite(r["sld_Film"]))
+        if name == "nx":
+            assert "nexafs" in s and os.path.exists(s["nexafs"]["Film"]["model_json"])
+            assert s["basis_params"]["Film"] == (2 if nm == "nx_only" else 8)
+        else:
+            assert "knots_Film" in r
+        for f in X.plot(p, nm):
+            _png_ok(f)
+        if not angle:
+            # restart from its own coefficients reproduces (about) the last cost
+            s2 = X.run(p, nm, start="last", max_nfev=3, workers=4, log=logs.append)
+            assert s2["cost"] <= s["cost"] * 1.001 + 1e-6, (nm, s2["cost"], s["cost"])
+    assert main(["escan", "add", "cli_bs", "-p", p.path, "--model", "Model1", "--scans", scan,
+                 "--kk", "Film:C8H8:1.05", "--isld-basis", "bspline", "--knot-step", "1",
+                 "--knot-dense", "283:290:0.5", "--overwrite"]) == 0
+    assert p.__class__.open(p.path).get_escan("cli_bs").knot_dense == [[283.0, 290.0, 0.5]]
+    assert main(["escan", "add", "cli_nx", "-p", p.path, "--model", "Model1", "--scans", scan,
+                 "--kk", "Film:C8H8:1.05", "--isld-basis", "nexafs", "--nexafs-fit", "Film:film_pk_fit:0.2",
+                 "--overwrite"]) == 0
+    sp = p.__class__.open(p.path).get_escan("cli_nx")
+    assert sp.nexafs == [{"layer": "Film", "fit": "film_pk_fit", "shift": 0.2}]
 
 
 # ---------------------------------------------------------------------------

@@ -55,6 +55,22 @@ def cmd_material(a):
     print(f"material {a.name}: {src.kind} {src.label()}")
 
 
+def cmd_mask(a):
+    p = _proj(a)
+    if a.clear:
+        p.clear_point_mask(a.energy)
+    elif a.q:
+        if a.energy is None:
+            raise SystemExit("--q needs --energy")
+        got = p.mask_points(a.energy, a.q, note=a.note or "")
+        print(f"masked at {a.energy:g} eV: " + ", ".join(f"q={x:.5f}" for x in got))
+    rows = p.point_mask_table()
+    if not rows:
+        print("(no masked points)")
+    for e, q, r, note in rows:
+        print(f"{e:8g} eV  q={q:.5f}  R={r:.3g}  {note}")
+
+
 def cmd_models(a):
     p = _proj(a)
     print(p.models_table() if p.model_names else "(no models)")
@@ -355,6 +371,70 @@ def cmd_stoich(a):
     return 0 if job["status"] == "done" else 1
 
 
+def _count_arg(s):
+    """'12' → 12 ; '8:80' → [8, 80] ; '8:80:4' → [8, 80, 4]"""
+    parts = [int(x) for x in str(s).split(":")]
+    return parts[0] if len(parts) == 1 else parts
+
+
+def cmd_multiedge(a):
+    from . import multiedge as ME
+    p = _proj(a)
+    if a.action == "list":
+        print(p.multiedge_table() if p.multiedge_names else "(no multi-edge stoich searches)")
+        return 0
+    if not a.name:
+        raise SystemExit(f"multiedge {a.action} needs a NAME")
+    if a.action == "add":
+        if not (a.edge and a.atoms and a.counts):
+            raise SystemExit("multiedge add needs --edge (≥1), --atoms and --counts")
+        edges = []
+        for e in a.edge:
+            if len(e) not in (3, 5):
+                raise SystemExit("--edge LABEL SOURCE SIGMA [ELO EHI]")
+            sig = e[2]
+            try:
+                sig = float(sig)
+            except ValueError:
+                pass
+            ent = {"label": e[0], "source": e[1], "sigma": sig}
+            if len(e) == 5:
+                ent["erange"] = [float(e[3]), float(e[4])]
+            edges.append(ent)
+        ties = {}
+        for t in a.tie or []:
+            k, ref, f = t.split(":")
+            ties[k] = [ref, float(f)]
+        sp = p.add_multiedge(name=a.name[0], edges=edges, atoms=a.atoms,
+                             counts=[_count_arg(c) for c in a.counts], ties=ties,
+                             step_points=a.step or [], density_range=tuple(a.density),
+                             scoring=a.scoring, sigma_rel=a.sigma_rel, sigma_abs=a.sigma_abs,
+                             description=a.description or "", overwrite=a.overwrite)
+        print(sp.describe())
+        return 0
+    if a.action == "show":
+        for n in a.name:
+            sp = p.get_multiedge(n)
+            print(sp.describe())
+            for nm in ([n, n + "_stepedge"] if sp.scoring == "both" else [n]):
+                if not os.path.exists(os.path.join(p.stoich_dir(nm), "chi2.json")):
+                    print(f"  {nm}: not run yet")
+                    continue
+                s = ME.summary(p, nm, level=a.level, scaled=True)
+                iv = s["intervals"]
+                print(f"  {nm}: best {s['best']}  χ²/ν {s['chi2_nu']:.2f} (ν {s['nu']})  "
+                      f"Birge Δχ²≤{a.level:g}: ρ {iv['density'][0]:.3f}–{iv['density'][2]:.3f}, "
+                      + ", ".join(f"{e} {100 * iv[f'w_{e}'][0]:.1f}–{100 * iv[f'w_{e}'][2]:.1f} wt%"
+                                  for e in s["elements"])
+                      + (f"  [at grid edge: {', '.join(s['at_grid_edge'])}]" if s["at_grid_edge"] else ""))
+            print()
+        return 0
+    # run (foreground; CPU only, within the 50 % cap)
+    for n in a.name:
+        ME.run(p, n, workers=a.workers)
+    return 0
+
+
 def cmd_escan(a):
     from . import jobs as J
     from . import stoich as S
@@ -375,16 +455,43 @@ def cmd_escan(a):
         for s in a.flat or []:
             layer, below, sig = s.split(":")
             flat.append({"layer": layer, "below": float(below), "sigma": float(sig)})
+        regions = []
+        for s in a.sigma_curv_region or []:
+            lo, hi, sig = s.split(":")
+            regions.append({"lo": float(lo), "hi": float(hi), "sigma": float(sig)})
+        anchor = []
+        for s in a.anchor or []:
+            layer, lo, hi, formula, rho, sig = s.split(":")
+            anchor.append({"layer": layer, "lo": float(lo), "hi": float(hi), "formula": formula,
+                           "density": float(rho), "sigma": float(sig)})
         group = None
         if a.thickness_group:
             names, lo, hi = a.thickness_group.split(":")
             group = {"layers": names.split(","), "bounds": [float(lo), float(hi)]}
+        dense = []
+        for s in a.knot_dense or []:
+            lo, hi, st = s.split(":")
+            dense.append([float(lo), float(hi), float(st)])
+        nexafs = []
+        for kind, items in (("fit", a.nexafs_fit), ("model", a.nexafs_model)):
+            for s in items or []:
+                parts = s.split(":")
+                ent = {"layer": parts[0], kind: parts[1]}
+                if len(parts) > 2:
+                    ent["shift"] = float(parts[2])
+                nexafs.append(ent)
         kw = dict(name=a.name[0], model=a.model, scans=a.scans, kk=kk, seed_model=a.seed_model,
+                  isld_basis=a.isld_basis, knot_step=a.knot_step, knot_step_outside=a.knot_step_outside,
+                  knot_dense=dense, nexafs=nexafs,
                   window=a.window, outer_step=a.outer_step, sigma_curv=a.sigma_curv,
-                  sigma_curv_outside=a.sigma_curv_outside, flat=flat,
+                  sigma_curv_outside=a.sigma_curv_outside, curv_regions=regions,
+                  flat=flat, anchor=anchor,
                   angle=not a.escan_only, min_theta=a.min_theta, high_theta=a.high_theta,
                   high_sigma=(a.high_sigma if a.high_sigma == "auto" else float(a.high_sigma)),
                   sigma_data=a.sigma_data, scan_weights=a.scan_weights,
+                  scan_scales=([i in a.free_scan_scale for i in range(len(a.scans))]
+                               if a.free_scan_scale else None),
+                  escan_scale_bounds=tuple(a.escan_scale_bounds),
                   angle_scale_bounds=tuple(a.angle_scale_bounds), thickness_group=group,
                   max_nfev=a.max_nfev or 2000, description=a.description or "")
         sp = p.add_escan(overwrite=a.overwrite, **kw)
@@ -633,6 +740,12 @@ def main(argv=None):
     s.add_argument("--description")
     s.add_argument("--overwrite", action="store_true")
 
+    s = add("mask", cmd_mask, "exclude single data points (list with no args)")
+    s.add_argument("--energy", type=float)
+    s.add_argument("--q", type=float, nargs="+", help="q of the points to exclude")
+    s.add_argument("--note")
+    s.add_argument("--clear", action="store_true", help="clear (all, or --energy)")
+
     add("models", cmd_models, "list models")
 
     s = add("show", cmd_show, "show model recipe(s)")
@@ -750,6 +863,26 @@ def main(argv=None):
     s.add_argument("--h5", help="read another h5 (e.g. a notebook's) instead")
     s.add_argument("--sample", help="sample name inside --h5")
 
+    s = add("multiedge", cmd_multiedge, "multi-edge (e.g. C + O) stoichiometry searches: "
+                                        "add | list | show | run")
+    s.add_argument("action", choices=["add", "list", "show", "run"])
+    s.add_argument("name", nargs="*")
+    s.add_argument("--edge", nargs="+", action="append", metavar="ARG",
+                   help="add: LABEL SOURCE SIGMA [ELO EHI]; SOURCE = Model:Layer | <project dir>::Model:Layer "
+                        "| table file; SIGMA = columns | spread:<AltModel> | number (repeat per edge)")
+    s.add_argument("--atoms", nargs="+", help="add: elements, e.g. Sn O C H")
+    s.add_argument("--counts", nargs="+", help="add: per atom N | LO:HI | LO:HI:STEP (tied atoms: any value)")
+    s.add_argument("--tie", nargs="+", metavar="EL:REF:FACTOR", help="add: N_EL = round(FACTOR·N_REF), e.g. H:C:2.25")
+    s.add_argument("--step", type=float, nargs="+", help="add: step-edge (off-resonance) energies, eV")
+    s.add_argument("--density", type=float, nargs=2, default=[0.8, 3.0], metavar=("LO", "HI"))
+    s.add_argument("--scoring", default="twoedge", choices=["twoedge", "stepedge", "both"])
+    s.add_argument("--sigma-rel", type=float, default=0.03, help="add: σ ⊕ this·|value|")
+    s.add_argument("--sigma-abs", type=float, default=0.05, help="add: σ ⊕ this")
+    s.add_argument("--description")
+    s.add_argument("--overwrite", action="store_true")
+    s.add_argument("--workers", type=int, help="run: process-pool size (≤ 50%% of CPUs, shared)")
+    s.add_argument("--level", type=float, default=1.0, help="show: Birge-scaled Δχ² level (1 = 68%%)")
+
     s = add("escan", cmd_escan, "energy-scan fits (KK-linked; alone or co-refined with angle scans): "
                                 "add | list | show | run")
     s.add_argument("action", choices=["add", "list", "show", "run"])
@@ -764,8 +897,21 @@ def main(argv=None):
     s.add_argument("--sigma-curv", type=float, default=0.05, help="add: isld curvature σ per 0.5 eV")
     s.add_argument("--sigma-curv-outside", type=float,
                    help="add: curvature σ outside the energy scans (default σ/10)")
+    s.add_argument("--sigma-curv-region", nargs="+", metavar="LO:HI:SIGMA",
+                   help="add: isld curvature σ over LO–HI eV instead of --sigma-curv")
+    s.add_argument("--isld-basis", default="nodes", choices=["nodes", "bspline", "nexafs"],
+                   help="add: isld parameterisation (node values | cubic B-spline | NEXAFS peak model)")
+    s.add_argument("--knot-step", type=float, default=0.5, help="add: bspline knot spacing in the scans (eV)")
+    s.add_argument("--knot-step-outside", type=float, help="add: bspline knot spacing outside (default --outer-step)")
+    s.add_argument("--knot-dense", nargs="+", metavar="LO:HI:STEP", help="add: finer bspline knots over LO–HI")
+    s.add_argument("--nexafs-fit", nargs="+", metavar="LAYER:FIT[:SHIFT]",
+                   help="add: nexafs basis from a `nexafs fit` result (optional extra eV shift)")
+    s.add_argument("--nexafs-model", nargs="+", metavar="LAYER:MODEL[:SHIFT]",
+                   help="add: nexafs basis from a stored peak model")
     s.add_argument("--flat", nargs="+", metavar="LAYER:BELOW_EV:SIGMA",
                    help="add: flat-isld prior below an energy (σ per 0.5 eV)")
+    s.add_argument("--anchor", nargs="+", metavar="LAYER:LO:HI:FORMULA:DENSITY:SIGMA",
+                   help="add: pull a KK layer's isld over LO–HI eV towards a formula's bare-atom isld")
     s.add_argument("--escan-only", action="store_true", help="add: energy scans only, geometry fixed")
     s.add_argument("--min-theta", type=float, default=0.0, help="add: leave out angle-scan points below θ (deg)")
     s.add_argument("--high-theta", type=float, help="add: re-weight angle-scan points above θ (deg)")
@@ -773,6 +919,9 @@ def main(argv=None):
     s.add_argument("--sigma-data", type=float, default=0.03)
     s.add_argument("--scan-weights", nargs="+", type=float)
     s.add_argument("--angle-scale-bounds", nargs=2, type=float, default=[0.5, 1.5])
+    s.add_argument("--free-scan-scale", nargs="+", type=int, metavar="I",
+                   help="add: give energy scan(s) I (0-based, --scans order) their own fitted scale")
+    s.add_argument("--escan-scale-bounds", nargs=2, type=float, default=[0.5, 1.5])
     s.add_argument("--thickness-group", metavar="L1,L2:LO:HI",
                    help="add: fit the summed thickness of these layers within LO–HI")
     s.add_argument("--max-nfev", type=int)

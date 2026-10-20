@@ -196,6 +196,12 @@ def plan_energy(r, folder, open_beams, settings, ov, cache):
             hi = dict(h, data=_load(h["path"], cache))
             last, why, fl, stt = TR.junction_end(lo, hi, s["start"], h["start"], settings)
             junction.append(stt)
+            fp, fp_why, fp_fl = TR.pd_floor_points(lo, hi, h["start"], last,
+                                                    stt["cap_idx"], settings)
+            if fp:
+                s["floor_drop"] = fp
+                why = f"{why}; {fp_why}"
+                fl = fl + fp_fl
         else:
             last, why, fl = TR.tail_end(lo, s["start"], settings)
         s["end"] = int(TR.legacy_end(last, len(d)))
@@ -237,6 +243,19 @@ def plan_energy(r, folder, open_beams, settings, ov, cache):
             "status": "planned", "accepted": bool(ov.get("accept", False))}
 
 
+def _counting_errors(secs, scans, settings):
+    """output.error_model == "counting": per-raw-point relative noise per section
+    (PD σ/(PD−bg), CEM 1/√counts, both on the smoothed signal); else None."""
+    if settings["output"].get("error_model", "flat") != "counting":
+        return None
+    out = {}
+    for i, (s, d) in enumerate(zip(secs, scans)):
+        rel, _ = TR.rel_err(s["kind"], d[:, 0], d[:, 1], s.get("bg", 0.0),
+                            s.get("sigma"), s.get("count_time"))
+        out[i] = rel
+    return out
+
+
 def reduce_energy(pe, settings, cache=None, scale_overrides=None):
     """Stitch one plan entry. -> (result dict, junction stats, flags)"""
     cache = cache if cache is not None else {}
@@ -253,7 +272,10 @@ def reduce_energy(pe, settings, cache=None, scale_overrides=None):
             so[i] = s["scale"]
     res = ST.reduce_sections(scans, trims, bgs, pe["energy"], i0=i0,
                              error_frac=settings["output"]["error_frac"],
-                             scale_overrides=so)
+                             scale_overrides=so,
+                             point_drops={i: s["floor_drop"] for i, s in enumerate(secs)
+                                          if s.get("floor_drop")},
+                             rel_errs=_counting_errors(secs, scans, settings))
     res["i0"] = i0
     stats = QC.junction_stats(pe, res)
     # scale is PD volts per CEM rate: remove the PD gain decade so energies

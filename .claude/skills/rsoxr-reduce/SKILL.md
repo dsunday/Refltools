@@ -80,13 +80,21 @@ spots; info ≤ 3 mm — spots are stepped on purpose to limit beam damage).
 - *Junction ends* (PD→CT1, CTk→CTk+1) — keep the lower section into the overlap
   until the stitch scale is known to 2 % with ≥ 4 upper-section points, but not
   past its own noise floor (PD smoothed SNR < 5, CEM counts < 10).
+- *PD floor points* — `PD_FLOOR_POINTS` (info): when PD is kept past its SNR floor
+  for the overlap (`LOW_OVERLAP`), PD points the next section covers are not
+  written, and below it isolated dropouts ((PD−bg) < `trim.floor_outlier_ratio` 0.33 ×
+  5-pt running median) are not written; all still set the stitch scale. Not a σ cut
+  (that would keep only upward fluctuations). Added 2026-10-07 for Brewer2 carbon
+  (289.5 eV point at ×0.01).
 - *CT start* — `CT_SATURATION`: CEM > 1e5 cps is non-linear (+3 % at 1–3e5,
   +22 % at 3e5–1e6 cps in Nov 2025) → leading points trimmed.
 - *Tail* — last section cut where counts < 10 (`LOW_COUNTS_TAIL`); final point always dropped.
 
 **Stitch** (`stitch.py`) — numerically identical to the widget/legacy path
 (trim → background → ÷ I0 → drop ≤0 → cumulative median-ratio stitch → Q with
-λ = 12399/E); flat 1 % errors. Open beam (`pipeline.choose_open_beam`): same edge,
+λ = 12399/E); flat 1 % errors by default. `set output.error_model counting` (opt-in,
+test only so far) writes R·√(1 %² + rel²) with rel = PD σ/(PD−bg) or CEM 1/√counts on
+the smoothed signal — put such a variant in its own folder (`init --out <raw>/ReducedAuto_counting`). Open beam (`pipeline.choose_open_beam`): same edge,
 then same filter, same exit-slit gap (±3 %), covering the energy, closest in time.
 **PD gain is in decades: I0 is multiplied by 10^(gain_sample − gain_open-beam)**
 (`GAIN_CORRECTED`); slit/filter mismatches are flagged, not corrected.
@@ -107,7 +115,11 @@ short — weak: same-filter junctions scatter 0.4–1.8), `NEG_AFTER_BG`, `TRUNC
 ## Protocol
 
 1. **Status first:** after every `reduce`, report ok / review / rejected counts and
-   list held energies with codes. Nothing held is written to a `.dat`.
+   list held energies with codes. Nothing held is written to a `.dat` — **except**
+   by a partial `reduce --energies …`, which (known bug, 2026-10-07) writes held
+   energies and skips cross-energy QC, so `SCALE_BLENDED` energies get the
+   unblended CT scale (Brewer2 C: ×1.1–1.7). Use partial runs only for diagnostics
+   and always finish with a full `reduce` before fitting.
 2. **Review = look:** before recommending `accept`, `Read` the diagnostic PNG and say
    what it shows (overlap agreement, fringe damping, kept ranges). For
    `FILTER_CHANGE`, compare fringe amplitude in the overlap panel; if damped, suggest

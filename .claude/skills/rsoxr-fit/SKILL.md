@@ -12,19 +12,10 @@ project-directory front end to the Refltools pipeline
 code when a harness call exists.** Package docs: module docstrings in
 `/homes/dfs1/Refltools/rsoxr_harness/*.py`.
 
-> **Pending ideas — mention these to the user once when this skill is loaded**
-> (requested 2026-10-07, not started). For energy-scan / KK-linked isld fits
-> (see "Energy scans" below), try two alternative isld representations, both
-> linear in their parameters so the cached KK response-matrix approach still
-> applies:
-> 1. **Cubic B-spline isld** on a coarser knot grid (instead of piecewise-linear
->    node values), with the curvature prior as a proper ∫(isld″)² dE.
-> 2. **NEXAFS building-block isld** (edge step + peaks, `NEXAFS_BuildingBlock.py`)
->    — far fewer parameters, imposes a physical shape.
-> Implement as an option in `rsoxr_harness/escan.py` (isld basis in `Problem.paths`,
-> prior in `Problem._arrays`) and compare against the current node-value fit
-> (Brewer1 O edge: `Harness_Brewer1_Oxygen_Auto`, `escan run O2L`). Remove this note
-> once done or declined.
+> **Open follow-up (2026-10-08):** the B-spline / NEXAFS isld bases are implemented
+> (`--isld-basis`, see "Energy scans") and were compared on INT_MOX carbon; the
+> comparison on the Brewer1 O edge (`Harness_Brewer1_Oxygen_Auto`, `O2L`) has not
+> been run. Mention once when this skill is loaded; remove when done or declined.
 
 ## Environment
 
@@ -75,11 +66,14 @@ Any older notebook h5 can be read by plot/fits/nuts/jaxns commands via
 | "show ModelNa's new bounds on that SLD plot" | add `--bounds-from ModelNa` to `plot sld-energy` (works for unfitted models; widened energies marked ▲/▼). |
 | "thickness of SOC vs energy" | `plot param -p P --param "SOC - thick" --models ...` |
 | "depth profiles" | `plot profiles -p P --models ... [--energies ...] [--ref SOG SOC]` |
+| "mask the bad points" / "drop that point at 287.8" | Find them from the fit, not the data alone (deep fringe minima look like dropouts): per energy, points with data/model ≪ 1 carrying most of that energy's χ² (`plots._load_objectives` → `o.data.y / o.model(q)`). Pairs with an identical R value are clamped floor values: mask both. `mask -p P --energy E --q q1 [q2] --note "..."` (`p.mask_points`; nearest point within 2e-4); `mask -p P` lists, `--clear [--energy E]`. Data-level, applies to every model; earlier runs no longer reproduce (load_best refuses them) → refit the affected energies (new run index; best = lowest χ²). |
+| "drop 295 entirely" / "exclude that energy" | Python API (no CLI yet): `p.exclude_energy(295, note="...")` → removed from data, `p.energies`, every model/run/plot; recorded in `project.json` `data.exclude_energies`; existing fits at that energy are moved (not deleted) to h5 group `<sample>_excluded/<E>`. `p.excluded_energies()` lists; `p.include_energy(E)` undoes both. Before excluding, check whether it was a held/overridden energy in the reduction (`ReducedAuto/reduction_record.csv`) and say so. |
 | "save/export Model3's SOG SLD (to seed the next sample)" | `export-sld -p P --model Model3 --layer SOG [--register-as SOG_B9M3]` |
 | "check KK consistency" / "KK check of Model2's PS" / "are Re and Im Kramers–Kronig consistent" | `kk -p P --source Model2:PS --formula C8H8 [--density 1.05 \| --density-range lo hi] [--merge lo hi] [--mask lo hi ...] [--name N] [--tol T]` → KK-transforms the fitted Im (formula tails, density fitted unless given), compares with the fitted Re per energy; prints rms ΔRe, rms/(Re span) with a rough verdict (<0.10 consistent, <0.25 roughly), flagged energies (|ΔRe| > tol, default max(1, 10 % of span)) and writes a 3-panel plot. Results in `<project>/kk/<name>/` (kk_table.csv, kk_sld.csv, summary.json). `kk list`, `kk show --name N`; compare models: `plot kk --names N1 N2`. Report the density (and whether it hit the range edge), the verdict and where the mismatch sits. Source can also be a material or CSV (e.g. a NEXAFS-derived table). |
 | "fit the energy scans" / "co-refine the angle and energy scans" | `escan add NAME --model M [--seed-model S] --scans … --kk LAYER:FORMULA:RHO …` (see "Energy scans"), show the `describe()` output, confirm, then `escan run NAME --gpu N --detach`; report cost (angle / each scan), scale, geometry at bounds, and Read the four `escan_NAME_*.png`. |
 | "fit the stoichiometry / density of SOG (from Model3's fit / a CSV)" | Register a search: `p.add_stoich(name=, source=, atoms=[...], counts=[...], density_range=(lo, hi), merge_points=, energy_mask=)` — source = material name \| `"Model3:SOG"` (fitted layer SLD) \| CSV path; counts entries int (fixed) \| `[lo, hi]` \| `[lo, hi, step]`. Fragment search: `mode="fragments", fragments=["SiO2", "CH3"], counts=[...]`. State the candidate count (`p.get_stoich(n).n_candidates()`, ~40 s per 1600 at the 56-worker cap), then `stoich run NAME [NAME2] -p P [--workers N] --detach`; `stoich list` / `stoich show NAME`. Fix one count (or use a fixed fragment) — formulas differing by an overall factor have identical cost. Best density is refined within ±`refine_density` (default 0.1). |
 | "proper uncertainty" / "Δχ² intervals" for a stoich run | `stoich chi2 NAME -p P` (needs σ columns 4–5 in the source table, e.g. from `sld_from_jaxns_cache`) → σ-weighted χ² per formula with density profiled, 401-pt χ²(ρ) grid; prints raw-σ and Birge-scaled (Δχ²/(χ²_best/ν)) profile intervals at Δχ²=1 (68%) and 4 (95%); `plot stoich-chi2 --name N`. Several runs (any projects) stacked as rows with shared column limits: `plots.plot_stoich_chi2_rows([(proj, name, label), ...], out=...)`. Prefer Birge-scaled when χ²/ν ≫ 1 or σ are mis-scaled (JAXNS normalize=True tempers σ). Flag interval ends that sit on the count grid edge. Noise model assumes the imaginary SLD fed to KK is exact. |
+| "combined C + O (multi-edge) stoichiometry" | `multiedge add NAME -p <O project> --edge C <C project dir>::Model1:MOX spread:Model3b --edge O Model3bx:MOX spread:Model3bw --atoms Sn O C H --counts 12 8:80:4 0:72:4 0 --tie H:C:2.25 --step 270 282 310 330 470 505 560 --density 1 3.5 --scoring both`, then `multiedge run NAME` (foreground, CPU, shares the 50 % cap — another stoich job holding the cap leaves it 1 worker, ~20× slower), `multiedge show NAME` (best + Birge-scaled ρ / wt% intervals, grid-edge flags), `multiedge list`. Module `rsoxr_harness/multiedge.py`. Sources: `Model:Layer` (this project), `<dir>::Model:Layer` (another project), or a table; σ = `columns` \| `spread:<AltModel>` \| number, always ⊕ `--sigma-rel`·|v| ⊕ `--sigma-abs` (3 %, 0.05); optional per-edge erange (`--edge LABEL SRC SIGMA LO HI`). Scoring `twoedge` = absolute multi-edge KK (measured Im spliced into Henke at the trial ρ, no rescale) on Re + step-edge Im; `stepedge` = bare-atom Im at the step points only — weak: an O step from one post-edge point (560 eV) runs to the grid edge (INT_MOX). Results in `stoich/NAME[_stepedge]/` in the `stoich chi2` format (`plot stoich-chi2 --name`). Always extend counts until the optimum is inside the grid. INT_MOX C+O (2026-10-08): C/Sn and ρ robust, O/Sn 3–5 (chemically high, treat as upper bound). |
 | "uncertainty with a ±5% RMSE cutoff" | `plot stoich-accept --name N --tol-pct 5` (+ `plots.stoich_accepted(p, N, 5)` for the table: counts, atom and mass fractions, density of every candidate within +tol% of the best). Report ranges of ρ, element ratios and mass fractions, and flag counts whose accepted range touches the grid edge (range is then a lower bound on the uncertainty). Split residual windows: `energy_mask=[[270, 284], [310, 330]]`. |
 | "use the JAXNS fits as the stoichiometry target" | `from rsoxr_harness.stoich import sld_from_jaxns_cache; sld_from_jaxns_cache(cache_dir, "SOC", out_csv)` → posterior-median (or `stat="mean"`) SLD + std per energy from notebook `*_jaxns_<E>.npz` caches (e.g. `BrewerN_Fit_NB/ALS_Fits/BrewerN/Uncertainty_M1/`); use out_csv as the stoich source. There is no density "initial guess" — density is bounded-optimised per candidate; centre `density_range` on the user's guess and say so. If the best count sits at a range edge (check `plot stoich-counts`), say the optimum is outside the grid and offer a wider/ratio search (fix one atom, e.g. O=1). |
 | "stoichiometry plots" | `plot stoich-results --name N` (top-N bars + KK real/imag), `stoich-density` (RMSE vs ρ), `stoich-counts [--baseline C=40 ...]` (RMSE vs each count/multiplier, others at best), `stoich-overlay --name N [--sim FORMULA:RHO ...]` or `--source S --sim ...` (simulate without fitting). Results in `<project>/stoich/<name>/` (results.csv, best.json, best_kk_sld.csv = KK-consistent SLD of the best formula, registrable as a material). |
@@ -272,14 +266,96 @@ $PY -m rsoxr_harness escan list|show NAME -p P ;  plot escan --name NAME
 - **Priors are per eV** (σ quoted per 0.5 eV): curvature everywhere,
   `--sigma-curv-outside` (default σ/10) stiffer outside the scans so those nodes
   can't act as a KK knob on the in-window sld; `--flat LAYER:E:σ` holds isld flat
-  below E (user's sharp-onset rule for a surface layer at the O edge).
+  below E (user's sharp-onset rule for a surface layer at the O edge);
+  `--sigma-curv-region LO:HI:σ` (repeatable) sets σ over an energy range (outside
+  the scans the stiffer of region/outside σ wins) — e.g. carbon: loose over the
+  edge, stiff post-edge.
 - **Modes**: default co-refinement with the angle scans (one shared angle-scan
   scale, energy scans at scale 1, bkg per energy); `--escan-only` fixes geometry,
   scale and non-KK layers at the seed model's values (user rule: thickness and
   roughness otherwise float — keep them fixed or tightly bounded; use RSoXR fits
   from the same spot, not HXR).
+  `--free-scan-scale I [I ...]` (0-based, `--scans` order; bounds `--escan-scale-bounds`,
+  default 0.5–1.5) gives those energy scans their own fitted scale (`escale:I` in the
+  params) — for a scan whose absolute level disagrees with the rest (Brewer5 O θ=2°,
+  below θc, +15–20 % over the whole pre-edge). Report it; it is a diagnosis, not a fix.
+- **isld basis** (`--isld-basis`, default `nodes` = free value per grid node):
+  `bspline` = clamped cubic B-spline (`--knot-step` in the scans, `--knot-dense
+  LO:HI:STEP` finer, `--knot-step-outside` default `--outer-step`), curvature prior
+  ∫(isld″)² dE with the same σ / σ-outside / `--sigma-curv-region`; `nexafs` = a
+  stored NEXAFS peak model (`--nexafs-fit LAYER:FIT[:SHIFT]` from a `nexafs fit`
+  of the isld, energy_shift honoured, or `--nexafs-model LAYER:MODEL[:SHIFT]`),
+  its varied params/bounds are the fit params, no curvature prior; refined model →
+  `escan/NAME/nexafs_<layer>.json`.
+  INT_MOX carbon (2026-10-08, 4°, co-refined): bspline (0.5 eV, 0.2 over 284–293)
+  reproduces the node fit (cost within 1.5 %, curves overlap) with 302 vs 719
+  params → good default. nexafs (user's notebook peaks, tight bounds, slope fixed
+  0) gave physical tails but doubled the cost: ±10–40 % escan misfit at 288–290 eV
+  and a broad tilt over 250–350 eV (flat baseline can't follow the pre/post-edge
+  trend) → needs a free slope and looser peak bounds to compete.
+  ExpAsDep bspline tuning: 2 eV knots off-edge + 0.2 eV over the edge loses
+  nothing (168 params). A wider KK window (200–450) only helps with a stiff
+  outside prior (`--sigma-curv-outside 0.0005`); with the default (σ/10) the
+  outside isld swings to 2× the data and drags the in-window post-edge isld; a
+  stiff prior with the auto window (−20/+30 eV) makes artefacts at the scan end.
 - Outputs `escan/NAME/`: result.npz, summary.json, `paths_<layer>.csv` (E, sld,
   isld, has-data flag), `free_<layer>.csv`; figures `escan_NAME_{optics,window,escans,angles}.png`.
+- GPU memory: the Jacobian is forward-mode in chunks of `escan.JAC_CHUNK` (256)
+  parameters; a two-layer carbon fit (~1100 params) needs ~33 GB. Check
+  `nvidia-smi` for a GPU with that much free.
+
+### New sample: energy-scan recipe (what "fit the energy scans" means)
+
+The user's intent: KK-consistent sld/isld of the film at each edge, from the
+fixed-angle energy scans **co-refined with the angle scans** (shared geometry,
+one angle-scan scale that should come out ≈ 1), then a C+O stoichiometry. One
+reduction project and one fit project per sample × edge (`Harness_<S>_Auto`,
+`Harness_<S>_Oxygen_Auto`). Reference run: Brewer2, 2026-10-08 (`Brewer2_Fit_NB/`).
+Defaults below; the user overrides freely.
+
+1. **Reduce both edges** (rsoxr-reduce skill): `init` + `reduce` + `escan` per raw
+   folder; review held energies (e.g. 545 eV `SCALE_OUTLIER` accepted on Brewer1/2).
+   Always finish with a full `reduce`: a partial `reduce --energies` writes held
+   energies and skips cross-energy scale blending.
+2. **Compare energy scans with the angle scans** (R at the scan θ read off each
+   reduced angle scan, plus an energy-shift test):
+   `Data_Reduction/Nov 2025/Brewer2/compare_escan_angle.py` (copy, change SAMPLE).
+   Expect ≤ 1 % off-edge, ±10–20 % at steep near-edge energies, ~0 eV shift.
+3. **Fit projects + angle-scan models** (flat 1 % errors — user's choice for
+   consistency; `output.error_model counting` exists but is a test option):
+   - C: Model1 (single SOC, dq 1.8, scale start 1) → Model2 (+`SOC_Surf` skin,
+     own material copy) → **Model2g** (`link` SOC_Surf + SOC thickness/roughness,
+     `link_energies`; `run fit --gens 10000`, 5000 did not converge).
+   - O: Model6 (Brewer recipe, dq 0.7, SiO2 ±5, scale start 1) → Model6s
+     (`add_layer SOC_surf above SOC`).
+   - Start tables: previous sample's final SLDs if available (register as
+     `fit_csv`; for a two-layer table write a 3-column copy per layer). It only
+     matters at a few near-edge energies; check where the old fit sits outside
+     the new ±window.
+4. **Energy-scan fits** (both two-layer, both KK layers, same formula/density —
+   the previous sample's stoichiometry, e.g. C25O5H8N4:1.337):
+   ```bash
+   # carbon (one 4° scan) — Brewer2 C2e1
+   escan add C -p PC --model Model2gB2 --seed-model Model2gB --scans <th4.dat> \
+     --kk SOC_Surf:F:ρ SOC:F:ρ --sigma-curv 0.5 \
+     --sigma-curv-region 284:290:1 300:381:0.05 --flat SOC_Surf:284:0.01 SOC:284:0.01 \
+     --min-theta 1.5 --high-theta 4 --high-sigma auto --thickness-group SOC_Surf,SOC:965:985
+   # oxygen (2° + 3°) — Brewer2 O2LB2
+   escan add O -p PO --model Model6sB --seed-model Model6B --scans <th2.dat> <th3.dat> \
+     --kk SOC_surf:F:ρ SOC:F:ρ --window 450 600 --sigma-curv 0.05 --flat SOC_surf:538:0.001 \
+     --min-theta 1.5 --high-theta 4 --high-sigma auto --thickness-group SOC_surf,SOC:940:976
+   ```
+   Report cost (escan / angles), angle-scan scale, geometry at bounds, KK offsets
+   (≈ 0 ⇒ formula/density consistent), and Read optics + escans + angles PNGs.
+   Show the user the fits to the data, not only the SLDs.
+5. **Stoichiometry (C+O, full covariance)** — script, not a harness command:
+   `Brewer2_Fit_NB/stoich_brewer2/stoich_fullcov2_brewer2.py` (set PC/PO,
+   C_NAME/O_NAME; GPU for the Jacobians, 24 CPU workers, ~10 min). Writes stoich-chi2
+   runs `SOC_B2_fullcov2_c{1e-08,1e-06,1e-04}` (→ `plot stoich-chi2 --name`).
+   Report the wt% ranges across cutoffs, not one formula (best formula changes
+   with the cutoff); flag counts at the grid edge.
+6. **Final summary**: `Brewer2_Fit_NB/FinalSummaryPlots/make_final_summary.py`
+   (stoichiometry figure, C/O waterfalls, sld CSVs + JSON + README).
 
 **Lessons (Brewer1, 2026-10-06/07)**
 - One angle per energy = one equation, two unknowns: a locus; continuity alone
@@ -301,10 +377,24 @@ $PY -m rsoxr_harness escan list|show NAME -p P ;  plot escan --name NAME
   O-edge development scripts: `Brewer1_Fit_NB/Harness_Brewer1_Auto/escan_grid/`,
   `Brewer1_Fit_NB/Harness_Brewer1_Oxygen_Auto/escan_grid/`.
 
+**Lessons (Brewer2, 2026-10-07/08)**
+- Carbon two layers vs one (co-refined): two-layer cost 10.9k vs 24.0k, scale
+  1.00 vs 0.92. One layer spikes at the angle-scan energies (angle and energy
+  scans want different SOC). Two layers with σ 0.5 everywhere oscillate above
+  300 eV with surface/bulk anticorrelated → stiff post-edge region (σ 0.05).
+- Softer edge prior: carbon σ 1 over 284–290 cost −19 % (σ 2: −28 % but pre-edge
+  wiggles); the ±20–30 % escan spikes at 285.5–287.5 eV did not shrink → not
+  prior-limited. O edge σ 0.2/0.5 over 530–550: only −5/−7 % and spikes at the
+  angle-scan energies → keep 0.05 at the O edge.
+- Per-edge thicknesses differ (C surface 63 Å / total 972 Å; O 44 / 960 Å, O at a
+  different spot) — user: acceptable (global per edge, different sensitivities).
+- Angle-only per-energy fits: scale 0.53–1.83 near the C edge; the global link
+  (Model2g) costs only +3 % χ² for 152 fewer parameters (BIC prefers it).
+
 ## Not implemented yet (milestone M6)
 
 Global-fit JAXNS/NUTS (M6 step 2 — `run jaxns` on a linked model is not yet
-global), linking SLD across energies, multi-edge stoichiometry (independent/stitched KK across edges),
+global), linking SLD across energies,
 KK-constrained fitting of angle scans alone (the `kk` command only checks consistency after a fit; KK-linked fits
 with energy scans are the `escan` commands), single-angle grid/continuity tools (scripts only, see "Energy scans"). Say so and offer to do it with the underlying Refltools
 functions directly.

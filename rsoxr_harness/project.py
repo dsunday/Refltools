@@ -163,11 +163,137 @@ class FitProject:
             with _quiet(verbose):
                 self._data = import_batch_reflectivity(
                     d["folder"], file_type=d["file_type"], q_max=d["q_max"])
+            self._apply_energy_exclusions()
+            self._apply_point_mask()
         data_dict, elist = self._data
         if energies is None:
             return data_dict, list(elist)
         sel = self.select_energies(energies)
         return {e: data_dict[e] for e in sel}, sel
+
+    def _apply_energy_exclusions(self):
+        """Drop whole energies listed in cfg data.exclude_energies {E: {note, added}}."""
+        ex = self.cfg["data"].get("exclude_energies") or {}
+        if not ex:
+            return
+        data_dict, elist = self._data
+        drop = [e for e in elist if any(abs(e - float(k)) < 1e-3 for k in ex)]
+        for e in drop:
+            data_dict.pop(e, None)
+        self._data = (data_dict, [e for e in elist if e not in drop])
+
+    def exclude_energy(self, energy, note="", h5_move=True):
+        """Remove one energy from the project (data, energy list, all fits/plots).
+
+        Recorded in cfg data.exclude_energies.  With h5_move, existing fits at that
+        energy are moved (not deleted) to '<sample>_excluded/<E>' in the project h5,
+        so h5 readers no longer see them; include_energy() moves them back.
+        """
+        e = self.select_energies([energy])[0]
+        ex = self.cfg["data"].setdefault("exclude_energies", {})
+        ex[f"{e:g}"] = {"note": note, "added": datetime.now().isoformat(timespec="seconds")}
+        self.cfg["data"]["energies"] = [x for x in self.energies if abs(x - e) > 1e-3]
+        moved = self._move_energy_group(e, self.sample_name, self.sample_name + "_excluded") \
+            if h5_move else []
+        self.save()
+        self._data = None
+        return {"energy": e, "moved_h5_groups": moved}
+
+    def include_energy(self, energy):
+        """Undo exclude_energy (restores the energy and any moved h5 fits)."""
+        ex = self.cfg["data"].get("exclude_energies") or {}
+        key = next((k for k in ex if abs(float(k) - float(energy)) < 1e-3), None)
+        if key is None:
+            raise ProjectError(f"{energy} eV is not excluded")
+        ex.pop(key)
+        self._data = None
+        self.cfg["data"]["energies"] = [float(x) for x in self.load_data()[1]]
+        moved = self._move_energy_group(float(key), self.sample_name + "_excluded",
+                                        self.sample_name)
+        self.save()
+        return {"energy": float(key), "moved_h5_groups": moved}
+
+    def excluded_energies(self):
+        ex = self.cfg["data"].get("exclude_energies") or {}
+        return sorted((float(k), v.get("note", "")) for k, v in ex.items())
+
+    def _move_energy_group(self, e, src, dst):
+        import h5py
+        if not os.path.exists(self.h5_path):
+            return []
+        moved = []
+        with h5py.File(self.h5_path, "a") as f:
+            if src not in f:
+                return []
+            for ek in list(f[src].keys()):
+                try:
+                    if abs(float(ek) - e) > 1e-3:
+                        continue
+                except ValueError:
+                    continue
+                f.require_group(dst)
+                if ek in f[dst]:
+                    raise ProjectError(f"h5 already has {dst}/{ek}; resolve by hand")
+                f.move(f"{src}/{ek}", f"{dst}/{ek}")
+                moved.append(f"{src}/{ek} -> {dst}/{ek}")
+        return moved
+
+    def _apply_point_mask(self):
+        """Exclude masked points (cfg data.point_mask {E: [{q, note}]}) on top of q_max."""
+        pm = self.cfg["data"].get("point_mask") or {}
+        data_dict, _ = self._data
+        for key, entries in pm.items():
+            ds = data_dict.get(float(key))
+            if ds is None:
+                continue
+            q = np.asarray(ds._x)
+            keep = np.ones(q.size, bool) if ds.mask is None else np.asarray(ds.mask, bool).copy()
+            for ent in entries:
+                i = int(np.argmin(np.abs(q - ent["q"])))
+                keep[i] = False
+            ds.mask = keep
+
+    def mask_points(self, energy, qs, tol=2e-4, note=""):
+        """Exclude the data points nearest each q in `qs` at `energy` from all fits/plots.
+
+        Data-level (not part of any model): fits made before the mask keep their
+        unmasked χ² and no longer reproduce (load_best refuses them) — refit.
+        """
+        e = self.select_energies([energy])[0]
+        self._data = None
+        data_dict, _ = self.load_data()
+        q = np.asarray(data_dict[e]._x)
+        pm = self.cfg["data"].setdefault("point_mask", {})
+        entries = pm.setdefault(f"{e:g}", [])
+        out = []
+        for qq in np.atleast_1d(qs):
+            i = int(np.argmin(np.abs(q - qq)))
+            if abs(q[i] - qq) > tol:
+                raise ProjectError(f"no data point within {tol} of q={qq} at {e:g} eV "
+                                   f"(nearest {q[i]:.5f})")
+            if not any(abs(x["q"] - q[i]) < 1e-9 for x in entries):
+                entries.append({"q": float(q[i]), "R": float(data_dict[e]._y[i]),
+                                "note": note,
+                                "added": datetime.now().isoformat(timespec="seconds")})
+            out.append(float(q[i]))
+        self.save()
+        self._data = None
+        return out
+
+    def clear_point_mask(self, energy=None):
+        pm = self.cfg["data"].get("point_mask") or {}
+        if energy is None:
+            pm.clear()
+        else:
+            pm.pop(f"{self.select_energies([energy])[0]:g}", None)
+        self.cfg["data"]["point_mask"] = pm
+        self.save()
+        self._data = None
+
+    def point_mask_table(self):
+        pm = self.cfg["data"].get("point_mask") or {}
+        return [(float(k), x["q"], x.get("R"), x.get("note", ""))
+                for k, v in sorted(pm.items(), key=lambda kv: float(kv[0])) for x in v]
 
     # ------------------------------------------------------------------
     # materials
@@ -393,6 +519,55 @@ class FitProject:
         return "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(r)) for r in rows)
 
     # ------------------------------------------------------------------
+    # multi-edge stoichiometry (multiedge.py)
+    # ------------------------------------------------------------------
+    @property
+    def multiedge_names(self):
+        return list(self.cfg.get("stoich_multiedge", {}))
+
+    def add_multiedge(self, spec=None, overwrite=False, **kw):
+        """Register a multi-edge (e.g. C + O) stoichiometry search (MultiEdgeSpec or
+        its fields).  Every edge table is built now (fail early); results go to
+        stoich/<name>/ in the `stoich chi2` format (`multiedge run NAME`)."""
+        from . import multiedge as ME
+        spec = spec if isinstance(spec, ME.MultiEdgeSpec) else ME.MultiEdgeSpec(**(spec or kw))
+        if spec.name in self.stoich_names:
+            raise ProjectError(f"'{spec.name}' is already a single-edge stoich search name")
+        cur = self.cfg.setdefault("stoich_multiedge", {})
+        if spec.name in cur and not overwrite:
+            if cur[spec.name] == spec.to_json():
+                return spec
+            raise ProjectError(f"multi-edge stoich '{spec.name}' exists (overwrite=True to replace)")
+        try:
+            ME.inputs(self, spec)
+        except (ValueError, KeyError, OSError) as e:
+            raise ProjectError(f"multi-edge stoich '{spec.name}': {e}") from None
+        cur[spec.name] = spec.to_json()
+        self.save()
+        return spec
+
+    def get_multiedge(self, name):
+        from . import multiedge as ME
+        try:
+            return ME.MultiEdgeSpec.from_json(self.cfg["stoich_multiedge"][name])
+        except KeyError:
+            raise ProjectError(f"no multi-edge stoich '{name}'; known: {self.multiedge_names}") from None
+
+    def multiedge_table(self):
+        rows = [("name", "scoring", "edges", "candidates", "best", "ρ", "χ²/ν")]
+        for n in self.multiedge_names:
+            sp = self.get_multiedge(n)
+            best = ("-", "-", "-")
+            f = os.path.join(self.stoich_dir(n), "chi2.json")
+            if os.path.exists(f):
+                with open(f) as fh:
+                    i = json.load(fh)
+                best = (i["best_formula"], f"{i['best_density']:.3f}", f"{i['chi2_best'] / i['nu']:.2f}")
+            rows.append((n, sp.scoring, "+".join(e["label"] for e in sp.edges), str(sp.n_candidates()), *best))
+        w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+        return "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(r)) for r in rows)
+
+    # ------------------------------------------------------------------
     # energy-scan fits (escan.py)
     # ------------------------------------------------------------------
     @property
@@ -417,12 +592,21 @@ class FitProject:
             X.read_scan(path)                         # header has θ, data parse
             scans.append(path)
         spec.scans = scans
-        for f in spec.flat:
+        for f in spec.flat + spec.anchor:
             if f["layer"] not in [k["layer"] for k in spec.kk]:
                 raise ProjectError(f"flat prior on '{f['layer']}', which is not a KK layer")
         if spec.thickness_group:
             for n in spec.thickness_group["layers"]:
                 rec.layer(n)
+        if spec.isld_basis == "nexafs":
+            from . import nexafs as NX
+            for n in spec.nexafs:
+                if n["layer"] not in [k["layer"] for k in spec.kk]:
+                    raise ProjectError(f"nexafs entry for '{n['layer']}', which is not a KK layer")
+                try:
+                    NX.load_fit(self, n["fit"]) if "fit" in n else NX.get_model(self, n["model"])
+                except KeyError as e:
+                    raise ProjectError(str(e)) from None
         cur = self.cfg.setdefault("escan", {})
         if spec.name in cur and not overwrite:
             if cur[spec.name] == spec.to_json():

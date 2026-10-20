@@ -52,20 +52,27 @@ def median_ratio(combined, scan):
 
 
 def reduce_sections(scans, trims, backgrounds, energy, i0=None,
-                    remove_zeros=True, error_frac=0.01, scale_overrides=None):
+                    remove_zeros=True, error_frac=0.01, scale_overrides=None,
+                    point_drops=None, rel_errs=None):
     """Stitch sections into one curve.
 
     scans: list of raw arrays (N×≥2), stitch order.  trims: [(start, end)].
     backgrounds: per-section constant.  i0: open-beam intensity at ``energy``
     (None -> no I0 division, curve normalised to its max like the legacy code).
     scale_overrides: optional {section_index: scale}.
+    point_drops: optional {section_index: raw indices} left out of the output
+    curve but still used for the stitch scales (PD_FLOOR_POINTS).
+    rel_errs: optional {section_index: per-raw-point relative noise}; the written
+    error is then R·√(error_frac² + rel²) instead of the flat R·error_frac.
 
     Returns dict(q_data (N×3 sorted by Q), theta_data (N×2 unsorted, stitched
     order), sections=[per-section dict(theta, y, scale, n_overlap, ratios)]).
     """
     scale_overrides = scale_overrides or {}
+    point_drops = point_drops or {}
+    rel_errs = rel_errs or {}
     per = []
-    refl = bc_refl = None
+    refl = bc_refl = rel_all = None
     for i, (data, (s, e), bg) in enumerate(zip(scans, trims, backgrounds)):
         seg = apply_trim(data, s, e)
         if bg != 0.0:
@@ -73,16 +80,22 @@ def reduce_sections(scans, trims, backgrounds, energy, i0=None,
         bc = seg.copy()
         if i0 is not None:
             seg[:, 1] = seg[:, 1] / i0
+        out = ~np.isin(kept_indices(len(data), s, e), list(point_drops.get(i, [])))
         n_drop = 0
         if remove_zeros:
             m = seg[:, 1] > 0
             n_drop = int((~m).sum())
-            seg = seg[m]
+            out &= m
             bc = bc[bc[:, 1] > 0]
-        info = {"n_kept": int(len(seg)), "n_nonpositive": n_drop,
+        n_floor = int((~out).sum()) - n_drop
+        idx = kept_indices(len(data), s, e)
+        rel = (np.asarray(rel_errs[i], float)[idx] if i in rel_errs
+               else np.zeros(len(idx)))[out]
+        seg = seg[out]
+        info = {"n_kept": int(len(seg)), "n_nonpositive": n_drop, "n_floor_dropped": n_floor,
                 "scale": 1.0, "ratios": [], "n_overlap": 0}
         if i == 0:
-            refl, bc_refl = seg, bc
+            refl, bc_refl, rel_all = seg, bc, rel
         else:
             scale, ratios = median_ratio(bc_refl, bc)
             if i in scale_overrides:
@@ -93,6 +106,7 @@ def reduce_sections(scans, trims, backgrounds, energy, i0=None,
             bc[:, 1] *= scale
             refl = np.concatenate((refl, seg))
             bc_refl = np.concatenate((bc_refl, bc))
+            rel_all = np.concatenate((rel_all, rel))
         info["theta"] = seg[:, 0].copy()
         info["y"] = seg[:, 1].copy()
         per.append(info)
@@ -100,7 +114,8 @@ def reduce_sections(scans, trims, backgrounds, energy, i0=None,
         refl[:, 1] = refl[:, 1] / np.max(refl[:, 1])
     q = to_q(refl[:, 0], energy)
     out = np.zeros((len(q), 3))
-    out[:, 0], out[:, 1], out[:, 2] = q, refl[:, 1], refl[:, 1] * error_frac
+    out[:, 0], out[:, 1] = q, refl[:, 1]
+    out[:, 2] = refl[:, 1] * np.sqrt(error_frac ** 2 + rel_all ** 2)
     out = out[out[:, 0].argsort()]
     return {"q_data": out, "theta_data": refl, "sections": per}
 

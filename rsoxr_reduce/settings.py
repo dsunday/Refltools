@@ -47,6 +47,9 @@ DEFAULTS = {
         "scale_rel_target": 0.02,     # stop overlap once the scale is known to 2 %
         "min_overlap": 4,             # points
         "snr_min": 5.0,               # PD usable while smoothed (PD-bg) >= snr_min*σ
+        "floor_outlier_ratio": 0.33,  # PD kept past its SNR floor for the overlap: dropouts
+                                      # (PD-bg) < this × 5-pt running median are not written
+                                      # (nor PD points the next section covers); see trim.py
         "ct_min_counts": 10.0,        # CEM usable while smoothed counts >= this
         "ct_max_rate": 1.0e5,         # cps; CEM non-linear above (Nov 2025 data)
         "ct_end_min": 1,              # always drop the final point (legacy convention)
@@ -77,6 +80,8 @@ DEFAULTS = {
     "output": {
         "dir": "ReducedAuto",
         "error_frac": 0.01,           # flat 1 % error, as the widget wrote
+        "error_model": "flat",        # "flat" | "counting": add PD σ/(PD-bg) or CEM
+                                      # 1/√counts (smoothed signal) in quadrature
         "name": "{sample}_{energy:.1f}eV.dat",
     },
 }
