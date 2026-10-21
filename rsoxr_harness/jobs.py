@@ -14,15 +14,15 @@ GPU choice (CUDA_VISIBLE_DEVICES) applies cleanly and the caller is free.
 """
 
 import contextlib
-import fcntl
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime
+
+from . import _portable
 
 TERMINAL = ("done", "failed", "cancelled", "crashed")
 
@@ -39,12 +39,8 @@ def _now():
 def h5_lock(h5_path, shared=False):
     lock_path = h5_path + ".lock"
     os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
-    with open(lock_path, "a") as fh:
-        fcntl.flock(fh, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with open(lock_path, "a") as fh, _portable.file_lock(fh, shared=shared):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -76,13 +72,9 @@ def update_job(project, job_id, **kw):
 
 
 def _alive(pid):
-    if not pid:
+    if not pid or not _portable.pid_alive(pid):
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+    if _portable.WINDOWS:
         return True
     # a zombie child of this process still "exists"; reap if possible
     try:
@@ -163,7 +155,7 @@ def launch(project, job, detach=True, echo=True):
            "--project", project.path, "--job", job["id"]]
     log = open(job["log"], "a")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
-                            cwd=refltools, env=env, start_new_session=True)
+                            cwd=refltools, env=env, **_portable.detached_popen_kwargs())
     log.close()
     update_job(project, job["id"], pid=proc.pid)
     if detach:
@@ -190,10 +182,7 @@ def cancel(project, job_id):
     if job["status"] not in ("queued", "running"):
         return job
     if job.get("pid") and _alive(job["pid"]):
-        try:
-            os.killpg(job["pid"], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        _portable.terminate_tree(job["pid"])
     return update_job(project, job_id, status="cancelled", finished=_now())
 
 

@@ -194,18 +194,14 @@ _REGISTRY = os.path.expanduser("~/.cache/rsoxr_harness/cpu_reservations.json")
 
 
 def _alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError):
-        return False
+    from ._portable import pid_alive
+    return pid_alive(pid)
 
 
 def _with_registry(fn):
-    import fcntl
+    from ._portable import file_lock
     os.makedirs(os.path.dirname(_REGISTRY), exist_ok=True)
-    with open(_REGISTRY + ".lock", "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
+    with open(_REGISTRY + ".lock", "w") as lk, file_lock(lk):
         try:
             with open(_REGISTRY) as fh:
                 reg = json.load(fh)

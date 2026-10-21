@@ -1,0 +1,60 @@
+# Native-Windows (CPU-only) variant of environment.yml. See INSTALL.md, "Windows".
+# Needs Visual Studio Build Tools (C++ workload) installed to compile refnx.
+#   mamba env create -f environment-windows.yml
+#   mamba activate refltools
+#   pip install --no-deps --no-build-isolation "git+https://github.com/dsunday/refnx.git@JAX"
+# refnx is installed separately because it must come from the JAX fork (it provides
+# refnx.reflect._jax_reflect), built against this env's numpy, without its GUI deps.
+name: refltools
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - git
+  # build tools for refnx (meson + Cython extension)
+  - c-compiler
+  - cxx-compiler
+  - meson
+  - meson-python
+  - cython
+  - ninja
+  # numerics
+  - numpy=2.4.*
+  - scipy>=1.14
+  - numba
+  - pandas>=2.2
+  - xarray
+  - h5py>=3.10
+  - scikit-learn
+  # plotting / notebooks
+  - matplotlib>=3.9
+  - plotly>=5
+  - corner
+  - arviz
+  - ipywidgets
+  - ipykernel
+  - jupyterlab
+  # refnx runtime deps
+  - orsopy
+  - periodictable
+  - attrs
+  - pyparsing
+  - xlrd
+  - uncertainties
+  - tqdm
+  - pyyaml
+  - pillow
+  - pip:
+      # JAX stack: exact versions (APIs changed in jax 0.10 / evosax 0.2).
+      # no CUDA jax wheels exist for native Windows; use WSL2 + environment.yml for GPU
+      - jax==0.10.0
+      - blackjax==1.5
+      - jaxns==2.6.9
+      - evosax==0.2.0
+      - optax==0.2.8
+      - flax==0.12.7
+      - kkcalc==0.8.4
+variables:
+  # Windows Python defaults to cp1252 for open(); the harness writes σ, χ², ° etc.
+  PYTHONUTF8: "1"

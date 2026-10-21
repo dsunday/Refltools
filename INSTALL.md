@@ -11,6 +11,7 @@ upstream `pip install refnx` / `conda install refnx` packages **will not work**.
 - For GPU use: Linux with an NVIDIA GPU and driver ≥ 525 (`nvidia-smi`). You do
   **not** need a system CUDA toolkit; the JAX wheels ship their own CUDA 12 libraries.
 - CPU-only machines (including macOS) work too, just slower for CMA-ES, NUTS and JAXNS.
+- Windows: see [section 7](#7-windows).
 
 ## 2. Get Refltools and create the environment
 
@@ -89,11 +90,46 @@ see only `CpuDevice`, check Troubleshooting below.
   `rsoxr-fit` and `rsoxr-reduce` skills in `.claude/skills/` then load
   automatically and drive the harnesses from plain-text requests.
 
-## 7. Troubleshooting
+## 7. Windows
+
+There are two routes:
+
+**WSL2 (recommended, and the only way to use a GPU on Windows).** Install WSL2 with
+Ubuntu (`wsl --install` in an admin PowerShell) and the normal NVIDIA Windows
+driver. Then follow sections 2–6 *inside Ubuntu* exactly as written, using
+`environment.yml`. Keep data inside the WSL filesystem (e.g. `~/data`); access
+to `/mnt/c/...` is much slower.
+
+**Native Windows (CPU only).** Use the Miniforge Prompt (or PowerShell after
+`conda init`), and:
+
+1. Install [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
+   with the **"Desktop development with C++"** workload. This is needed to compile refnx.
+2. Create the env from the Windows file:
+   ```bat
+   git clone https://github.com/dsunday/Refltools.git
+   cd Refltools
+   mamba env create -f environment-windows.yml
+   mamba activate refltools
+   ```
+   This uses CPU-only `jax` and sets `PYTHONUTF8=1`, so files with σ, χ², ° are
+   read and written as UTF-8.
+3. Install the refnx fork and verify exactly as in sections 3 and 5.
+
+Differences from Linux:
+- Cancelling a job (`python -m rsoxr_harness cancel ...`) force-kills the worker
+  and its child processes. The job is marked `cancelled`, but the worker gets no
+  chance to tidy up, so a partly written output may be left behind.
+- Job and stoichiometry locks are exclusive on Windows (readers wait for each
+  other). This is slower in theory, but not noticeable in practice.
+
+## 8. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
 | refnx build fails (compiler / meson errors) | Env not active, or created without the build tools. Re-create it from `environment.yml`. |
 | `ModuleNotFoundError: refnx.reflect._jax_reflect` | Upstream refnx is installed. Run `pip uninstall refnx`, then repeat step 3. |
 | `jax.devices()` shows only CPU on a GPU machine | Driver too old (`nvidia-smi`), the CPU-only jax line was used, or a system CUDA on `LD_LIBRARY_PATH` is shadowing the wheels (`unset LD_LIBRARY_PATH`). |
+| Windows: refnx build can't find `cl.exe` / MSVC | Visual Studio 2022 Build Tools with the C++ workload aren't installed. Install them, open a new prompt, re-activate the env, and repeat step 3. |
+| Windows: `UnicodeEncodeError` / `UnicodeDecodeError` | Env created from `environment.yml` instead of `environment-windows.yml`. Run `conda env config vars set PYTHONUTF8=1`, then re-activate. |
 | CUDA out-of-memory with several jobs | Set `CUDA_VISIBLE_DEVICES` per job, and keep `XLA_PYTHON_CLIENT_PREALLOCATE=false`. |
