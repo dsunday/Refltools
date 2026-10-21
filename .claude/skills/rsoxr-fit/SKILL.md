@@ -34,7 +34,8 @@ For quick non-GPU work prefix `JAX_PLATFORMS=cpu`. Pipe noisy output through
 
 One project directory per sample campaign, source of truth for everything:
 `project.json` (data folder, materials, models + lineage), `fits.h5` (h5io
-layout), `figures/`, `logs/`, `jobs/`, `uncertainty/`, `sld_exports/`.
+layout), `figures/`, `logs/` (incl. `chat_log.md`), `jobs/`, `scripts/` (every
+script run, numbered — see Protocol 7–8), `uncertainty/`, `sld_exports/`.
 Default location: next to the user's notebooks, e.g.
 `/homes/dfs1/Reflectivity/Brewer/Nov2025/Brewer10_Fit_NB/Harness_Brewer10`.
 Establish the active project once per session (ask if ambiguous) and reuse it.
@@ -152,6 +153,23 @@ only the starting table is shared otherwise — say so.
    Describe what it shows in 2–4 lines.
 5. **Failures:** `status --job ID --tail 40`; job records keep the traceback.
 6. Don't kill processes you didn't start; `pkill -f` patterns can match your own shell — kill by PID.
+7. **Save the scripts (user rule, 2026-10-21).** Every Python script that builds
+   a model or runs/analyses a fit (heredoc `$PY - <<EOF` blocks included) is
+   written to `<project>/scripts/NN_<short_name>.py` (NN = running number, in the
+   order run) and executed from that file, not only inline. Each script is
+   self-contained and reproducible: absolute project path, the exact model
+   build / `derive` / mask / analysis calls, and a header comment with the date
+   and purpose. Pure CLI calls (`run fit …`, `plot …`) are recorded as a one-line
+   command in `scripts/commands.sh` (appended, with date). Fix a failing script
+   in place rather than leaving the broken version; scratch exploration that
+   changes nothing may stay inline.
+8. **Keep a chat log (user rule, 2026-10-21).** Maintain
+   `<project>/logs/chat_log.md`, appended after each assistant turn that did
+   work: date/time, the user's request (verbatim or close), what was done
+   (scripts/commands by file name), key numbers (χ², fitted values, bounds hit),
+   figures made (paths), assumptions stated, and open questions/next step. Plain
+   text of the conversation, not tool output dumps. Create it at `init`; if a
+   project is started mid-conversation, backfill it from the conversation so far.
 
 ## General fitting workflow
 
