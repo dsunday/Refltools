@@ -83,6 +83,15 @@ def pid_alive(pid):
     return True
 
 
+def safe_stdio():
+    """Never crash printing χ/σ/Å to a cp1252 console or pipe (Windows): characters
+    the stream's encoding lacks are written as escapes instead."""
+    import sys
+    for s in (sys.stdout, sys.stderr):
+        if hasattr(s, "reconfigure"):
+            s.reconfigure(errors="backslashreplace")
+
+
 def detached_popen_kwargs():
     """Popen kwargs so a job survives Ctrl+C / closing the launching terminal."""
     if WINDOWS:

@@ -715,6 +715,8 @@ def cmd_worker(a):
 
 
 def main(argv=None):
+    from ._portable import safe_stdio
+    safe_stdio()
     ap = argparse.ArgumentParser(prog="rsoxr_harness")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

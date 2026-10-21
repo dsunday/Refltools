@@ -141,6 +141,10 @@ def launch(project, job, detach=True, echo=True):
     env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     env["JAX_ENABLE_X64"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
+    # logs are UTF-8 (χ, σ, Å...); Windows would otherwise encode a redirected
+    # stdout with the locale codepage (cp1252) and crash on the first χ
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     env["MPLBACKEND"] = "Agg"
     if job["gpu"] == "cpu":
         env["JAX_PLATFORMS"] = "cpu"
@@ -153,7 +157,7 @@ def launch(project, job, detach=True, echo=True):
 
     cmd = [sys.executable, "-m", "rsoxr_harness", "_worker",
            "--project", project.path, "--job", job["id"]]
-    log = open(job["log"], "a")
+    log = open(job["log"], "a", encoding="utf-8")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                             cwd=refltools, env=env, **_portable.detached_popen_kwargs())
     log.close()
@@ -162,7 +166,7 @@ def launch(project, job, detach=True, echo=True):
         return proc
 
     # foreground: follow the log until the process ends
-    with open(job["log"]) as fh:
+    with open(job["log"], encoding="utf-8", errors="replace") as fh:
         while True:
             chunk = fh.read()
             if chunk and echo:

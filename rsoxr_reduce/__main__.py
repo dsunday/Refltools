@@ -250,6 +250,10 @@ def cmd_calibrate(a):
 
 
 def main(argv=None):
+    # never crash printing Å/χ to a cp1252 console or pipe (Windows)
+    for s in (sys.stdout, sys.stderr):
+        if hasattr(s, "reconfigure"):
+            s.reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser(prog="python -m rsoxr_reduce",
                                  description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
