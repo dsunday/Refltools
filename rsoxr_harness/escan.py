@@ -115,6 +115,7 @@ class EscanSpec:
     knot_step_outside: float | None = None              # bspline: outside the scans (default outer_step)
     knot_dense: list = field(default_factory=list)    # bspline: [[lo, hi, step], ...] finer knots
     nexafs: list = field(default_factory=list)        # nexafs: [{"layer", "fit" | "model", "shift"}]
+    fix_offset: bool = False                            # True → KK sld constant offset pinned at 0 (fit the density instead)
 
     def __post_init__(self):
         if not self.scans:
@@ -185,6 +186,7 @@ class EscanSpec:
                  + ("".join(f"; {n['layer']} ← {'fit' if 'fit' in n else 'model'} "
                             f"{n.get('fit') or n.get('model')}" + (f" shift {n['shift']:+g} eV" if n["shift"] else "")
                             for n in self.nexafs) if self.isld_basis == "nexafs" else ""),
+                 ("  KK sld offset: pinned at 0 (density sets the real-part level)" if self.fix_offset else "  KK sld offset: free"),
                  f"  priors: curvature σ {self.sigma_curv} per {H0} eV "
                  f"(outside the scans {self.sigma_curv_outside or self.sigma_curv / 10:g})"
                  + "".join(f"; σ {c['sigma']} over {c['lo']:g}–{c['hi']:g} eV" for c in self.curv_regions)
@@ -781,7 +783,7 @@ class Problem:
             else:
                 x = x0.at[1:-1].set(v)
                 cv = x
-            s = jnp.asarray(k["s0"]) + self.Mj[name] @ (x - x0) + p[self.idx[("c", name)]]
+            s = jnp.asarray(k["s0"]) + self.Mj[name] @ (x - x0) + (0.0 if self.spec.fix_offset else p[self.idx[("c", name)]])
             i = jnp.asarray(k["i0"]) + self.Nj[name] @ (x - x0)
             out[name] = (s, i, x, cv)
         return out
@@ -930,6 +932,8 @@ class Problem:
             inside = (E >= max(Eo[0], E[self.data_idx[0]])) & (E <= min(Eo[-1], E[self.data_idx[-1]]))
             c = float(np.mean(np.interp(E[inside], Eo, so) - sl[inside])) if inside.any() else 0.0
             p[sc], lb[sc], ub[sc] = c, -10.0, 10.0
+            if self.spec.fix_offset:
+                p[sc], lb[sc], ub[sc] = 0.0, -1e-6, 1e-6
         prevp = prev.get("params") if prev is not None else None
         for j, f in enumerate(self.spec.scan_scales or []):
             if f:
@@ -999,9 +1003,11 @@ def _chunked_jacfwd(f, n, chunk=None):
     return jac
 
 
-def run(project, name, start="last", max_nfev=None, workers=8, log=print):
+def run(project, name, start="last", max_nfev=None, workers=8, log=print, simulate=False):
     """Fit one escan spec; writes escan/<name>/ and returns a summary dict.
-    start: 'last' (previous result if any, else seed model) | 'model' | path to result.npz"""
+    start: 'last' (previous result if any, else seed model) | 'model' | path to result.npz
+    simulate: no optimisation — evaluate the start vector (forward model only) and write the same outputs,
+    so the start optical constants/geometry can be compared with the data as they are."""
     import jax
     import jax.numpy as jnp
     from scipy.optimize import least_squares
@@ -1023,16 +1029,32 @@ def run(project, name, start="last", max_nfev=None, workers=8, log=print):
     log(f"[escan] {name}: {pr.NP} parameters, {n_data} data points, KK grid {pr.E.size} nodes "
         f"({pr.E[0]:g}–{pr.E[-1]:g} eV); start cost {0.5 * np.sum(r0 ** 2):.1f} "
         f"(start: {'previous result' if prev is not None else 'seed model'})")
-    r = least_squares(lambda x: np.asarray(res_j(jnp.asarray(x))), p0,
-                      jac=lambda x: np.asarray(jac_j(jnp.asarray(x))), bounds=(lb, ub),
-                      method="trf", x_scale="jac", max_nfev=max_nfev or spec.max_nfev)
+    if simulate:
+        from types import SimpleNamespace
+        r = SimpleNamespace(x=p0, cost=0.5 * float(np.sum(r0 ** 2)), nfev=0, status=0)
+        log(f"[escan] {name}: SIMULATE (no optimisation)")
+    else:
+        # pinned parameters (KK offset with spec.fix_offset) are removed from the optimised vector;
+        # a zero Jacobian column with ~zero-width bounds stalls trf
+        pinned = [pr.idx[("c", n)] for n in pr.kk_layers] if spec.fix_offset else []
+        fr = np.array([i for i in range(pr.NP) if i not in pinned], dtype=int)
+        base = np.array(p0, float)
+
+        def _full(x):
+            v = base.copy()
+            v[fr] = x
+            return v
+        r = least_squares(lambda x: np.asarray(res_j(jnp.asarray(_full(x)))), p0[fr],
+                          jac=lambda x: np.asarray(jac_j(jnp.asarray(_full(x))))[:, fr], bounds=(lb[fr], ub[fr]),
+                          method="trf", x_scale="jac", max_nfev=max_nfev or spec.max_nfev)
+        r.x = _full(r.x)
     p = r.x
     Ra, Re, P = pr.forward(jnp.asarray(p))
     Re = [np.asarray(x) for x in Re]
     lre = [np.log(R) - np.asarray(l) for R, l in zip(Re, pr.lnRe)]
     cost_e = [float(0.5 * np.sum((w * l / spec.sigma_data) ** 2)) for w, l in zip(pr.w_scan, lre)]
     summ = {"name": name, "model": spec.model, "cost": float(r.cost), "nfev": int(r.nfev),
-            "status": int(r.status), "converged": bool(r.status > 0), "cost_escan": cost_e,
+            "status": int(r.status), "converged": bool(r.status > 0), "simulated": bool(simulate), "cost_escan": cost_e,
             "escan_pts_gt5pct": [int((np.abs(l) > np.log(1.05)).sum()) for l in lre],
             "escan_theta": pr.theta, "params": pr.param_dict(p), "dq": pr.dq,
             "kk_grid": [float(pr.E[0]), float(pr.E[-1]), int(pr.E.size)],
@@ -1105,6 +1127,70 @@ def run(project, name, start="last", max_nfev=None, workers=8, log=print):
         f"energy scans {', '.join(f'{c:.1f}' for c in cost_e)}"
         + (f"; angle scans {summ['cost_angle']:.1f}; scale {summ['params']['scale']:.3f}" if pr.angle else ""))
     return summ
+
+
+def fit_density(project, name, lo, hi, layer=None, xatol=0.01, workers=8, log=print):
+    """Fit the KK-layer density (outer 1-D search) with the full escan fit at each density.
+
+    The density only enters through the formula tails and the KK response matrix (kkcalc), which
+    is not differentiable, so it is scanned outside the JAX fit: scipy bounded Brent on the final
+    cost over [lo, hi] g/cm³, each point a complete `run` from the model start.  Use with
+    spec.fix_offset = True so the density, not a constant sld offset, sets the real-part level.
+    Evaluations are written to escan/<name>/density_scan.csv; the spec `name` is left at the best
+    density and re-run there.  σ(ρ) is a rough parabola (Δcost = ½ · cost/dof per Birge scaling).
+    → dict(density, cost, sigma, table)."""
+    import copy
+    import csv
+    from scipy.optimize import minimize_scalar
+    base = project.get_escan(name)
+    layer = layer or base.kk[0]["layer"]
+    d = escan_dir(project, name)
+    os.makedirs(d, exist_ok=True)
+    seen = {}
+
+    def one(rho):
+        key = round(float(rho), 4)
+        if key in seen:
+            return seen[key]["cost"]
+        sp = copy.deepcopy(base)
+        sp.name = f"{name}__rho{key:g}"
+        for k in sp.kk:
+            if k["layer"] == layer:
+                k["density"] = key
+        project.add_escan(sp, overwrite=True)
+        s = run(project, sp.name, start="model", workers=workers, log=lambda m: None)
+        seen[key] = dict(density=key, cost=s["cost"], offset=s["params"].get("offset:" + layer, 0.0),
+                         converged=s["converged"], nfev=s["nfev"], name=sp.name)
+        log(f"[escan density] {name}: ρ={key:.4f}  cost {s['cost']:.1f}  ({'converged' if s['converged'] else 'max_nfev'})")
+        return s["cost"]
+
+    res = minimize_scalar(one, bounds=(lo, hi), method="bounded", options={"xatol": xatol})
+    best = round(float(res.x), 4)
+    tab = sorted(seen.values(), key=lambda r: r["density"])
+    with open(os.path.join(d, "density_scan.csv"), "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=["density", "cost", "offset", "converged", "nfev", "name"], extrasaction="ignore")
+        w.writeheader()
+        w.writerows(tab)
+    # final run of the base spec at the best density
+    final = copy.deepcopy(base)
+    for k in final.kk:
+        if k["layer"] == layer:
+            k["density"] = best
+    project.add_escan(final, overwrite=True)
+    s = run(project, name, start="model", workers=workers, log=lambda m: None)
+    sigma = None
+    pts = [(r["density"], r["cost"]) for r in tab]
+    if len(pts) >= 3:
+        x = np.array([p[0] for p in pts]); y = np.array([p[1] for p in pts])
+        near = np.argsort(abs(x - best))[:5]
+        c2, c1, c0 = np.polyfit(x[near], y[near], 2)
+        n_pts = sum(len(read_scan(p_)[0]) for p_ in final.scans)
+        chi2_nu = (2 * s["cost"]) / max(n_pts - 1, 1)
+        if c2 > 0:
+            sigma = float(np.sqrt(0.5 * max(chi2_nu, 1.0) / c2))
+    log(f"[escan density] {name}: best ρ = {best:.4f} g/cm³ (cost {s['cost']:.1f}"
+        + (f", σ≈{sigma:.3f} rough" if sigma else "") + f"); {len(tab)} densities tried")
+    return dict(density=best, cost=s["cost"], sigma=sigma, table=tab)
 
 
 def _pad(arrs):

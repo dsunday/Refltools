@@ -448,7 +448,7 @@ def _run_escan(project, job):
     try:
         for name in job["models"]:
             print("\n[harness] " + project.get_escan(name).describe(), flush=True)
-            summ = X.run(project, name, start=prm.get("start", "last"), max_nfev=prm.get("max_nfev"),
+            summ = X.run(project, name, start=prm.get("start", "last"), max_nfev=prm.get("max_nfev"), simulate=bool(prm.get("simulate")),
                          workers=n_workers, log=lambda s: print(s, flush=True))
             figs = X.plot(project, name)
             outputs[name] = {"cost": summ["cost"], "converged": summ["converged"],

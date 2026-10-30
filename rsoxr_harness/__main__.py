@@ -435,6 +435,10 @@ def cmd_multiedge(a):
     return 0
 
 
+def gpu_arg(a):
+    return "cpu" if a.cpu else a.gpu
+
+
 def cmd_escan(a):
     from . import jobs as J
     from . import stoich as S
@@ -480,7 +484,7 @@ def cmd_escan(a):
                 if len(parts) > 2:
                     ent["shift"] = float(parts[2])
                 nexafs.append(ent)
-        kw = dict(name=a.name[0], model=a.model, scans=a.scans, kk=kk, seed_model=a.seed_model,
+        kw = dict(name=a.name[0], model=a.model, scans=a.scans, kk=kk, seed_model=a.seed_model, fix_offset=a.no_offset,
                   isld_basis=a.isld_basis, knot_step=a.knot_step, knot_step_outside=a.knot_step_outside,
                   knot_dense=dense, nexafs=nexafs,
                   window=a.window, outer_step=a.outer_step, sigma_curv=a.sigma_curv,
@@ -517,13 +521,24 @@ def cmd_escan(a):
     # run
     for n in a.name:
         p.get_escan(n)
+    if a.fit_density:
+        if gpu_arg(a) is None:
+            print("error: pass --gpu N or --cpu", file=sys.stderr)
+            return 2
+        os.environ["CUDA_VISIBLE_DEVICES"] = "" if a.cpu else str(a.gpu)
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        from . import escan as X
+        for n in a.name:
+            r = X.fit_density(p, n, a.fit_density[0], a.fit_density[1], workers=S.resolve_workers(a.workers or 8, S.cpus_in_use()))
+            print(f"{n}: ρ = {r['density']:.4f}" + (f" ± {r['sigma']:.3f}" if r["sigma"] else "") + f", cost {r['cost']:.1f}")
+        return 0
     gpu = "cpu" if a.cpu else a.gpu
     if gpu is None:
         print("error: pass --gpu N or --cpu", file=sys.stderr)
         return 2
     in_use = S.cpus_in_use()
     workers = S.resolve_workers(a.workers or 8, in_use)
-    params = {"n_workers": workers, "start": a.start, "max_nfev": a.max_nfev}
+    params = {"n_workers": workers, "start": a.start, "max_nfev": a.max_nfev, "simulate": a.simulate}
     job = J.new_job(p, "escan", list(a.name), [], params, gpu)
     print(f"job {job['id']}: escan {' '.join(a.name)} on gpu={gpu} (start: {a.start}, "
           f"{workers} CPU workers for KK responses)")
@@ -915,6 +930,8 @@ def main(argv=None):
     s.add_argument("--anchor", nargs="+", metavar="LAYER:LO:HI:FORMULA:DENSITY:SIGMA",
                    help="add: pull a KK layer's isld over LO–HI eV towards a formula's bare-atom isld")
     s.add_argument("--escan-only", action="store_true", help="add: energy scans only, geometry fixed")
+    s.add_argument("--no-offset", action="store_true", help="add: pin the KK sld constant offset at 0 (fit --fit-density instead)")
+    s.add_argument("--fit-density", nargs=2, type=float, metavar=("LO", "HI"), help="run: fit the KK-layer density over LO–HI g/cm³ (outer search, offset should be pinned)")
     s.add_argument("--min-theta", type=float, default=0.0, help="add: leave out angle-scan points below θ (deg)")
     s.add_argument("--high-theta", type=float, help="add: re-weight angle-scan points above θ (deg)")
     s.add_argument("--high-sigma", default="auto", help="add: σ above --high-theta: auto | number")
@@ -930,6 +947,7 @@ def main(argv=None):
     s.add_argument("--description")
     s.add_argument("--overwrite", action="store_true")
     s.add_argument("--start", default="last", help="run: last | model | path/to/result.npz")
+    s.add_argument("--simulate", action="store_true", help="run: no fit — evaluate the start model against the scans")
     s.add_argument("--gpu")
     s.add_argument("--cpu", action="store_true")
     s.add_argument("--workers", type=int)

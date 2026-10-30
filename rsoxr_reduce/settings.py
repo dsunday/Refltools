@@ -82,7 +82,7 @@ DEFAULTS = {
         "error_frac": 0.01,           # flat 1 % error, as the widget wrote
         "error_model": "flat",        # "flat" | "counting": add PD σ/(PD-bg) or CEM
                                       # 1/√counts (smoothed signal) in quadrature
-        "name": "{sample}_{energy:.1f}eV.dat",
+        "name": "{sample}_{energy:.2f}eV.dat",
     },
 }
 
