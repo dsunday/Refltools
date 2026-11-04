@@ -529,7 +529,7 @@ def cmd_escan(a):
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
         from . import escan as X
         for n in a.name:
-            r = X.fit_density(p, n, a.fit_density[0], a.fit_density[1], workers=S.resolve_workers(a.workers or 8, S.cpus_in_use()))
+            r = X.fit_density(p, n, a.fit_density[0], a.fit_density[1], xatol=a.density_tol, workers=S.resolve_workers(a.workers or 8, S.cpus_in_use()))
             print(f"{n}: ρ = {r['density']:.4f}" + (f" ± {r['sigma']:.3f}" if r["sigma"] else "") + f", cost {r['cost']:.1f}")
         return 0
     gpu = "cpu" if a.cpu else a.gpu
@@ -931,6 +931,7 @@ def main(argv=None):
                    help="add: pull a KK layer's isld over LO–HI eV towards a formula's bare-atom isld")
     s.add_argument("--escan-only", action="store_true", help="add: energy scans only, geometry fixed")
     s.add_argument("--no-offset", action="store_true", help="add: pin the KK sld constant offset at 0 (fit --fit-density instead)")
+    s.add_argument("--density-tol", type=float, default=0.01, help="run --fit-density: density tolerance of the 1-D search (g/cm3)")
     s.add_argument("--fit-density", nargs=2, type=float, metavar=("LO", "HI"), help="run: fit the KK-layer density over LO–HI g/cm³ (outer search, offset should be pinned)")
     s.add_argument("--min-theta", type=float, default=0.0, help="add: leave out angle-scan points below θ (deg)")
     s.add_argument("--high-theta", type=float, help="add: re-weight angle-scan points above θ (deg)")

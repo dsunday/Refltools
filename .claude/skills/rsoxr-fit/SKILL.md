@@ -72,6 +72,7 @@ Any older notebook h5 can be read by plot/fits/nuts/jaxns commands via
 | "save/export Model3's SOG SLD (to seed the next sample)" | `export-sld -p P --model Model3 --layer SOG [--register-as SOG_B9M3]` |
 | "check KK consistency" / "KK check of Model2's PS" / "are Re and Im Kramers–Kronig consistent" | `kk -p P --source Model2:PS --formula C8H8 [--density 1.05 \| --density-range lo hi] [--merge lo hi] [--mask lo hi ...] [--name N] [--tol T]` → KK-transforms the fitted Im (formula tails, density fitted unless given), compares with the fitted Re per energy; prints rms ΔRe, rms/(Re span) with a rough verdict (<0.10 consistent, <0.25 roughly), flagged energies (|ΔRe| > tol, default max(1, 10 % of span)) and writes a 3-panel plot. Results in `<project>/kk/<name>/` (kk_table.csv, kk_sld.csv, summary.json). `kk list`, `kk show --name N`; compare models: `plot kk --names N1 N2`. Report the density (and whether it hit the range edge), the verdict and where the mismatch sits. Source can also be a material or CSV (e.g. a NEXAFS-derived table). |
 | "fit the energy scans" / "co-refine the angle and energy scans" | `escan add NAME --model M [--seed-model S] --scans … --kk LAYER:FORMULA:RHO …` (see "Energy scans"), show the `describe()` output, confirm, then `escan run NAME --gpu N --detach`; report cost (angle / each scan), scale, geometry at bounds, and Read the four `escan_NAME_*.png`. |
+| "fit the energy scans from the NEXAFS" / "NEXAFS-based optical constants" / "peak-fit the isld and use it for the escan" / "fit the density of the escan" | Follow "NEXAFS-constrained energy-scan workflow" below (peak fit → isld fit → escan on the NEXAFS isld basis → density/stoichiometry → plots); it is a guide, not a fixed recipe. |
 | "fit the stoichiometry / density of SOG (from Model3's fit / a CSV)" | Register a search: `p.add_stoich(name=, source=, atoms=[...], counts=[...], density_range=(lo, hi), merge_points=, energy_mask=)` — source = material name \| `"Model3:SOG"` (fitted layer SLD) \| CSV path; counts entries int (fixed) \| `[lo, hi]` \| `[lo, hi, step]`. Fragment search: `mode="fragments", fragments=["SiO2", "CH3"], counts=[...]`. State the candidate count (`p.get_stoich(n).n_candidates()`, ~40 s per 1600 at the 56-worker cap), then `stoich run NAME [NAME2] -p P [--workers N] --detach`; `stoich list` / `stoich show NAME`. Fix one count (or use a fixed fragment) — formulas differing by an overall factor have identical cost. Best density is refined within ±`refine_density` (default 0.1). |
 | "proper uncertainty" / "Δχ² intervals" for a stoich run | `stoich chi2 NAME -p P` (needs σ columns 4–5 in the source table, e.g. from `sld_from_jaxns_cache`) → σ-weighted χ² per formula with density profiled, 401-pt χ²(ρ) grid; prints raw-σ and Birge-scaled (Δχ²/(χ²_best/ν)) profile intervals at Δχ²=1 (68%) and 4 (95%); `plot stoich-chi2 --name N`. Several runs (any projects) stacked as rows with shared column limits: `plots.plot_stoich_chi2_rows([(proj, name, label), ...], out=...)`. Prefer Birge-scaled when χ²/ν ≫ 1 or σ are mis-scaled (JAXNS normalize=True tempers σ). Flag interval ends that sit on the count grid edge. Noise model assumes the imaginary SLD fed to KK is exact. |
 | "combined C + O (multi-edge) stoichiometry" | `multiedge add NAME -p <O project> --edge C <C project dir>::Model1:MOX spread:Model3b --edge O Model3bx:MOX spread:Model3bw --atoms Sn O C H --counts 12 8:80:4 0:72:4 0 --tie H:C:2.25 --step 270 282 310 330 470 505 560 --density 1 3.5 --scoring both`, then `multiedge run NAME` (foreground, CPU, shares the 50 % cap — another stoich job holding the cap leaves it 1 worker, ~20× slower), `multiedge show NAME` (best + Birge-scaled ρ / wt% intervals, grid-edge flags), `multiedge list`. Module `rsoxr_harness/multiedge.py`. Sources: `Model:Layer` (this project), `<dir>::Model:Layer` (another project), or a table; σ = `columns` \| `spread:<AltModel>` \| number, always ⊕ `--sigma-rel`·|v| ⊕ `--sigma-abs` (3 %, 0.05); optional per-edge erange (`--edge LABEL SRC SIGMA LO HI`). Scoring `twoedge` = absolute multi-edge KK (measured Im spliced into Henke at the trial ρ, no rescale) on Re + step-edge Im; `stepedge` = bare-atom Im at the step points only — weak: an O step from one post-edge point (560 eV) runs to the grid edge (INT_MOX). Results in `stoich/NAME[_stepedge]/` in the `stoich chi2` format (`plot stoich-chi2 --name`). Always extend counts until the optimum is inside the grid. INT_MOX C+O (2026-10-08): C/Sn and ρ robust, O/Sn 3–5 (chemically high, treat as upper bound). |
@@ -408,6 +409,62 @@ Defaults below; the user overrides freely.
   different spot) — user: acceptable (global per edge, different sensitivities).
 - Angle-only per-energy fits: scale 0.53–1.83 near the C edge; the global link
   (Model2g) costs only +3 % χ² for 152 fewer parameters (BIC prefers it).
+
+## NEXAFS-constrained energy-scan workflow (general guide, 2026-10-30)
+
+A guide, not a fixed recipe: skip or reorder steps when the data say so. First worked on Brewer1/2 carbon (SOC, θ=4° escan);
+status in `Reflectivity/Brewer/Nov2025/TODO.md` section G. Code: `Refltools/nexafs_models.py` (seed peak models),
+`nexafs_batch.py` (batch peak fits), `nexafs_cofit.py` (joint fits), `nexafs_escan_plots.py` (final plot); NEXAFS-fit skill
+`nexafs-fit` (draft). Outputs go under the sample's `NEXAFS_Fits/`.
+
+1. **Peak-fit the NEXAFS spectrum if there is one** (LARIAT surface spectrum, `*_processed.csv`: pre-edge 0, post-edge ≈ 1.4).
+   Notebook-engine fit (`nexafs_batch.fit_one`) or harness `nexafs fit`. Seeds from the notebook models are sample-specific:
+   free the π* peak and the edge height/decay, widen bounds (energy ±0.5–1 eV, width ×0.5–1.6+) and check at-bound
+   parameters. Several samples of one material: `nexafs_cofit` (shared peak energies/widths, per-sample heights/edge;
+   covariance-propagated areas and ratios). SOG baseline: wide bounds, no 291.5 eV peak.
+   **Consistency check (similar samples):** peak energies and widths of the *weighted* peaks (area ≥ 3 % of the largest) should
+   agree across samples of the same chemistry — flag energy spread > 0.3 eV or width spread > 30 %
+   (`python nexafs_cofit.py consistency` → `NEXAFS_Fits/peak_consistency.csv`). Judge only parameters that were free and not at a
+   bound in every sample (a fixed/pinned parameter agrees by construction), and note a shared co-fit imposes agreement, so
+   test with *independent wide-bounds fits* first and compare their RSS with the co-fit before accepting shared shapes. Weak
+   peaks (e.g. 291.5 eV) wander freely and are not judged.
+2. **Use that model to fit the isld from the reflectivity fits** (the layer's isld vs energy from the per-energy fits, e.g. an
+   `SLD_Fits` CSV or `Model:Layer`). Freeze the peak energies/widths from the NEXAFS fit (the isld grid is sparse) and fit
+   heights + edge; scan an **energy shift** between the RSoXR and NEXAFS axes (C edge: −1.25 eV, E_nexafs = E_rsoxr + shift;
+   same for all SOC/SOG references — confirm per edge). Register the result as a harness peak model in *absolute isld
+   units* (`nexafs.make_model`, baseline = pre-edge isld) and run `nexafs fit -p P --model M --source <csv> --signal isld
+   --shift S --weights none`. Free edge decay can go to 0 when 300–310 eV has no data: anchor the tail case by case
+   (`fit_isld(tail_decay=…)`), never automatically. `nexafs export --formula F --density ρ` is a quick amplitude check: the
+   kkcalc Im rescale (≈1 ⇒ the isld amplitude is consistent with that formula/density; Brewer1 ×0.90, Brewer2 ×0.97).
+3. **Fit the escan on the NEXAFS isld basis.** First *simulate* (no fitting) to see what the NEXAFS optics predict:
+   ```bash
+   $PY -m rsoxr_harness escan add NAME -p P --model M --seed-model M --scans <escan.dat> --kk LAYER:FORMULA:RHO \
+       --escan-only --isld-basis nexafs --nexafs-fit LAYER:FITNAME        # or --nexafs-model LAYER:MODEL:SHIFT
+   $PY -m rsoxr_harness escan run NAME -p P --gpu N --simulate             # forward model only, start cost
+   ```
+   Then fit with a *wide-bounds* peak model (energies, widths, heights, edge, baseline, slope free; ~30 params); geometry
+   fixed to the model's fitted values (`--escan-only`) unless co-refining. Never leave the KK offset free (step 4).
+4. **Refine with density (given a stoichiometry) and then stoichiometry.**
+   - `escan add … --no-offset` pins the KK sld offset at 0 so the density, not a free constant, sets the real-part level;
+     `escan run NAME -p P --gpu N --fit-density LO HI` runs the outer 1-D density search (a full fit per density; writes
+     `escan/NAME/density_scan.csv`, rough σ(ρ), re-runs the spec at the best density). Each point starts from the model, so
+     the cost curve can be jagged (local minima: Brewer2's first search gave 1.325/cost 633, the true minimum was 1.301/cost 517) —
+     start each density from the *refined* peak model (not the original wide start) and use `--density-tol 0.002` over a narrow range.
+   - Check the refined peaks before accepting: remove peaks that sit within ~0.1 eV of a neighbour (a refit without p3 cost only +2 to +8
+     in cost and 3 fewer parameters), and floor FWHM at the escan point spacing (~0.3 eV) — a 0.14 eV peak is fitting single points.
+   - The reported σ(ρ) is statistical with the formula, geometry, shift and peak set fixed; **density and stoichiometry are
+     correlated** (tails ∝ ρ·Σf), so fit them together only after the density is stable: use the escan's
+     `escan/NAME/paths_<layer>.csv` (E, sld, isld) as the source of `add_stoich` / `stoich run` (or the full-covariance
+     scripts, see "Energy scans" step 5). Not yet wired into `--fit-density`.
+   - An earlier trap: a pinned parameter with zero-width bounds stalls trf (all fits hit max_nfev); the harness now removes
+     the pinned offset from the optimised vector.
+5. **Plot.** `plot escan --name NAME` (R(E) vs data + ratio; optics; window) — **re-run it after `--fit-density`**, which
+   re-fits the final point but does not redraw. `python nexafs_escan_plots.py` draws isld/sld from the escan with every
+   NEXAFS peak shaded, the edge, a NEXAFS-axis top ruler and the per-energy NUTS medians with 95 % intervals (raw and Birge-
+   scaled by √(χ²/ν) — the raw NUTS widths are far too tight when χ²/N ≫ 1; red crosses = R̂ > 1.05, rerun those energies).
+
+Then (separate step, on the to-do list): a combined fit of the angle scans and the energy scans on the NEXAFS isld basis
+(`escan add` without `--escan-only`, geometry per recipe, offset pinned, density fitted).
 
 ## Not implemented yet (milestone M6)
 

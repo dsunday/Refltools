@@ -10,6 +10,7 @@ Uncertainties come from the full covariance (J^T J)^-1 * RSS/dof, so shared-para
 
 Run:  python nexafs_cofit.py sog      (SOG references Brewer3-6, LARIAT + isld)
 """
+import json
 import os
 import sys
 
@@ -287,6 +288,41 @@ def soc_test(names, model):
             rows.append(dict(variant=tag, RSS=cf.res["rss"], k=cf.res["k"], at_bound=cf.res["n_at_bound"], AIC=cf.res["aic"], BIC=cf.res["bic"]))
     pd.DataFrame(rows).to_csv(f"{OUT}/SOC_variants.csv", index=False)
     print(pd.DataFrame(rows).round(3).to_string(index=False))
+
+
+
+# ---------------------------------------------------------------- consistency check across similar samples
+def peak_consistency(sets, tol_e=0.3, tol_w=0.3, min_area_frac=0.03):
+    """Do peak energies/widths agree across samples of the same chemistry?
+
+    sets: {label: DataFrame(peak, energy, width, area[, e_free, w_free])} (area ∝ height·width; any common unit per set).
+    e_free / w_free (bool): the parameter varied and was not at a bound.  If given, a spread is only judged where the parameter
+    was free in every sample — otherwise "constrained" (fixed or at a bound, so agreement there is imposed, not measured).
+    A peak is 'weighted' if its area ≥ min_area_frac of that fit's largest peak in EVERY sample; only those are flagged
+    (weak peaks wander freely and carry no chemical information).  Flags: energy range > tol_e (eV) or width range
+    > tol_w (relative to the mean).  → DataFrame per peak: mean/range energy and width, min area fraction, flag."""
+    labels = list(sets)
+    peaks = sorted(set.intersection(*[set(df["peak"]) for df in sets.values()]))
+    rows = []
+    for pk in peaks:
+        E = np.array([sets[l].set_index("peak").loc[pk, "energy"] for l in labels])
+        W = np.array([sets[l].set_index("peak").loc[pk, "width"] for l in labels])
+        frac = np.array([sets[l].set_index("peak").loc[pk, "area"] / sets[l]["area"].max() for l in labels])
+        w_ok = frac.min() >= min_area_frac
+        e_rng, w_rng = E.max() - E.min(), (W.max() - W.min()) / W.mean()
+        ef = all(bool(sets[l].set_index("peak").loc[pk, "e_free"]) if "e_free" in sets[l] else True for l in labels)
+        wf = all(bool(sets[l].set_index("peak").loc[pk, "w_free"]) if "w_free" in sets[l] else True for l in labels)
+        flags = []
+        if w_ok and ef and e_rng > tol_e:
+            flags.append(f"energy spread {e_rng:.2f} eV")
+        if w_ok and wf and w_rng > tol_w:
+            flags.append(f"width spread {100 * w_rng:.0f} %")
+        notes = [n for n, f in (("E", ef), ("W", wf)) if w_ok and not f]
+        if not flags and notes:
+            flags.append("ok where free; " + "/".join(notes) + " constrained (not judged)")
+        rows.append(dict(peak=pk, E_mean=E.mean(), E_range=e_rng, W_mean=W.mean(), W_range_rel=w_rng,
+                         min_area_frac=frac.min(), weighted=w_ok, E_free=ef, W_free=wf, flag="; ".join(flags) or ("ok" if w_ok else "weak (not judged)")))
+    return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":

@@ -34,3 +34,6 @@ Shared peak energies/widths (free within bounds), per-sample heights + edge heig
 - Peak 6 (291.5): only supported in Brewer3 LARIAT (ratio to 288.8 = 0.42±0.17); isld AIC/BIC prefer dropping it; dropping it collapses peak 8 (297 eV) to zero height.
 - **Open issue:** the 302.7 eV peak is unphysically large (FWHM ~10.4 eV); revisit its bounds/model later.
 - SOC test (Brewer1/2, all peaks kept; SOC peak 6 is ~290.4 eV): wide bounds also help (LARIAT RSS 0.87→0.59, 8→1 params at bound; isld 1.43→1.08). isld SOC co-fit has only 2 samples/75 points for 40 params — overfit risk; Brewer1 isld edge decay still goes to 0 (needs tail anchoring, not applied in co-fit).
+
+## Where this fits
+The end-to-end NEXAFS → isld → escan → density/stoichiometry → plots guide lives in the `rsoxr-fit` skill ("NEXAFS-constrained energy-scan workflow"); this skill covers steps 1–2 (peak fits, co-fits, isld fits).
