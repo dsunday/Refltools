@@ -22,5 +22,9 @@ modules directly (`batch`, `h5io`, `Model_Setup`, `gpu_*`, `Plotting_Refl`, ...)
   (reduction harness).
 - GPUs are shared: check `nvidia-smi` first, set `CUDA_VISIBLE_DEVICES` and
   `XLA_PYTHON_CLIENT_PREALLOCATE=false`; the harness job runner does this.
+- kkcalc: refnxlocal has the accelerated fork (`kkcalc 0.8.4+fast1`, editable install of `/homes/dfs1/Github/kkcalc_fast`; backend
+  via `KKCALC_BACKEND`, default numpy). Stoichiometry searches use the batched closed-form search (`kk_fast_search.py`) by default,
+  falling back to the per-candidate pool; disable with `REFLTOOLS_KK_FAST=0` or `--no-fast`. Both work with stock kkcalc (slower
+  transforms). `kk_stoichiometry_fit.kk_info_str()` reports what is in use.
 - Known issue (not fixed): `h5io.extract_sld_from_h5(materials_filter=...)`
   matches by substring ("SOG" also returns "SOG2").

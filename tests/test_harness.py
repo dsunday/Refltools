@@ -1448,6 +1448,354 @@ def test_nexafs_export_kk_material():
     _raises(ValueError, N.export_material, p, "syn2", "C8H8", 1.05)   # intensity fit
 
 
+# ---------------------------------------------------------------------------
+# Fast (batched, closed-form) stoichiometry search: kk_fast_search
+# ---------------------------------------------------------------------------
+
+def _fast_data():
+    """KK-self-consistent C8H8 @ 1.05 g/cm3 table (270-330 eV) and its merge window; shared by the fast-search tests."""
+    if "fast_tab" not in _TMP:
+        d = tempfile.mkdtemp(prefix="rsoxr_fast_")
+        _TMP["fast_dir"] = d
+        _TMP["fast_tab"] = _stoich_table(os.path.join(d, "t.csv"))
+    return _TMP["fast_tab"], [270.0, 330.0]
+
+
+def _legacy_kw(**kw):
+    return dict(n_workers=4, verbose=False, fast=False, **kw)
+
+
+def _assert_tables_match(leg, fst, rho_tol=2e-4, mse_rtol=1e-9, mse_atol=1e-12):
+    """Same candidates; interior optima agree to mse_rtol (+ mse_atol: a KK-consistent test table has MSE ~1e-20 for the
+    true formula, pure roundoff); where the optimum sits ON a density bound the closed form is exact while legacy's
+    bounded Brent (xatol 1e-4) stops short, so there the fast cost may only be lower."""
+    assert list(leg.columns) == list(fst.columns), (list(leg.columns), list(fst.columns))
+    L, Fd = leg.set_index("formula"), fst.set_index("formula")
+    assert set(L.index) == set(Fd.index) and len(L) == len(leg) == len(fst)
+    fin = np.isfinite(L["mse"]).values
+    assert (np.isfinite(Fd.loc[L.index, "mse"]).values == fin).all()           # same failures / inf rows
+    f, l = Fd.loc[L.index], L
+    drho = np.abs(f["density"].values - l["density"].values)[fin]
+    assert np.nanmax(drho) < rho_tol, np.nanmax(drho)
+    assert (f["mse"].values[fin] <= l["mse"].values[fin] * (1 + 1e-9) + 1e-12).all()        # never worse than legacy
+    lo, hi = _bounds_of(fst)
+    at_b = (np.abs(f["density"].values - lo) < 1e-9) | (np.abs(f["density"].values - hi) < 1e-9)
+    interior = fin & ~at_b
+    dm = np.abs(f["mse"].values - l["mse"].values)[interior]
+    tol = mse_rtol * l["mse"].values[interior] + mse_atol
+    assert dm.size == 0 or (dm <= tol).all(), (dm / tol).max()
+    assert np.all(np.diff(fst["mse"].values[np.isfinite(fst["mse"].values)]) >= 0)        # sorted by cost
+
+
+def _bounds_of(df):
+    return df.attrs.get("rho_lo", 0.8), df.attrs.get("rho_hi", 2.5)
+
+
+def test_fast_search_atoms_matches_legacy():
+    import kk_stoichiometry_fit as K
+    tab, mp = _fast_data()
+    cr = [[0, 4], [0, 4], [0, 2]]
+    leg, lb = K.fit_stoichiometry_density(tab, ["C", "H", "O"], cr, (0.8, 2.5), mp, **_legacy_kw())
+    fst, fb = K.fit_stoichiometry_density(tab, ["C", "H", "O"], cr, (0.8, 2.5), mp, verbose=False)
+    assert fst.attrs["engine"] == "fast-numpy" and fst.attrs["n_candidates_total"] == 75
+    _assert_tables_match(leg, fst)
+    assert abs(fb["mse"] - lb["mse"]) < 1e-9 * max(1.0, abs(lb["mse"])), (fb, lb)
+    # energy_mask: only the residual window changes, the KK transform still uses the whole spectrum
+    leg, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [[1, 6], [1, 8]], (0.8, 2.5), mp,
+                                         energy_mask=[(270, 284), (300, 330)], **_legacy_kw())
+    fst, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [[1, 6], [1, 8]], (0.8, 2.5), mp,
+                                         energy_mask=[(270, 284), (300, 330)], verbose=False)
+    assert fst.attrs["engine"] == "fast-numpy"
+    _assert_tables_match(leg, fst)
+
+
+def test_fast_search_fragments_matches_legacy():
+    import kk_stoichiometry_fit as K
+    tab, mp = _fast_data()
+    fr, cr = ["CH2", "C2H4", "O"], [[0, 3], [0, 2], [0, 2]]       # CH2 x2 == C2H4 x1: duplicate formulas, plus the empty tuple
+    leg, _ = K.fit_stoichiometry_density_fragments(tab, fr, cr, (0.8, 2.5), mp, **_legacy_kw())
+    fst, _ = K.fit_stoichiometry_density_fragments(tab, fr, cr, (0.8, 2.5), mp, verbose=False)
+    assert fst.attrs["engine"] == "fast-numpy"
+    assert len(leg) < 3 * 2 * 2 * 3 and len(leg) == len(fst)                      # dedupe + zero-skip happened
+    _assert_tables_match(leg, fst)
+    leg, _ = K.fit_stoichiometry_density_fragments(tab, ["C8H8", "CH2"], [1, [0, 3]], (0.8, 2.5), mp,
+                                                   energy_mask=[(270, 290), (300, 330)], **_legacy_kw())
+    fst, _ = K.fit_stoichiometry_density_fragments(tab, ["C8H8", "CH2"], [1, [0, 3]], (0.8, 2.5), mp,
+                                                   energy_mask=[(270, 290), (300, 330)], verbose=False)
+    _assert_tables_match(leg, fst)
+
+
+def test_fast_species_superposition_property():
+    """SLD(rho=1) of a compound == mass-fraction-weighted sum of its species' SLDs, for random formulas/merge windows."""
+    import kk_stoichiometry_fit as K
+    from kkcalc import data as kd
+    tab, _ = _fast_data()
+    rng = np.random.default_rng(7)
+    for _ in range(12):
+        lo, hi = float(rng.uniform(268, 280)), float(rng.uniform(320, 332))
+        mask = (max(lo, 270.0), min(hi, 330.0))
+        (_, e_fit, R, I, e_beta, _) = K._prepare_fit_data(tab, mask)
+        mpt = [lo, hi]
+        counts = {"C": int(rng.integers(0, 12)), "H": int(rng.integers(0, 14)), "O": int(rng.integers(0, 4)), "N": int(rng.integers(0, 3))}
+        counts = {k: v for k, v in counts.items() if v}
+        if not counts:
+            continue
+        formula = "".join(f"{k}{v}" for k, v in counts.items())
+        asf, M = K._asf_output_for_formula(e_beta, formula, mpt, {})
+        r, i = K._asf_to_both_sld(asf, M, 1.0, e_fit)
+        w = {}
+        pr = pi_ = 0.0
+        for k, v in counts.items():
+            a, m_k = K._asf_output_for_formula(e_beta, k, mpt, {})
+            r_k, i_k = K._asf_to_both_sld(a, m_k, 1.0, e_fit)
+            pr = pr + v * m_k * r_k; pi_ = pi_ + v * m_k * i_k
+        tot = sum(v * kd.calculate_FormulaMass(kd.ParseChemicalFormula(k)) for k, v in counts.items())
+        assert np.allclose(M, tot, rtol=1e-12)
+        assert np.allclose(r, pr / tot, atol=1e-8, rtol=1e-9), (formula, np.abs(r - pr / tot).max())
+        assert np.allclose(i, pi_ / tot, atol=1e-8, rtol=1e-9), (formula, np.abs(i - pi_ / tot).max())
+
+
+def test_fast_density_bounds_clip():
+    import kk_stoichiometry_fit as K
+    tab, mp = _fast_data()
+    for rng_ in ((0.8, 0.9), (1.5, 2.0)):                    # true optimum is 1.05: above the upper / below the lower bound
+        leg, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [8, [4, 8, 4]], rng_, mp, **_legacy_kw())
+        fst, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [8, [4, 8, 4]], rng_, mp, verbose=False)
+        d = fst["density"].values
+        assert np.all((np.abs(d - rng_[0]) < 1e-12) | (np.abs(d - rng_[1]) < 1e-12)), d      # exactly on a bound
+        assert np.all(np.abs(d - leg.set_index("formula").loc[fst["formula"], "density"].values) < 2e-4)
+        assert np.all(fst["mse"].values <= leg.set_index("formula").loc[fst["formula"], "mse"].values * (1 + 1e-12))
+
+
+def test_fast_search_edge_cases():
+    import warnings
+    import kk_stoichiometry_fit as K
+    tab, mp = _fast_data()
+    # zero counts and the all-zero candidate (legacy: inf; same here, density NaN)
+    leg, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [[0, 2], [0, 2]], (0.8, 2.5), mp, **_legacy_kw())
+    fst, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [[0, 2], [0, 2]], (0.8, 2.5), mp, verbose=False)
+    assert fst.attrs["engine"] == "fast-numpy"
+    z = fst[(fst.n_C == 0) & (fst.n_H == 0)].iloc[0]
+    assert not np.isfinite(z["mse"]) and not np.isfinite(leg[(leg.n_C == 0) & (leg.n_H == 0)].iloc[0]["mse"])
+    assert np.array_equal(np.isfinite(leg.set_index("formula").loc[fst.formula, "mse"].values), np.isfinite(fst.mse.values))
+    # NaN points in the residual data (real SLD) are ignored per array, as K._mse does.  (A NaN in the IMAGINARY column is the
+    # KK input and poisons the transform for every candidate: the fast path then warns and the legacy search reports inf.)
+    bad = tab.copy(); bad[5, 1] = np.nan; bad[20, 1] = np.nan
+    leg, _ = K.fit_stoichiometry_density(bad, ["C", "H"], [8, [4, 12, 4]], (0.8, 2.5), mp, **_legacy_kw())
+    fst, _ = K.fit_stoichiometry_density(bad, ["C", "H"], [8, [4, 12, 4]], (0.8, 2.5), mp, verbose=False)
+    assert fst.attrs["engine"] == "fast-numpy"
+    _assert_tables_match(leg, fst)
+    # conditions outside the fast path's validity silently use the legacy search (no engine attribute, no warning)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        a, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [8, [6, 10, 2]], (0.8, 2.5), [280.0, 320.0], n_workers=2, verbose=False)
+        b, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [8, [6, 10, 2]], (0.8, 2.5), mp, n_workers=2, verbose=False,
+                                           kk_kwargs={"fix_distortions": True})
+        c, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [8, [6, 10, 2]], (0.8, 2.5), mp, n_workers=2, verbose=False,
+                                           optimise_density=False, n_density_grid=20)
+    assert "engine" not in a.attrs and "engine" not in b.attrs and "engine" not in c.attrs
+    # a species whose KK transform fails -> warning + the legacy table
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        fst, _ = K.fit_stoichiometry_density(tab, ["C", "Xx"], [[1, 2], [0, 1]], (0.8, 2.5), mp, n_workers=2, verbose=False)
+    assert any("falling back" in str(x.message) for x in w), [str(x.message) for x in w]
+    leg, _ = K.fit_stoichiometry_density(tab, ["C", "Xx"], [[1, 2], [0, 1]], (0.8, 2.5), mp, **_legacy_kw())
+    assert "engine" not in fst.attrs
+    assert np.array_equal(np.isfinite(leg.set_index("formula").loc[fst.formula, "mse"].values), np.isfinite(fst.mse.values))
+
+
+def test_fast_search_fallback_switches():
+    import warnings
+    import kk_stoichiometry_fit as K
+    import kk_fast_search as F
+    tab, mp = _fast_data()
+    args = (tab, ["C", "H"], [8, [6, 10, 2]], (0.8, 2.5), mp)
+    ref, _ = K.fit_stoichiometry_density(*args, **_legacy_kw())
+    orig = F.species_statistics
+    try:
+        # any unexpected failure of the fast path: warning + the legacy result
+        def boom(*a, **k):
+            raise RuntimeError("synthetic failure")
+        F.species_statistics = boom
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            got, _ = K.fit_stoichiometry_density(*args, n_workers=2, verbose=False)
+        assert any("falling back" in str(x.message) for x in w) and "engine" not in got.attrs
+        assert np.allclose(got.sort_values("formula").mse.values, ref.sort_values("formula").mse.values, rtol=1e-12)
+        # REFLTOOLS_KK_FAST=0 disables it (the fast code is never called); fast=True overrides the variable
+        def never(*a, **k):
+            raise AssertionError("fast path was called")
+        F.species_statistics = never
+        os.environ["REFLTOOLS_KK_FAST"] = "0"
+        got, _ = K.fit_stoichiometry_density(*args, n_workers=2, verbose=False)
+        assert "engine" not in got.attrs
+        assert F.fast_enabled() is False and F.fast_enabled(True) is True
+    finally:
+        os.environ.pop("REFLTOOLS_KK_FAST", None)
+        F.species_statistics = orig
+    # the module not being importable at all -> legacy, no error
+    saved = sys.modules.get("kk_fast_search")
+    sys.modules["kk_fast_search"] = None
+    try:
+        got, _ = K.fit_stoichiometry_density(*args, n_workers=2, verbose=False)
+        assert "engine" not in got.attrs and len(got) == len(ref)
+    finally:
+        sys.modules["kk_fast_search"] = saved
+    # stock kkcalc (no KK_PP_legacy): the search still works and kk_info() says so
+    from kkcalc import kk
+    legacy_fn = getattr(kk, "KK_PP_legacy", None)
+    if legacy_fn is not None:
+        del kk.KK_PP_legacy
+    try:
+        info = K.kk_info()
+        assert info["fork"] is False and info["backend"] == "stock", info
+        got, _ = K.fit_stoichiometry_density(*args, verbose=False)
+        assert got.attrs["engine"] == "fast-numpy"
+    finally:
+        if legacy_fn is not None:
+            kk.KK_PP_legacy = legacy_fn
+    assert "kkcalc" in K.kk_info_str()
+
+
+def test_fast_search_dedupe_and_topk():
+    import kk_stoichiometry_fit as K
+    import kk_fast_search as F
+    tab, mp = _fast_data()
+    full, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [[1, 16], [1, 16]], (0.8, 2.5), mp, verbose=False)
+    dd, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [[1, 16], [1, 16]], (0.8, 2.5), mp, verbose=False, dedupe=True)
+    assert len(dd) < len(full) and "multiplicity" in dd.columns and "multiplicity" not in full.columns
+    # chi2_scan counts the free parameters as the results columns starting with "n_": no extra column may match
+    assert [c for c in dd.columns if c.startswith("n_")] == ["n_C", "n_H"], list(dd.columns)
+    red = [tuple(np.array([r.n_C, r.n_H]) // np.gcd(r.n_C, r.n_H)) for r in dd.itertuples()]
+    assert len(set(red)) == len(red)                                        # one row per composition
+    r = dd[(dd.n_C == 1) & (dd.n_H == 1)].iloc[0]
+    assert r.multiplicity == 16 and r.formula == "C1H1"                     # smallest multiple represents CH
+    fi = full.set_index("formula")
+    assert np.allclose(dd.mse.values, fi.loc[dd.formula, "mse"].values, rtol=1e-12)     # costs unchanged
+    # top_k + dedupe returns the best distinct compositions (the legacy top-10 was dominated by multiples of one)
+    tk, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [[1, 16], [1, 16]], (0.8, 2.5), mp, verbose=False, dedupe=True, top_k=5)
+    assert len(tk) == 5 and list(tk.formula) == list(dd.formula.head(5)), (list(tk.formula), list(dd.formula.head(5)))
+    tk2, _ = K.fit_stoichiometry_density(tab, ["C", "H"], [[1, 16], [1, 16]], (0.8, 2.5), mp, verbose=False, top_k=5)
+    assert len(tk2) == 5 and tk2.attrs["n_candidates_total"] == 256
+    # helper: all-zero rows are dropped; the smallest multiple is kept
+    keep, mult = F.dedupe_keep_smallest(np.array([[0, 0], [2, 4], [1, 2], [3, 6], [0, 5], [0, 1], [5, 5]]))
+    assert keep.tolist() == [2, 5, 6] and mult.tolist() == [3, 2, 1], (keep, mult)
+
+
+def test_fast_search_jax_backend_cpu():
+    """numpy vs jax (CPU, in a subprocess: importing jax kernels enables x64 process-wide)."""
+    import subprocess
+    tab, _ = _fast_data()
+    npy = os.path.join(_TMP["fast_dir"], "tab.npy")
+    np.save(npy, tab)
+    code = (
+        "import sys, warnings, numpy as np; warnings.simplefilter('ignore')\n"
+        f"sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n"
+        "import kk_stoichiometry_fit as K\n"
+        f"tab = np.load({npy!r})\n"
+        "kw = dict(verbose=False)\n"
+        "args = (tab, ['C','H','O'], [[0,4],[0,4],[0,2]], (0.8,2.5), [270.0,330.0])\n"
+        "a, _ = K.fit_stoichiometry_density(*args, **kw)\n"
+        "b, _ = K.fit_stoichiometry_density(*args, backend='jax-cpu', **kw)\n"
+        "assert b.attrs['engine'] == 'fast-jax', b.attrs\n"
+        "A, B = a.set_index('formula'), b.set_index('formula'); B = B.loc[A.index]; fin = np.isfinite(A.mse.values)\n"
+        "assert np.allclose(A.mse.values[fin], B.mse.values[fin], rtol=1e-9) and np.allclose(A.density.values[fin], B.density.values[fin], atol=1e-9)\n"
+        "t, _ = K.fit_stoichiometry_density(*args, backend='jax-cpu', top_k=5, **kw)\n"
+        "assert len(t) == 5 and np.allclose(np.sort(t.mse.values), np.sort(a.mse.values)[:5], rtol=1e-9)\n"
+        "print('ok')\n")
+    env = dict(os.environ, JAX_PLATFORMS="cpu", CUDA_VISIBLE_DEVICES="", MPLBACKEND="Agg")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    if "ModuleNotFoundError" in r.stderr and "jax" in r.stderr:
+        return                                                              # jax not installed: nothing to test
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-1500:]
+
+
+def test_fast_count_scans_match_legacy():
+    import matplotlib.pyplot as plt
+    import kk_stoichiometry_fit as K
+    tab, mp = _fast_data()
+    a = K.scan_atom_count_surface(tab, ["C", "H"], [8, 8], "C", (2, 12), (0.8, 2.5), mp, ax=plt.figure().gca(), fast=False)
+    b = K.scan_atom_count_surface(tab, ["C", "H"], [8, 8], "C", (2, 12), (0.8, 2.5), mp, ax=plt.figure().gca())
+    assert np.array_equal(a[0], b[0]) and np.array_equal(np.isnan(a[1]), np.isnan(b[1]))
+    assert np.allclose(a[1], b[1], rtol=1e-9, equal_nan=True) and np.allclose(a[2], b[2], atol=2e-4, equal_nan=True)
+    a = K.scan_fragment_count_surface(tab, ["CH2", "O"], [3, 1], "CH2", (0, 6), (0.8, 2.5), mp, ax=plt.figure().gca(), fast=False)
+    b = K.scan_fragment_count_surface(tab, ["CH2", "O"], [3, 1], "CH2", (0, 6), (0.8, 2.5), mp, ax=plt.figure().gca())
+    assert np.array_equal(np.isnan(a[1]), np.isnan(b[1]))                    # same NaN pattern
+    assert np.allclose(a[2], b[2], atol=2e-4, equal_nan=True)
+    ok = np.isfinite(a[1])
+    assert np.all(b[1][ok] <= a[1][ok] * (1 + 1e-9))                         # closed form is never worse (bound cases)
+    plt.close("all")
+
+
+def test_stoich_spec_new_fields_keep_old_specs_valid():
+    from rsoxr_harness.stoich import StoichSpec
+    old = {"name": "a", "source": "x.csv", "atoms": ["C", "H"], "counts": [8, [4, 12, 2]], "density_range": [0.8, 1.5]}
+    sp = StoichSpec.from_json(old)                         # a spec.json written before the fast path existed
+    assert sp.fast is None and sp.backend == "numpy" and sp.dedupe is True
+    j = sp.to_json()
+    assert "fast" not in j and "backend" not in j and "dedupe" not in j        # defaults are not written -> old == new
+    sp2 = StoichSpec(name="a", source="x.csv", atoms=["C", "H"], counts=[8, [4, 12, 2]], density_range=(0.8, 1.5),
+                     fast=False, backend="jax-gpu", dedupe=False)
+    j2 = sp2.to_json()
+    assert j2["fast"] is False and j2["backend"] == "jax-gpu" and j2["dedupe"] is False
+    assert StoichSpec.from_json(json.loads(json.dumps(j2))).to_json() == j2
+    _raises(ValueError, StoichSpec, name="b", source="x", atoms=["C"], counts=[1], backend="cuda")
+
+
+def test_stoich_harness_engine_fields_and_fallback():
+    from rsoxr_harness.__main__ import main
+    from rsoxr_harness import stoich as S
+    p = synthetic()
+    csv = os.path.join(p.path, "ps_true.csv")
+    _stoich_table(csv)
+    p.add_stoich(name="fastA", source=csv, atoms=["C", "H"], counts=[[2, 16], [2, 16]],
+                 density_range=(0.8, 1.5), n_workers=4, overwrite=True)
+    assert main(["stoich", "run", "fastA", "-p", p.path]) == 0
+    sa = S.load_result(p.stoich_dir("fastA"))[0]
+    assert sa["engine"] == "fast-numpy" and sa["dedupe"] is True and sa["table_truncated"] is False, sa
+    assert sa["n_candidates"] == 15 * 15 and sa["n_table_rows"] < sa["n_candidates"], sa
+    assert sa["kkcalc"]["version"] and "fast_search" in sa["kkcalc"]
+    b = S.final_best(sa)
+    assert abs(b["density"] - 1.05) < 2e-3 and b["rmse"] < 1e-3, b
+    df = S.load_result(p.stoich_dir("fastA"))[2]
+    red = {(r.n_C // np.gcd(r.n_C, r.n_H), r.n_H // np.gcd(r.n_C, r.n_H)) for r in df.itertuples()}
+    assert len(red) == len(df)                                                  # one row per composition
+    # --no-fast: the legacy pool, every candidate listed, same answer
+    assert main(["stoich", "run", "fastA", "--no-fast", "--workers", "4", "-p", p.path]) == 0
+    sl = S.load_result(p.stoich_dir("fastA"))[0]
+    assert sl["engine"] == "legacy" and sl["n_table_rows"] == 15 * 15 and sl["dedupe"] is False, sl
+    bl = S.final_best(sl)
+    assert abs(bl["density"] - b["density"]) < 2e-3 and bl["rmse"] < 1e-3
+    # a spec saved with fast=False uses the pool without any CLI flag
+    p.add_stoich(name="legacyB", source=csv, atoms=["C", "H"], counts=[8, [4, 12, 2]], density_range=(0.8, 1.5),
+                 fast=False, n_workers=4, overwrite=True)
+    assert main(["stoich", "run", "legacyB", "-p", p.path]) == 0
+    assert S.load_result(p.stoich_dir("legacyB"))[0]["engine"] == "legacy"
+
+
+def test_stoich_cli_gpu_picker():
+    import subprocess
+    from types import SimpleNamespace
+    from rsoxr_harness import __main__ as M
+    from rsoxr_harness import jobs as J
+    proj = SimpleNamespace()
+    real_run, real_busy = subprocess.run, J.busy_gpus
+    try:
+        J.busy_gpus = lambda project: set()
+        subprocess.run = lambda *a, **k: SimpleNamespace(stdout="0, 5000, 90\n1, 150, 3\n2, 100, 0\n")
+        assert M._pick_free_gpu(proj) == 2                                     # least memory among the idle ones
+        J.busy_gpus = lambda project: {2}
+        assert M._pick_free_gpu(proj) == 1                                     # skips a GPU another harness job holds
+        subprocess.run = lambda *a, **k: SimpleNamespace(stdout="0, 5000, 90\n1, 4000, 10\n")
+        assert M._pick_free_gpu(proj) is None                                  # nothing idle
+        def broken(*a, **k):
+            raise FileNotFoundError("nvidia-smi")
+        subprocess.run = broken
+        assert M._pick_free_gpu(proj) is None                                  # no nvidia-smi -> CPU
+    finally:
+        subprocess.run, J.busy_gpus = real_run, real_busy
+
+
 def _run_all():
     tests = [(n, f) for n, f in globals().items()
              if n.startswith("test_") and callable(f)]
@@ -1462,6 +1810,8 @@ def _run_all():
             traceback.print_exc()
     if "dir" in _TMP:
         shutil.rmtree(_TMP["dir"], ignore_errors=True)
+    if "fast_dir" in _TMP:
+        shutil.rmtree(_TMP["fast_dir"], ignore_errors=True)
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     return failed
 

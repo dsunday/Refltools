@@ -54,7 +54,7 @@ dependencies:
       - evosax==0.2.0
       - optax==0.2.8
       - flax==0.12.7
-      - kkcalc==0.8.4
+      - kkcalc @ git+https://github.com/dsunday/kkcalc.git@fast   # accelerated fork (0.8.4+fast1); stock: kkcalc==0.8.4
 variables:
   # Windows Python defaults to cp1252 for open(); the harness writes σ, χ², ° etc.
   PYTHONUTF8: "1"

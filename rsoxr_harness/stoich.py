@@ -62,6 +62,14 @@ class StoichSpec:
                   uses the full imaginary spectrum inside merge_points.
     refine_density: after the search, re-optimise the best formula's density
                     within ±refine_density g/cm³ (None → skip).
+    fast:         None (default) → use the batched closed-form search
+                  (kk_fast_search: one KK transform per atom/fragment, density in
+                  closed form; same results as the per-candidate pool) unless
+                  REFLTOOLS_KK_FAST=0; False → always the legacy worker pool;
+                  True → force it on.  Anything the fast path cannot handle (or
+                  any failure) falls back to the pool automatically.
+    backend:      'numpy' (default) or 'jax-gpu' / 'jax-cpu' for huge grids.
+    dedupe:       fast path: list each composition once (C16H16 is C8H8 × 2).
     """
     name: str
     source: str
@@ -77,8 +85,13 @@ class StoichSpec:
     n_workers: int | None = None
     criteria: str = "best"
     description: str = ""
+    fast: bool | None = None
+    backend: str = "numpy"
+    dedupe: bool = True
 
     def __post_init__(self):
+        if self.backend not in ("numpy", "jax", "jax-gpu", "jax-cpu"):
+            raise ValueError(f"backend must be 'numpy', 'jax-gpu' or 'jax-cpu', got {self.backend!r}")
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
         names = self.atoms if self.mode == "atoms" else self.fragments
@@ -120,6 +133,10 @@ class StoichSpec:
     def to_json(self):
         d = asdict(self)
         d["density_range"] = list(self.density_range)
+        if d.get("backend") == "numpy":
+            d.pop("backend")
+        if d.get("dedupe") is True:
+            d.pop("dedupe")
         return {k: v for k, v in d.items() if v is not None}
 
     @classmethod
@@ -232,6 +249,31 @@ def release_workers():
     _with_registry(lambda reg: reg.pop(str(os.getpid()), None))
 
 
+def fast_available(spec=None):
+    """True if the batched closed-form search would be attempted (module importable, not disabled)."""
+    try:
+        import kk_fast_search as F
+    except Exception:
+        return False
+    return bool(F.fast_enabled(None if spec is None else spec.fast))
+
+
+def _raw_candidates(spec):
+    """Grid size before any de-duplication."""
+    if spec.mode == "fragments":
+        return spec.n_candidates()
+    n = 1
+    for c in spec.counts:
+        n *= len(_grid(c))
+    return n
+
+
+# rows kept in results.csv once a fast search covers this many candidates (formatting millions of formula
+# strings would dominate the run); best.json still records the full count
+TABLE_CAP_ABOVE = 2_000_000
+TABLE_CAP_ROWS = 20_000
+
+
 def _defaults(spec, sld):
     mp = spec.merge_points or [float(sld[:, 0].min()), float(sld[:, 0].max())]
     em = spec.energy_mask
@@ -263,10 +305,17 @@ def run_search(spec, sld, out_dir, provenance="", verbose=True):
                    "merge_points_used": mp, "energy_mask_used": mask}, fh, indent=2)
 
     t0 = time.time()
-    # never hand None to kk_stoichiometry_fit (it would use every CPU)
-    workers = resolve_workers(spec.n_workers)
+    fast_on = fast_available(spec)
+    # never hand None to kk_stoichiometry_fit (it would use every CPU).  A fast search holds one CPU in the
+    # registry; if it has to fall back to the pool, the pool is capped by what the other jobs leave free.
+    workers = resolve_workers(spec.n_workers, max(0, cpus_in_use() - 1) if fast_on else 0)
+    n_raw = _raw_candidates(spec)
+    top_k = max(spec.top_n, TABLE_CAP_ROWS) if (fast_on and n_raw > TABLE_CAP_ABOVE) else None
     common = dict(density_range=spec.density_range, merge_points=mp, energy_mask=mask,
-                  optimise_density=True, n_workers=workers, verbose=verbose)
+                  optimise_density=True, n_workers=workers, verbose=verbose,
+                  fast=spec.fast, backend=spec.backend, dedupe=spec.dedupe, top_k=top_k)
+    if verbose:
+        print(f"[harness] {K.kk_info_str()}", flush=True)
     if spec.mode == "atoms":
         df, best = K.fit_stoichiometry_density(sld, atoms=spec.atoms,
                                                count_ranges=spec._kk_counts(), **common)
@@ -275,6 +324,9 @@ def run_search(spec, sld, out_dir, provenance="", verbose=True):
                                                          count_ranges=spec._kk_counts(),
                                                          **common)
     search_sec = time.time() - t0
+    engine = df.attrs.get("engine", "legacy")
+    n_total = int(df.attrs.get("n_candidates_total", len(df)))
+    n_rows_searched = int(len(df))
     df = df.dropna(subset=["mse"]).reset_index(drop=True)
     if df.empty:
         raise RuntimeError("every candidate failed (KK transform errors) — check "
@@ -292,8 +344,13 @@ def run_search(spec, sld, out_dir, provenance="", verbose=True):
     kk = kk_sld(sld, final["formula"], final["density"], mp)
     np.savetxt(os.path.join(out_dir, "best_kk_sld.csv"), kk, delimiter=",",
                header="Energy_eV,Real_SLD,Imag_SLD", comments="")
+    from kk_stoichiometry_fit import kk_info
     summary = {"name": spec.name, "mode": spec.mode, "provenance": provenance,
-               "n_candidates": int(len(df)), "search_sec": round(search_sec, 1),
+               "n_candidates": int(n_total if engine != "legacy" else len(df)),
+               "n_table_rows": int(n_rows_searched), "engine": engine,
+               "dedupe": bool(spec.dedupe and engine != "legacy"),
+               "table_truncated": bool(engine != "legacy" and top_k is not None),
+               "kkcalc": kk_info(), "search_sec": round(search_sec, 1),
                "best": best, "refined": refined,
                "top": df.head(spec.top_n)[["formula", "density", "rmse"]]
                .to_dict(orient="records"),

@@ -411,11 +411,21 @@ def _run_sampling(project, job):
 def _run_stoich(project, job):
     from . import stoich as S
     outputs = {}
+    prm = job["params"]
     for name in job["models"]:
         spec = project.get_stoich(name)
-        spec.n_workers = S.reserve_workers(job["params"].get("n_workers") or spec.n_workers)
-        print(f"[harness] using {spec.n_workers} worker processes (cap {S.cpu_cap()} = 50% "
-              f"of {os.cpu_count()} CPUs, shared by all stoich searches)", flush=True)
+        for key in ("fast", "backend", "dedupe"):            # per-job overrides from the CLI
+            if prm.get(key) is not None:
+                setattr(spec, key, prm[key])
+        if S.fast_available(spec):
+            # batched closed-form search: one process.  If it cannot be used the pool fallback is capped by run_search.
+            spec.n_workers = S.reserve_workers(1)
+            print(f"[harness] batched stoichiometry search (backend {spec.backend}, 1 process; the per-candidate pool "
+                  f"is only a fallback, cap {S.cpu_cap()} = 50% of {os.cpu_count()} CPUs)", flush=True)
+        else:
+            spec.n_workers = S.reserve_workers(prm.get("n_workers") or spec.n_workers)
+            print(f"[harness] per-candidate pool: {spec.n_workers} worker processes (cap {S.cpu_cap()} = 50% "
+                  f"of {os.cpu_count()} CPUs, shared by all stoich searches)", flush=True)
         sld, prov = S.resolve_source(project, spec.source, spec.criteria)
         print(f"\n[harness] stoich {spec.describe()}", flush=True)
         print(f"[harness] source: {prov}", flush=True)
@@ -425,11 +435,11 @@ def _run_stoich(project, job):
             S.release_workers()
         b = S.final_best(summ)
         outputs[name] = {"best": b, "n_candidates": summ["n_candidates"],
-                         "search_sec": summ["search_sec"]}
+                         "search_sec": summ["search_sec"], "engine": summ.get("engine")}
         J.update_job(project, job["id"], outputs=outputs)
         print(f"[harness] stoich {name}: best {b['formula']}  ρ={b['density']:.4f} g/cm³  "
               f"RMSE={b['rmse']:.5f}  ({summ['n_candidates']} candidates, "
-              f"{summ['search_sec']:.0f}s)", flush=True)
+              f"{summ['search_sec']:.1f}s, {summ.get('engine', 'legacy')})", flush=True)
     return outputs
 
 

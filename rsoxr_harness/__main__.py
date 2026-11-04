@@ -356,10 +356,31 @@ def cmd_stoich(a):
         print(f"note: {req} workers requested; capped at {workers} "
               f"(50% of {os.cpu_count()} CPUs, {in_use} in use by other stoich jobs)")
     params = {"n_workers": workers}
-    job = J.new_job(p, "stoich", list(a.name), [], params, "cpu")
+    if a.no_fast:
+        params["fast"] = False
+    if a.no_dedupe:
+        params["dedupe"] = False
+    specs = [p.get_stoich(n) for n in a.name]
+    fast_on = (not a.no_fast) and all(S.fast_available(sp) for sp in specs)
+    gpu = "cpu"
+    big = max(S._raw_candidates(sp) for sp in specs)
+    if fast_on and (a.gpu is not None or big > GPU_AUTO_ABOVE):
+        gpu = a.gpu if a.gpu is not None else _pick_free_gpu(p)
+        if gpu is None:
+            print(f"note: {big:,} candidates would benefit from a GPU but none is free; using the CPU "
+                  f"(or pass --gpu N)")
+            gpu = "cpu"
+    elif a.gpu is not None:
+        print("note: --gpu is only used by the batched search; running on the CPU")
+    if gpu != "cpu":
+        params["backend"] = "jax-gpu"
+        if gpu in J.busy_gpus(p):
+            print(f"warning: another harness job is already running on gpu {gpu}")
+    job = J.new_job(p, "stoich", list(a.name), [], params, gpu)
     print(f"job {job['id']}: stoich {' '.join(a.name)}  ("
           + ", ".join(f"{n}: {p.get_stoich(n).n_candidates()} candidates" for n in a.name)
-          + ")")
+          + f")  [{'batched search' if fast_on else 'per-candidate pool'}, "
+          + (f"gpu {gpu}" if gpu != "cpu" else "cpu") + "]")
     print(f"log: {job['log']}")
     proc = J.launch(p, job, detach=a.detach)
     if a.detach:
@@ -369,6 +390,24 @@ def cmd_stoich(a):
     job = J.read_job(p, job["id"])
     print(f"\njob {job['id']}: {job['status']}")
     return 0 if job["status"] == "done" else 1
+
+
+GPU_AUTO_ABOVE = 10_000_000       # candidates: above this the batched search is submitted as a GPU job
+
+
+def _pick_free_gpu(project):
+    """Index of an idle GPU (low memory use and utilisation, no harness job), or None."""
+    import subprocess
+    from . import jobs as J
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=15).stdout
+        rows = [tuple(int(float(x)) for x in line.split(",")) for line in out.strip().splitlines()]
+    except Exception:
+        return None
+    busy = J.busy_gpus(project)
+    free = [(mem, i) for i, mem, util in rows if i not in busy and mem < 2000 and util < 50]
+    return min(free)[1] if free else None
 
 
 def _count_arg(s):
@@ -858,6 +897,12 @@ def main(argv=None):
     s.add_argument("--tol-pct", type=float, default=5.0,
                    help="stoich-accept: RMSE acceptance cut, %% above the best")
     s.add_argument("--detach", action="store_true")
+    s.add_argument("--no-fast", action="store_true",
+                   help="run: use the per-candidate worker pool instead of the batched closed-form search")
+    s.add_argument("--no-dedupe", action="store_true",
+                   help="run: list every candidate (default: each composition once; C16H16 is C8H8 x 2)")
+    s.add_argument("--gpu", type=int, default=None,
+                   help="run: run the batched search on this GPU (chosen automatically above 1e7 candidates)")
 
     s = add("unc", cmd_unc, "summarise cached NUTS/JAXNS results")
     s.add_argument("--models", "--model", nargs="+", required=True)

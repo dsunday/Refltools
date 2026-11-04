@@ -75,6 +75,62 @@ def _spawn_worker_init(parent_sys_path):
 
 
 # ---------------------------------------------------------------------------
+# Optional fast path (kk_fast_search) and kkcalc feature detection
+# ---------------------------------------------------------------------------
+
+def kk_info():
+    """What kkcalc is in use: version, file, whether it is the accelerated fork, the KK_PP backend and whether the
+    batched closed-form search (kk_fast_search) is available/enabled.  Nothing here requires the fork."""
+    import kkcalc
+    from kkcalc import kk as _kk
+    fork = hasattr(_kk, 'KK_PP_legacy')
+    try:
+        import kk_fast_search as _F
+        fast = bool(_F.fast_enabled())
+    except Exception:
+        fast = False
+    return {'version': getattr(kkcalc, '__version__', '?'), 'file': getattr(kkcalc, '__file__', '?'), 'fork': fork,
+            'backend': os.environ.get('KKCALC_BACKEND', 'numpy') if fork else 'stock', 'fast_search': fast}
+
+
+def kk_info_str():
+    i = kk_info()
+    return (f"kkcalc {i['version']} ({'accelerated fork' if i['fork'] else 'stock'}, KK backend {i['backend']}); "
+            f"batched stoichiometry search {'on' if i['fast_search'] else 'off'}")
+
+
+def _fast_requested(fast):
+    """True if the batched search should be attempted (module importable and enabled)."""
+    try:
+        import kk_fast_search as _F
+    except Exception:
+        return False
+    return _F.fast_enabled(fast)
+
+
+def _try_fast(kind, fast, sld_3col, species, count_ranges, density_range, merge_points,
+              energy_mask, kk_kwargs, optimise_density, backend, top_k, dedupe, verbose):
+    """Run the batched closed-form search (kk_fast_search).  Returns (results_df, best) or None, in which case the
+    caller runs the legacy per-candidate search.  Any problem falls back; unexpected ones with a warning."""
+    if not _fast_requested(fast) or not optimise_density:    # a grid scan over density has different semantics
+        return None
+    import kk_fast_search as _F
+    try:
+        fn = _F.fast_fit_atoms if kind == 'atoms' else _F.fast_fit_fragments
+        return fn(sld_3col, species, count_ranges, density_range, merge_points, energy_mask=energy_mask,
+                  kk_kwargs=kk_kwargs, backend=backend, top_k=top_k, dedupe=dedupe, verbose=verbose)
+    except _F.FastPathUnsupported as exc:
+        if fast:
+            warnings.warn(f"fast KK search not applicable ({exc}); using the legacy per-candidate search", stacklevel=3)
+        elif verbose:
+            print(f"  [fast search not applicable: {exc}; using the legacy per-candidate search]")
+    except Exception as exc:
+        warnings.warn(f"fast KK stoichiometry search failed ({type(exc).__name__}: {exc}); "
+                      "falling back to the legacy per-candidate search", stacklevel=3)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers — shared
 # ---------------------------------------------------------------------------
 
@@ -747,7 +803,8 @@ def _dispatch(worker_fn, worker_args, n_workers, verbose, n_combos):
 def fit_stoichiometry_density(
     sld_3col, atoms, count_ranges, density_range, merge_points,
     n_density_grid=50, optimise_density=True, energy_mask=None,
-    kk_kwargs=None, n_workers=None, verbose=True
+    kk_kwargs=None, n_workers=None, verbose=True,
+    fast=None, backend='numpy', dedupe=False, top_k=None
 ):
     """
     Fit stoichiometry and density using the forward KK direction only.
@@ -766,8 +823,17 @@ def fit_stoichiometry_density(
     optimise_density: bool             True → Brent; False → uniform grid.
     energy_mask   : tuple, optional    (E_min, E_max) eV for residual window.
     kk_kwargs     : dict, optional     Extra kwargs for kkcalc.
-    n_workers     : int or None        Parallel workers (1 = serial).
+    n_workers     : int or None        Parallel workers (1 = serial) -- legacy path only.
     verbose       : bool
+    fast          : bool or None       Use the batched closed-form search (kk_fast_search): one KK transform per
+                                       atom, density in closed form (exact; identical to the per-candidate result).
+                                       None -> env REFLTOOLS_KK_FAST (default on).  Falls back to the legacy
+                                       per-candidate pool if not applicable (grid-scan density, fix_distortions,
+                                       residual energies outside the merge window) or on any failure.
+    backend       : str                'numpy' (default) or 'jax-gpu' / 'jax-cpu' (fast path only).
+    dedupe        : bool               Fast path: drop candidates that are integer multiples of another (C16H16 vs
+                                       C8H8); adds an ``multiplicity`` column.
+    top_k         : int or None        Fast path: return only the best top_k rows (huge grids).
 
     Returns
     -------
@@ -779,6 +845,11 @@ def fit_stoichiometry_density(
         kk_kwargs = {}
     if len(atoms) != len(count_ranges):
         raise ValueError("len(atoms) must equal len(count_ranges)")
+
+    _res = _try_fast('atoms', fast, sld_3col, atoms, count_ranges, density_range, merge_points,
+                     energy_mask, kk_kwargs, optimise_density, backend, top_k, dedupe, verbose)
+    if _res is not None:
+        return _res
 
     stoichiometry_combos = _build_stoichiometry_grid(atoms, count_ranges)
     n_combos = len(stoichiometry_combos)
@@ -1277,7 +1348,8 @@ def _build_fragment_grid(fragments, count_ranges):
 def fit_stoichiometry_density_fragments(
     sld_3col, fragments, count_ranges, density_range, merge_points,
     n_density_grid=50, optimise_density=True, energy_mask=None,
-    kk_kwargs=None, n_workers=None, verbose=True
+    kk_kwargs=None, n_workers=None, verbose=True,
+    fast=None, backend='numpy', dedupe=False, top_k=None
 ):
     """
     Fit stoichiometry and density using a fragment-based search (forward KK).
@@ -1311,8 +1383,17 @@ def fit_stoichiometry_density_fragments(
     optimise_density : bool            True → Brent; False → uniform grid.
     energy_mask   : tuple, optional    (E_min, E_max) eV residual window.
     kk_kwargs     : dict, optional     Extra kwargs for kkcalc.
-    n_workers     : int or None        Parallel workers (1 = serial).
+    n_workers     : int or None        Parallel workers (1 = serial) -- legacy path only.
     verbose       : bool
+    fast          : bool or None       Use the batched closed-form search (kk_fast_search): one KK transform per
+                                       fragment, density in closed form (exact; identical to the per-candidate result).
+                                       None -> env REFLTOOLS_KK_FAST (default on).  Falls back to the legacy
+                                       per-candidate pool if not applicable (grid-scan density, fix_distortions,
+                                       residual energies outside the merge window) or on any failure.
+    backend       : str                'numpy' (default) or 'jax-gpu' / 'jax-cpu' (fast path only).
+    dedupe        : bool               Fast path: drop candidates that are integer multiples of another (C16H16 vs
+                                       C8H8); adds an ``multiplicity`` column.
+    top_k         : int or None        Fast path: return only the best top_k rows (huge grids).
 
     Returns
     -------
@@ -1326,6 +1407,11 @@ def fit_stoichiometry_density_fragments(
         kk_kwargs = {}
     if len(fragments) != len(count_ranges):
         raise ValueError("len(fragments) must equal len(count_ranges)")
+
+    _res = _try_fast('fragments', fast, sld_3col, fragments, count_ranges, density_range, merge_points,
+                     energy_mask, kk_kwargs, optimise_density, backend, top_k, dedupe, verbose)
+    if _res is not None:
+        return _res
 
     fragment_combos = _build_fragment_grid(fragments, count_ranges)
     n_combos = len(fragment_combos)
@@ -1463,7 +1549,7 @@ def fit_stoichiometry_density_fragments_bidirectional(
 def scan_atom_count_surface(
     sld_3col, atoms, fixed_counts, scan_atom, scan_range,
     density_range, merge_points,
-    n_density_points=40, energy_mask=None, kk_kwargs=None, ax=None
+    n_density_points=40, energy_mask=None, kk_kwargs=None, ax=None, fast=None
 ):
     """
     Scan the RMSE cost surface over integer counts of a single atom, while
@@ -1486,6 +1572,8 @@ def scan_atom_count_surface(
     energy_mask    : tuple, optional    (E_min, E_max) eV residual window.
     kk_kwargs      : dict, optional     Extra kwargs for kkcalc.
     ax             : Axes, optional     Plot into existing axes.
+    fast           : bool or None       Use the batched closed-form evaluation (one KK transform per atom);
+                                        None -> env REFLTOOLS_KK_FAST.  Falls back to the per-count loop.
 
     Returns
     -------
@@ -1508,7 +1596,23 @@ def scan_atom_count_surface(
     rmses     = np.full(len(count_vals), np.nan)
     best_dens = np.full(len(count_vals), np.nan)
 
-    for i, c in enumerate(count_vals):
+    _done = False
+    if _fast_requested(fast):
+        import kk_fast_search as _F
+        try:
+            _rm, _bd = _F.fast_count_scan(sld_3col, atoms, fixed_counts, scan_idx, count_vals,
+                                          density_range, merge_points, energy_mask, kk_kwargs,
+                                          skip_all_zero=False)
+            rmses[:] = _rm
+            best_dens[:] = _bd
+            _done = True
+        except _F.FastPathUnsupported:
+            pass
+        except Exception as exc:
+            warnings.warn(f"fast count scan failed ({type(exc).__name__}: {exc}); using the per-count loop",
+                          stacklevel=2)
+
+    for i, c in enumerate(() if _done else count_vals):
         counts           = list(fixed_counts)
         counts[scan_idx] = int(c)
         formula          = _build_formula(atoms, counts)
@@ -1616,7 +1720,7 @@ def scan_all_atom_count_surfaces(
 def scan_fragment_count_surface(
     sld_3col, fragments, fixed_counts, scan_fragment, scan_range,
     density_range, merge_points,
-    n_density_points=40, energy_mask=None, kk_kwargs=None, ax=None
+    n_density_points=40, energy_mask=None, kk_kwargs=None, ax=None, fast=None
 ):
     """
     Scan the RMSE cost surface over integer multipliers of a single fragment,
@@ -1638,6 +1742,8 @@ def scan_fragment_count_surface(
     energy_mask   : tuple, optional
     kk_kwargs     : dict, optional
     ax            : Axes, optional
+    fast          : bool or None      Use the batched closed-form evaluation (one KK per fragment);
+                                      None -> env REFLTOOLS_KK_FAST.  Falls back to the per-count loop.
 
     Returns
     -------
@@ -1662,7 +1768,23 @@ def scan_fragment_count_surface(
     rmses     = np.full(len(count_vals), np.nan)
     best_dens = np.full(len(count_vals), np.nan)
 
-    for i, c in enumerate(count_vals):
+    _done = False
+    if _fast_requested(fast):
+        import kk_fast_search as _F
+        try:
+            _rm, _bd = _F.fast_count_scan(sld_3col, fragments, fixed_counts, scan_idx, count_vals,
+                                          density_range, merge_points, energy_mask, kk_kwargs,
+                                          skip_all_zero=True)
+            rmses[:] = _rm
+            best_dens[:] = _bd
+            _done = True
+        except _F.FastPathUnsupported:
+            pass
+        except Exception as exc:
+            warnings.warn(f"fast count scan failed ({type(exc).__name__}: {exc}); using the per-count loop",
+                          stacklevel=2)
+
+    for i, c in enumerate(() if _done else count_vals):
         counts           = list(fixed_counts)
         counts[scan_idx] = int(c)
         if all(n == 0 for n in counts):

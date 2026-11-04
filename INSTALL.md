@@ -49,6 +49,20 @@ pip install --no-deps --no-build-isolation -e .
 To update later, re-run the same `pip install` command (or `git pull` in the
 clone; editable installs rebuild on import).
 
+### 3b. Accelerated kkcalc (installed by `environment.yml`)
+
+`environment.yml` installs the fork `dsunday/kkcalc` (branch `fast`, version `0.8.4+fast1`): a drop-in replacement
+for kkcalc with a 4-7x faster Kramers-Kronig kernel and an optional GPU backend. Refltools detects it automatically
+(`kk_stoichiometry_fit.kk_info_str()`), and also works with the stock `kkcalc==0.8.4`; the batched stoichiometry
+search (`kk_fast_search.py`) does not need the fork. To install it into an existing env, or from a local clone:
+
+```bash
+pip uninstall -y kkcalc
+pip install --no-deps "git+https://github.com/dsunday/kkcalc.git@fast"      # or: pip install --no-deps -e <clone>
+```
+
+To go back: `pip uninstall -y kkcalc && pip install --no-deps kkcalc==0.8.4`.
+
 ## 4. Optional extras
 
 | For | Install |
