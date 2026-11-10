@@ -12,11 +12,6 @@ project-directory front end to the Refltools pipeline
 code when a harness call exists.** Package docs: module docstrings in
 `/homes/dfs1/Refltools/rsoxr_harness/*.py`.
 
-> **Open follow-up (2026-10-08):** the B-spline / NEXAFS isld bases are implemented
-> (`--isld-basis`, see "Energy scans") and were compared on INT_MOX carbon; the
-> comparison on the Brewer1 O edge (`Harness_Brewer1_Oxygen_Auto`, `O2L`) has not
-> been run. Mention once when this skill is loaded; remove when done or declined.
-
 ## Environment
 
 ```bash
