@@ -116,6 +116,7 @@ class EscanSpec:
     knot_dense: list = field(default_factory=list)    # bspline: [[lo, hi, step], ...] finer knots
     nexafs: list = field(default_factory=list)        # nexafs: [{"layer", "fit" | "model", "shift"}]
     fix_offset: bool = False                            # True → KK sld constant offset pinned at 0 (fit the density instead)
+    freeze: list = field(default_factory=list)          # KK layers held at their start values (NEXAFS basis params + sld offset not fitted)
 
     def __post_init__(self):
         if not self.scans:
@@ -194,6 +195,8 @@ class EscanSpec:
                  + "".join(f"; {a['layer']} isld → bare-atom {a['formula']} {a['density']:g} over "
                            f"{a['lo']:g}–{a['hi']:g} eV (σ {a['sigma']})" for a in self.anchor),
                  f"  mode: {'co-refinement with angle scans' if self.angle else 'energy scans only (geometry fixed)'}"]
+        if self.freeze:
+            lines.append(f"  frozen layers (basis + KK offset held at their start values): {', '.join(self.freeze)}")
         if self.scan_scales and any(self.scan_scales):
             lines.append("  own fitted scale for: "
                          + ", ".join(os.path.basename(s) for s, f in zip(self.scans, self.scan_scales) if f)
@@ -422,6 +425,12 @@ def _kk_call(args):
     return np.interp(E, o[:, 0], o[:, 1]), np.interp(E, o[:, 0], o[:, 2])
 
 
+def _unit(x0, j):
+    x = x0.copy()
+    x[j] += 1.0
+    return x
+
+
 def _kk_col(args):
     E, x0, j, formula, density, window = args
     x = x0.copy()
@@ -437,6 +446,9 @@ def kk_response(cache_dir, E, x_seed, formula, density, window, workers=8, log=p
     if os.path.exists(path):
         r = np.load(path)
         return {k: r[k] for k in ("x0", "s0", "i0", "M", "N")}, path
+    # an all-zero seed (e.g. a surface layer whose per-energy isld sits on the 0 clamp) makes kkcalc return NaN
+    # for the tabulated end values and poisons the cache (the key ignores the seed): floor at a small positive isld
+    x_seed = np.maximum(np.asarray(x_seed, float), 1e-3)
     _, it = _kk_call((E, x_seed, formula, density, window))
     x0 = x_seed.copy()
     x0[0], x0[-1] = it[0], it[-1]
@@ -445,12 +457,21 @@ def kk_response(cache_dir, E, x_seed, formula, density, window, workers=8, log=p
     M, N = np.zeros((n, n)), np.zeros((n, n))
     from concurrent.futures import ProcessPoolExecutor
     w = max(1, int(workers))                 # reserved by the job runner (≤ 50 % CPUs machine-wide)
-    with ProcessPoolExecutor(w) as ex:
-        for j, (s, i) in ex.map(_kk_col, [(E, x0, j, formula, density, window) for j in range(1, n - 1)],
-                                chunksize=4):
+    backend = os.environ.get("KKCALC_BACKEND", "numpy").lower()
+    if backend.startswith("jax"):
+        # fast kkcalc fork on the GPU (KKCALC_BACKEND=jax-gpu): ~30 ms per transform at ~180 nodes vs ~120 ms (numpy)
+        # and ~850 ms (stock); run the columns serially in this process so no worker process initialises JAX
+        w = 1
+        for j in range(1, n - 1):
+            s, i = _kk_call((E, _unit(x0, j), formula, density, window))
             M[:, j], N[:, j] = s - s0, i - i0
+    else:
+        with ProcessPoolExecutor(w) as ex:
+            for j, (s, i) in ex.map(_kk_col, [(E, x0, j, formula, density, window) for j in range(1, n - 1)],
+                                    chunksize=4):
+                M[:, j], N[:, j] = s - s0, i - i0
     dev = float(np.abs(N[1:-1, 1:-1] - np.eye(n - 2)).max())
-    log(f"[escan] KK response {formula} {density:g} g/cm³ on {n} nodes ({w} workers); "
+    log(f"[escan] KK response {formula} {density:g} g/cm³ on {n} nodes (kkcalc backend {backend}, {w} workers); "
         f"tabulated isld ends {x0[0]:.3f}/{x0[-1]:.3f}; max |N − I| = {dev:.2e}")
     os.makedirs(cache_dir, exist_ok=True)
     np.savez(path, E=E, x0=x0, s0=s0, i0=i0, M=M, N=N, formula=formula, density=density)
@@ -934,6 +955,9 @@ class Problem:
             p[sc], lb[sc], ub[sc] = c, -10.0, 10.0
             if self.spec.fix_offset:
                 p[sc], lb[sc], ub[sc] = 0.0, -1e-6, 1e-6
+            if name in self.spec.freeze:
+                lb[sc], ub[sc] = p[sc] - 1e-6, p[sc] + 1e-6
+                lb[sx], ub[sx] = p[sx] - 1e-6, p[sx] + 1e-6
         prevp = prev.get("params") if prev is not None else None
         for j, f in enumerate(self.spec.scan_scales or []):
             if f:
@@ -1037,6 +1061,8 @@ def run(project, name, start="last", max_nfev=None, workers=8, log=print, simula
         # pinned parameters (KK offset with spec.fix_offset) are removed from the optimised vector;
         # a zero Jacobian column with ~zero-width bounds stalls trf
         pinned = [pr.idx[("c", n)] for n in pr.kk_layers] if spec.fix_offset else []
+        for n in spec.freeze:                      # frozen layer: basis parameters + KK offset not optimised
+            pinned += [pr.idx[("c", n)]] + list(np.arange(pr.NP)[pr.idx[("x", n)]])
         fr = np.array([i for i in range(pr.NP) if i not in pinned], dtype=int)
         base = np.array(p0, float)
 

@@ -523,7 +523,7 @@ def cmd_escan(a):
                 if len(parts) > 2:
                     ent["shift"] = float(parts[2])
                 nexafs.append(ent)
-        kw = dict(name=a.name[0], model=a.model, scans=a.scans, kk=kk, seed_model=a.seed_model, fix_offset=a.no_offset,
+        kw = dict(name=a.name[0], model=a.model, scans=a.scans, kk=kk, seed_model=a.seed_model, fix_offset=a.no_offset, freeze=list(a.freeze or []),
                   isld_basis=a.isld_basis, knot_step=a.knot_step, knot_step_outside=a.knot_step_outside,
                   knot_dense=dense, nexafs=nexafs,
                   window=a.window, outer_step=a.outer_step, sigma_curv=a.sigma_curv,
@@ -975,6 +975,7 @@ def main(argv=None):
     s.add_argument("--anchor", nargs="+", metavar="LAYER:LO:HI:FORMULA:DENSITY:SIGMA",
                    help="add: pull a KK layer's isld over LO–HI eV towards a formula's bare-atom isld")
     s.add_argument("--escan-only", action="store_true", help="add: energy scans only, geometry fixed")
+    s.add_argument("--freeze", nargs="+", metavar="LAYER", help="add: KK layers held at their start values (basis parameters and KK offset not fitted)")
     s.add_argument("--no-offset", action="store_true", help="add: pin the KK sld constant offset at 0 (fit --fit-density instead)")
     s.add_argument("--density-tol", type=float, default=0.01, help="run --fit-density: density tolerance of the 1-D search (g/cm3)")
     s.add_argument("--fit-density", nargs=2, type=float, metavar=("LO", "HI"), help="run: fit the KK-layer density over LO–HI g/cm³ (outer search, offset should be pinned)")

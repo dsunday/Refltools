@@ -53,8 +53,14 @@ def rss_aic(res, n_pts, k):
 class OCoFit:
     """th = [E(n), W(n), H(S*n), edgeH(S), edgeDecay(S), edgeLoc(S|1), edgeWid(S|1)]."""
 
-    def __init__(self, names, n_peaks, share_edge=False, rng=FIT_RANGE, paths=None, ordered=False, dmin=0.1, model_fn=None, **model_kw):
-        """n_peaks = seed set (5-8); model_kw -> nexafs_models.soc_oxygen (merge56, wide_caps); self.n = peaks actually fitted."""
+    def __init__(self, names, n_peaks, share_edge=False, rng=FIT_RANGE, paths=None, ordered=False, dmin=0.1, model_fn=None, height_cap=None, **model_kw):
+        """n_peaks = seed set (5-8); model_kw -> nexafs_models.soc_oxygen (merge56, wide_caps); self.n = peaks actually fitted.
+
+        height_cap: upper bound of the per-sample peak heights, per problem (2026-11-10; before, every height was capped at 4.0 for every problem, which made fits of
+        spectra with taller peaks - IMEC as-deposited O K edge, peaks to ~6.5 - fail silently).
+          None (default): per peak max(4.0, model's `peak_i_height_bounds[1]`) - never below the old universal 4.0, so existing fits are unchanged, but a model that asks
+                          for a higher cap (e.g. 12) gets it;
+          float:          that cap for every peak;   sequence of length n: one cap per peak."""
         self.names, self.S, self.share = list(names), len(names), share_edge
         self.ordered, self.dmin = ordered, dmin  # ordered: energies = E1 + cumulative gaps (>= dmin), so peaks can never cross their neighbours
         paths = paths or SOC_SAMPLES
@@ -69,9 +75,17 @@ class OCoFit:
                         [pb[f"peak_{i}_width_bounds"][0] for i in range(1, n + 1)],
                         np.zeros(S * n), np.full(S, ed["height_bounds"][0]), np.full(S, ed["decay_bounds"][0]),
                         np.full(k, ed["location_bounds"][0]), np.full(k, ed["width_bounds"][0])]
+        if height_cap is None:
+            hcap = np.array([max(4.0, float(pb[f"peak_{i}_height_bounds"][1])) if f"peak_{i}_height_bounds" in pb else 4.0 for i in range(1, n + 1)])
+        elif np.ndim(height_cap) == 0:
+            hcap = np.full(n, float(height_cap))
+        else:
+            hcap = np.asarray(height_cap, float)
+            assert hcap.shape == (n,), f"height_cap needs {n} values, got {hcap.shape}"
+        self.height_cap = hcap
         self.hi = np.r_[[pb[f"peak_{i}_energy_bounds"][1] for i in range(1, n + 1)],
                         [pb[f"peak_{i}_width_bounds"][1] for i in range(1, n + 1)],
-                        np.full(S * n, 4.0), np.full(S, ed["height_bounds"][1]), np.full(S, ed["decay_bounds"][1]),
+                        np.tile(hcap, S), np.full(S, ed["height_bounds"][1]), np.full(S, ed["decay_bounds"][1]),
                         np.full(k, ed["location_bounds"][1]), np.full(k, ed["width_bounds"][1])]
         self.e_lo = np.array([pb[f"peak_{i}_energy_bounds"][0] for i in range(1, n + 1)])  # per-peak energy windows (kept in ordered mode as a stiff hinge)
         self.e_hi = np.array([pb[f"peak_{i}_energy_bounds"][1] for i in range(1, n + 1)])
